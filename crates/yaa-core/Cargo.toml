@@ -2,6 +2,7 @@
 name = "yaa-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 
@@ -18,6 +19,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 sha2.workspace = true
 ulid.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

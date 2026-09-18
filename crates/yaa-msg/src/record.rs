@@ -80,6 +80,7 @@ impl Record {
     }
 
     /// 工具结果。
+    // 字段一一映射冻结的记录 schema，拆成结构体反而让调用点更啰嗦，故显式豁免。
     #[allow(clippy::too_many_arguments)]
     pub fn tool_result(
         call_id: impl Into<String>,

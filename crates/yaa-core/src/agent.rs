@@ -2,17 +2,17 @@
 //!
 //! 流程（见 `docs/plan.md`「Agent loop 与并发形状」）：
 //!
-//! 1. 每会话一次执行两个提示词钩子，成功的缓存按 `(名称，指纹，成功)` 判定；
-//! 2. 每次运行一次执行 `llm` 钩子，解析配置并只记一条 redacted 审计记录（stdout
+//! 1. 先追加用户记录：配置/钩子失败也不丢用户输入；
+//! 2. 每会话一次执行两个提示词钩子，成功的缓存按 `(名称，指纹，成功)` 判定；
+//! 3. 每次运行一次执行 `llm` 钩子，解析配置并只记一条 redacted 审计记录（stdout
 //!    含密钥，绝不落盘、绝不渲染）；
-//! 3. 追加用户记录；
 //! 4. 循环：重读历史 → 渲染 → 调用模型 → 原子追加 `ai` 及其 `tool_call` → 执行
 //!    工具并追加 `tool_result`，直到无工具调用或达到 `max_steps`。
 //!
 //! 退出码：`0` 成功，`1` 通用错误，`2` 用法错误，`3` 配置/钩子错误，`4` 模型错误，
 //! `5` 达到 `max_steps`。`run` 只在非预期 I/O 失败时返回 `Err`。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -130,20 +130,20 @@ impl Runner<'_> {
             });
         }
 
-        // 1. 提示词钩子（每会话一次）。
+        // 1. 用户记录先落盘：配置/钩子失败也不能丢失用户输入。
+        yaa_store::append(&self.session, &[Record::user(prompt_text)])?;
+
+        // 2. 提示词钩子（每会话一次）。
         if let Some(exit) = self.ensure_prompt_hooks().await? {
             return Ok(exit);
         }
 
-        // 2. llm 钩子（每次运行一次，只记 redacted 审计），并用解析出的配置构造模型。
+        // 3. llm 钩子（每次运行一次，只记 redacted 审计），并用解析出的配置构造模型。
         let llm = match self.resolve_llm_hook().await? {
             Ok(config) => config,
             Err(code) => return Ok(code),
         };
         let model = make_model(llm);
-
-        // 3. 用户记录。
-        yaa_store::append(&self.session, &[Record::user(prompt_text)])?;
 
         // 4. 循环。
         let schema_hash = crate::prompt::tool_schema_hash();
@@ -169,18 +169,32 @@ impl Runner<'_> {
                 tool_calls: response.tool_calls.len(),
             });
 
+            // 既无文本也无工具调用：不算错误（退出码仍为 0），但要明确告知用户，
+            // 否则 CLI 会静默结束，用户误以为卡死。
+            if response.tool_calls.is_empty()
+                && response.content.as_deref().is_none_or(str::is_empty)
+            {
+                self.sink.emit(Event::Notice {
+                    content: "模型返回了空回复（既无文本也无工具调用）。".to_string(),
+                });
+            }
+
+            // 清洗模型返回的 call_id：空串、批次内重复、或与历史冲突者一律重生成，
+            // 否则 OpenAI 会因重复/空 `tool_call_id` 拒绝请求。
+            let tool_calls = sanitize_tool_calls(&records, &response.tool_calls);
+
             // `ai` 与其 `tool_call` 以单批原子追加。
-            let mut batch = Vec::with_capacity(1 + response.tool_calls.len());
+            let mut batch = Vec::with_capacity(1 + tool_calls.len());
             batch.push(Record::ai(
                 model.name(),
                 schema_hash.clone(),
                 response.content.clone().unwrap_or_default(),
             ));
-            for call in &response.tool_calls {
+            for call in &tool_calls {
                 batch.push(Record::tool_call(
                     ToolOrigin::Ai,
                     call.id.clone(),
-                    call.arguments.clone(),
+                    persisted_arguments(&call.arguments),
                     None,
                     None,
                     false,
@@ -188,7 +202,7 @@ impl Runner<'_> {
             }
             yaa_store::append(&self.session, &batch)?;
 
-            if response.tool_calls.is_empty() {
+            if tool_calls.is_empty() {
                 self.sink.emit(Event::TurnEnd {
                     reason: response
                         .finish_reason
@@ -198,7 +212,7 @@ impl Runner<'_> {
                 return Ok(ExitCode::Success);
             }
 
-            for call in &response.tool_calls {
+            for call in &tool_calls {
                 let result = self.execute_tool_call(call).await;
                 yaa_store::append(&self.session, &[result])?;
             }
@@ -213,11 +227,12 @@ impl Runner<'_> {
     /// 执行两个提示词钩子；缓存命中则跳过。钩子失败返回 `Some(ExitCode::Config)`。
     async fn ensure_prompt_hooks(&self) -> anyhow::Result<Option<ExitCode>> {
         let env = self.hook_env();
+        let context = self.hook_context();
         for (name, command) in [
             ("system_prompt", self.config.hooks.system_prompt.as_str()),
             ("user_prompt", self.config.hooks.user_prompt.as_str()),
         ] {
-            let fingerprint = crate::hook::fingerprint(name, command, "");
+            let fingerprint = crate::hook::fingerprint(name, command, &context);
             if prompt_hook_cached(&yaa_store::load(&self.session)?, name, &fingerprint) {
                 continue;
             }
@@ -226,9 +241,20 @@ impl Runner<'_> {
                 name: name.to_string(),
                 command: command.to_string(),
             });
-            let outcome = crate::hook::run(command, self.cwd, &env)
-                .await
-                .map_err(|err| anyhow::anyhow!("执行提示词钩子 {name} 失败：{err}"))?;
+            // 钩子执行失败（spawn/IO/超限）是配置问题：报事件并按退出码 3 处理，
+            // 而不是作为非预期 `Err` 冒泡成通用错误 1。
+            let outcome =
+                match crate::hook::run(command, self.cwd, &env, self.config.hooks.timeout_secs)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        self.sink.emit(Event::Notice {
+                            content: format!("执行提示词钩子 {name} 失败：{err}"),
+                        });
+                        return Ok(Some(ExitCode::Config));
+                    }
+                };
             self.sink.emit(Event::HookFinished {
                 name: name.to_string(),
                 code: outcome.code,
@@ -275,32 +301,34 @@ impl Runner<'_> {
     async fn resolve_llm_hook(&self) -> anyhow::Result<Result<LlmConfig, ExitCode>> {
         let name = "llm";
         let command = self.config.hooks.llm.as_str();
-        let fingerprint = crate::hook::fingerprint(name, command, "");
+        let fingerprint = crate::hook::fingerprint(name, command, &self.hook_context());
         let env = self.hook_env();
 
         self.sink.emit(Event::HookStarted {
             name: name.to_string(),
             command: command.to_string(),
         });
-        let outcome = match crate::hook::run(command, self.cwd, &env).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                self.sink.emit(Event::Notice {
-                    content: format!("执行 llm 钩子失败：{err}"),
-                });
-                return Ok(Err(ExitCode::Config));
-            }
-        };
+        let outcome =
+            match crate::hook::run(command, self.cwd, &env, self.config.hooks.timeout_secs).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    self.sink.emit(Event::Notice {
+                        content: format!("执行 llm 钩子失败：{err}"),
+                    });
+                    return Ok(Err(ExitCode::Config));
+                }
+            };
         self.sink.emit(Event::HookFinished {
             name: name.to_string(),
             code: outcome.code,
         });
 
-        // 只记命令与指纹，不记 stdout（含密钥）、不配 tool_result；渲染器永不消费它。
+        // 只记指纹，命令与 stdout 都可能内联密钥，一律不落盘；也不配 tool_result，
+        // 渲染器永不消费它。
         let audit = Record::tool_call(
             ToolOrigin::Hook,
             format!("hook-llm-{}", ulid::Ulid::new()),
-            command,
+            "",
             None,
             Some(HookInfo {
                 name: name.to_string(),
@@ -411,12 +439,64 @@ impl Runner<'_> {
             "YAA_DATA_HOME".to_string(),
             self.data_root.to_string_lossy().into_owned(),
         );
+        // 当前可执行文件路径，供默认提示词钩子不依赖 PATH 地调用自身；取不到则省略。
+        if let Ok(exe) = std::env::current_exe() {
+            env.insert("YAA_BIN".to_string(), exe.to_string_lossy().into_owned());
+        }
         env
+    }
+
+    /// 钩子指纹的稳定执行上下文：工作目录、配置根、数据根，以 NUL 无歧义连接。
+    fn hook_context(&self) -> String {
+        format!(
+            "{}\u{0}{}\u{0}{}",
+            self.cwd.display(),
+            self.config_root.display(),
+            self.data_root.display()
+        )
     }
 }
 
+/// 清洗模型返回的工具调用 id。
+///
+/// 空串、批次内重复、或与历史任何 `call_id` 冲突的 id 都替换为本地生成的
+/// `call-<ULID>`，保证渲染出的 `tool_call_id` 唯一且非空。
+fn sanitize_tool_calls(history: &[Record], calls: &[AssistantToolCall]) -> Vec<AssistantToolCall> {
+    let mut used: HashSet<String> = history
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolCall(call) => Some(call.call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    calls
+        .iter()
+        .map(|call| {
+            let id = if call.id.is_empty() || used.contains(&call.id) {
+                format!("call-{}", ulid::Ulid::new())
+            } else {
+                call.id.clone()
+            };
+            used.insert(id.clone());
+            AssistantToolCall {
+                id,
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+            }
+        })
+        .collect()
+}
+
 /// 缓存判定：存在非 redacted、名称与指纹都匹配、且有 `code == 0` 配对结果的钩子调用。
+///
+/// 先一次建表 `call_id → tool_result`，把逐候选的全表扫描降为 `O(n)` 查询。
 fn prompt_hook_cached(records: &[Record], name: &str, fingerprint: &str) -> bool {
+    let mut results: HashMap<&str, &yaa_msg::ToolResult> = HashMap::new();
+    for record in records {
+        if let Record::ToolResult(result) = record {
+            results.entry(result.call_id.as_str()).or_insert(result);
+        }
+    }
     records.iter().any(|record| {
         let Record::ToolCall(call) = record else {
             return false;
@@ -427,13 +507,23 @@ fn prompt_hook_cached(records: &[Record], name: &str, fingerprint: &str) -> bool
         let Some(hook) = &call.hook else {
             return false;
         };
-        if hook.name != name || hook.fingerprint != fingerprint {
-            return false;
-        }
-        records.iter().any(|candidate| {
-            matches!(candidate, Record::ToolResult(result) if result.call_id == call.call_id && result.code == 0)
-        })
+        hook.name == name
+            && hook.fingerprint == fingerprint
+            && results
+                .get(call.call_id.as_str())
+                .is_some_and(|result| result.code == 0)
     })
+}
+
+/// 模型参数持久化前的清洗：仅当能解析为 JSON 对象时原样保存，否则存 `{}`。
+///
+/// 非法文本若原样回灌，后续每次请求都会携带非法 `function.arguments`，严格供应商会
+/// 直接拒绝；失败原因已由配对的 `tool_result` 告知模型。
+fn persisted_arguments(arguments: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(arguments) {
+        Ok(value) if value.is_object() => arguments.to_string(),
+        _ => "{}".to_string(),
+    }
 }
 
 /// 把 Shell 输出转成 `tool_result` 记录，`output_files` 相对数据根。
@@ -442,11 +532,11 @@ fn shell_output_to_record(output: &yaa_shell::ShellOutput, data_root: &Path) -> 
         let stdout = output
             .stdout_file
             .as_deref()
-            .and_then(|path| relativize(path, data_root));
+            .map(|path| relativize(path, data_root));
         let stderr = output
             .stderr_file
             .as_deref()
-            .and_then(|path| relativize(path, data_root));
+            .map(|path| relativize(path, data_root));
         Some(yaa_msg::OutputFiles { stdout, stderr })
     } else {
         None
@@ -463,12 +553,13 @@ fn shell_output_to_record(output: &yaa_shell::ShellOutput, data_root: &Path) -> 
     )
 }
 
-/// 把绝对路径相对化到数据根；不在数据根下时返回 `None`。
+/// 把绝对路径相对化到数据根；不在数据根下时退化为绝对路径字符串。
 ///
 /// `yaa_shell` 返回的是 `canonicalize` 后的路径，而 `data_root` 可能是未规范化的
 /// 符号链接目录，因此先按原值匹配，再退回规范化后的数据根（`canonicalize` 失败则
-/// 忽略）。
-fn relativize(path: &Path, data_root: &Path) -> Option<String> {
+/// 忽略）。两者都不匹配时（如 `--session` 指向数据根之外）保留绝对路径，绝不返回
+/// `None`——否则 `truncated` 为真时模型会被误导去一个不存在的相对文件找完整输出。
+fn relativize(path: &Path, data_root: &Path) -> String {
     path.strip_prefix(data_root)
         .ok()
         .or_else(|| {
@@ -476,6 +567,7 @@ fn relativize(path: &Path, data_root: &Path) -> Option<String> {
             path.strip_prefix(&canonical_root).ok()
         })
         .map(|relative| relative.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]
@@ -546,6 +638,21 @@ mod tests {
                 name: "shell".to_string(),
                 arguments: arguments.to_string(),
             }],
+            finish_reason: Some("tool_calls".to_string()),
+        }
+    }
+
+    fn calls_response(calls: &[(&str, &str)]) -> ChatResponse {
+        ChatResponse {
+            content: None,
+            tool_calls: calls
+                .iter()
+                .map(|(id, arguments)| AssistantToolCall {
+                    id: (*id).to_string(),
+                    name: "shell".to_string(),
+                    arguments: (*arguments).to_string(),
+                })
+                .collect(),
             finish_reason: Some("tool_calls".to_string()),
         }
     }
@@ -659,12 +766,12 @@ mod tests {
         assert_eq!(
             labels,
             vec![
-                "tool_call",
-                "tool_result",
-                "tool_call",
-                "tool_result",
-                "tool_call",
                 "user",
+                "tool_call",
+                "tool_result",
+                "tool_call",
+                "tool_result",
+                "tool_call",
                 "ai",
                 "tool_call",
                 "tool_result",
@@ -762,6 +869,49 @@ mod tests {
         assert_eq!(exit, ExitCode::Success);
     }
 
+    /// 记录事件的测试接收器。
+    struct RecordingSink {
+        events: Mutex<Vec<Event>>,
+    }
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: Event) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_reply_emits_notice_and_renders_no_assistant() {
+        let harness = Harness::new(test_config("echo SYS"));
+        let sink = RecordingSink {
+            events: Mutex::new(Vec::new()),
+        };
+        let model = FakeModel::new(vec![ChatResponse {
+            content: None,
+            tool_calls: Vec::new(),
+            finish_reason: Some("stop".to_string()),
+        }]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success, "空回复仍算成功");
+
+        let noticed =
+            sink.events.lock().unwrap().iter().any(
+                |event| matches!(event, Event::Notice { content } if content.contains("空回复")),
+            );
+        assert!(noticed, "空回复应发出 Notice");
+
+        let rendered = render::render(&harness.records());
+        assert!(
+            !rendered.iter().any(|message| message.role == "assistant"),
+            "空 ai 记录不得渲染为 assistant 消息：{rendered:?}"
+        );
+    }
+
     #[tokio::test]
     async fn invalid_arguments_yield_code_minus_one_and_continue() {
         let harness = Harness::new(test_config("echo SYS"));
@@ -788,6 +938,19 @@ mod tests {
             .expect("非法参数应产生 tool_result");
         assert_eq!(result.code, -1);
         assert!(!result.stderr.is_empty());
+
+        // 非法参数不得原样落盘：持久化的是合法 JSON 对象，否则后续请求会被严格供应商拒绝。
+        let bad_call = records
+            .iter()
+            .find_map(|record| match record {
+                Record::ToolCall(call) if call.call_id == "call_bad" => Some(call),
+                _ => None,
+            })
+            .expect("非法参数也应有 tool_call 记录");
+        assert_eq!(bad_call.command, "{}", "非法参数应清洗为 `{{}}`");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&bad_call.command).expect("持久化参数必须是合法 JSON");
+        assert!(persisted.is_object());
 
         let ai_count = records
             .iter()
@@ -822,6 +985,10 @@ mod tests {
             .collect();
         assert_eq!(llm_calls.len(), 1);
         assert!(llm_calls[0].redacted);
+        assert_eq!(
+            llm_calls[0].command, "",
+            "llm 审计记录不得保存可能内联密钥的命令"
+        );
         assert_eq!(llm_calls[0].hook.as_ref().unwrap().fingerprint.len(), 64);
         assert!(
             !records.iter().any(|record| matches!(
@@ -870,5 +1037,195 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(exit, ExitCode::MaxSteps);
+    }
+
+    #[tokio::test]
+    async fn changing_cwd_invalidates_prompt_hook_cache() {
+        let mut harness = Harness::new(test_config("echo SYS"));
+        let sink = NullSink;
+
+        let first = FakeModel::new(vec![text_response("a")]);
+        harness
+            .runner(&sink)
+            .run("你好", |_config| first.clone())
+            .await
+            .unwrap();
+        assert_eq!(count_hook_calls(&harness.records(), "system_prompt"), 1);
+        assert_eq!(count_hook_calls(&harness.records(), "user_prompt"), 1);
+
+        // 换个工作目录续用同一会话：指纹必须变化，提示词钩子重跑。
+        let new_cwd = harness._dir.path().join("work2");
+        std::fs::create_dir_all(&new_cwd).unwrap();
+        harness.cwd = new_cwd;
+
+        let second = FakeModel::new(vec![text_response("b")]);
+        harness
+            .runner(&sink)
+            .run("你好", |_config| second.clone())
+            .await
+            .unwrap();
+        assert_eq!(count_hook_calls(&harness.records(), "system_prompt"), 2);
+        assert_eq!(count_hook_calls(&harness.records(), "user_prompt"), 2);
+    }
+
+    #[tokio::test]
+    async fn failing_prompt_hook_preserves_user_record() {
+        // 钩子以退出码 3 失败：用户输入仍应先落盘。
+        let harness = Harness::new(test_config("exit 3"));
+        let sink = NullSink;
+        let model = FakeModel::new(vec![text_response("不该到达")]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("重要输入", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Config);
+
+        let records = harness.records();
+        assert_eq!(
+            records.first().map(record_label),
+            Some("user"),
+            "用户记录应在钩子之前落盘"
+        );
+        let Record::User(user) = &records[0] else {
+            panic!("首条应为用户记录");
+        };
+        assert_eq!(user.content, "重要输入");
+    }
+
+    #[tokio::test]
+    async fn hook_execution_failure_returns_config_not_error() {
+        // 钩子输出 2 MiB 超过硬上限：属配置/钩子错误（退出码 3），不是 Err（退出码 1）。
+        let harness = Harness::new(test_config("head -c 2097152 /dev/zero"));
+        let sink = NullSink;
+        let model = FakeModel::new(vec![text_response("不该到达")]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Config);
+        assert!(
+            harness
+                .records()
+                .iter()
+                .any(|record| matches!(record, Record::User(_))),
+            "即使钩子执行失败，用户记录也应已落盘"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_and_empty_tool_call_ids_are_sanitized() {
+        let harness = Harness::new(test_config("echo SYS"));
+        let sink = NullSink;
+        let model = FakeModel::new(vec![
+            calls_response(&[
+                ("dup", r#"{"command":"echo a"}"#),
+                ("dup", r#"{"command":"echo b"}"#),
+                ("", r#"{"command":"echo c"}"#),
+            ]),
+            text_response("完成"),
+        ]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success);
+
+        let records = harness.records();
+        let ai_ids: Vec<String> = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::ToolCall(call) if call.origin == ToolOrigin::Ai => {
+                    Some(call.call_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ai_ids.len(), 3, "三条模型调用都应落盘");
+        assert!(ai_ids.iter().all(|id| !id.is_empty()), "id 不应为空");
+        let unique: std::collections::HashSet<&String> = ai_ids.iter().collect();
+        assert_eq!(unique.len(), 3, "清洗后 id 应互不相同：{ai_ids:?}");
+
+        // 每个 assistant.tool_calls[].id 都应有配对的 tool.tool_call_id。
+        let rendered = render::render(&records);
+        let assigned: Vec<String> = rendered
+            .iter()
+            .filter_map(|message| message.tool_calls.as_ref())
+            .flatten()
+            .map(|call| call.id.clone())
+            .collect();
+        assert_eq!(assigned.len(), 3);
+        let tool_ids: Vec<String> = rendered
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect();
+        assert_eq!(tool_ids.len(), 3);
+        for id in &assigned {
+            assert!(tool_ids.contains(id), "缺少配对 tool 消息：{id}");
+        }
+    }
+
+    #[test]
+    fn output_files_outside_data_root_keeps_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        std::fs::create_dir_all(&data_root).unwrap();
+        let outside = dir.path().join("elsewhere").join("out.stdout.out");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "完整内容").unwrap();
+
+        let output = yaa_shell::ShellOutput {
+            call_id: "c1".to_string(),
+            stdout: "head ... [truncated] ... tail".to_string(),
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+            truncated: true,
+            stdout_file: Some(outside.clone()),
+            stderr_file: None,
+        };
+        let Record::ToolResult(result) = shell_output_to_record(&output, &data_root) else {
+            panic!("应生成 tool_result");
+        };
+        let files = result.output_files.expect("截断应记录输出文件");
+        assert_eq!(
+            files.stdout.as_deref(),
+            Some(outside.to_string_lossy().as_ref()),
+            "数据根之外的输出文件必须保留绝对路径"
+        );
+    }
+
+    #[test]
+    fn output_files_inside_data_root_is_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let inside = data_root
+            .join("sessions")
+            .join("sid")
+            .join("out.stdout.out");
+        std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
+        std::fs::write(&inside, "完整内容").unwrap();
+
+        let output = yaa_shell::ShellOutput {
+            call_id: "c1".to_string(),
+            stdout: "head ... [truncated] ... tail".to_string(),
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+            truncated: true,
+            stdout_file: Some(inside),
+            stderr_file: None,
+        };
+        let Record::ToolResult(result) = shell_output_to_record(&output, &data_root) else {
+            panic!("应生成 tool_result");
+        };
+        let files = result.output_files.expect("截断应记录输出文件");
+        assert_eq!(files.stdout.as_deref(), Some("sessions/sid/out.stdout.out"));
     }
 }

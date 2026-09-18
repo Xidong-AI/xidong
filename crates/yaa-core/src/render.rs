@@ -2,8 +2,10 @@
 //!
 //! 纯函数，无 I/O。渲染规则见 `docs/plan.md` 的「渲染管线」：
 //!
-//! - `tool_call(origin=hook)` + 配对 `tool_result` → `system` 消息（内容取 stdout）；
-//!   `redacted` 的钩子记录（`llm`）永不渲染。
+//! - `tool_call(origin=hook)`：预扫描全部记录，每个提示词钩子名（`system_prompt`、
+//!   `user_prompt`）只取**最后一条**非 redacted、配对 `tool_result` 存在且 `code == 0`
+//!   的调用，渲染为 `system` 消息（内容取 stdout），并按记录顺序置于消息列表最前；
+//!   其余钩子调用与结果全部跳过。`redacted` 的钩子记录（`llm`）永不渲染。
 //! - `user` → `user` 消息。
 //! - `ai` + 其后紧邻的 `tool_call(origin=ai)` → 一条 `assistant` 消息；每个工具调用
 //!   按 `call_id` 配对 `tool_result` 转成 `tool` 消息，顺序跟随 `tool_calls`。
@@ -21,21 +23,65 @@ use crate::message::{AssistantToolCall, ChatMessage};
 /// 失配工具调用的中断标记。
 const INTERRUPTED_MARKER: &str = "[interrupted] 工具结果缺失：该步骤在运行中被中断，无可用输出。";
 
+/// 需要提升为头部 `system` 消息的提示词钩子名。
+const PROMPT_HOOKS: [&str; 2] = ["system_prompt", "user_prompt"];
+
 /// 把历史记录渲染为 OpenAI 兼容的聊天消息序列。
 pub fn render(records: &[Record]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+
+    // call_id → 首个配对结果，一次建表供后续 O(1) 查询，避免逐调用线性扫描。
+    let mut results: HashMap<&str, &yaa_msg::ToolResult> = HashMap::new();
+    for record in records {
+        if let Record::ToolResult(result) = record {
+            results.entry(result.call_id.as_str()).or_insert(result);
+        }
+    }
+
+    // 预扫描：每个提示词钩子名只保留最后一条成功且非 redacted 的调用。
+    // 升级或重试不再叠加旧提示词，失败的 stdout 也不会泄漏进系统消息。
+    let mut selected: Vec<usize> = Vec::new();
+    for name in PROMPT_HOOKS {
+        let mut latest: Option<usize> = None;
+        for (index, record) in records.iter().enumerate() {
+            let Record::ToolCall(call) = record else {
+                continue;
+            };
+            if call.origin != ToolOrigin::Hook || call.redacted {
+                continue;
+            }
+            if !call.hook.as_ref().is_some_and(|hook| hook.name == name) {
+                continue;
+            }
+            // 只有配对结果存在且成功才算候选项。
+            if results
+                .get(call.call_id.as_str())
+                .is_some_and(|result| result.code == 0)
+            {
+                latest = Some(index);
+            }
+        }
+        if let Some(index) = latest {
+            selected.push(index);
+        }
+    }
+    // 选中的钩子按其在记录中的先后顺序输出，全部置于消息列表头部。
+    selected.sort_unstable();
+    for &index in &selected {
+        let Record::ToolCall(call) = &records[index] else {
+            continue;
+        };
+        if let Some(result) = results.get(call.call_id.as_str()) {
+            messages.push(ChatMessage::system(result.stdout.clone()));
+        }
+    }
+
     let mut index = 0;
     while index < records.len() {
         match &records[index] {
             Record::ToolCall(call) => match call.origin {
-                ToolOrigin::Hook => {
-                    if !call.redacted
-                        && let Some(result) = find_result(records, &call.call_id)
-                    {
-                        messages.push(ChatMessage::system(result.stdout.clone()));
-                    }
-                    index += 1;
-                }
+                // 钩子调用已在预扫描中处理，此处全部跳过。
+                ToolOrigin::Hook => index += 1,
                 ToolOrigin::User => {
                     messages.push(ChatMessage::user(call.command.clone()));
                     index += 1;
@@ -98,6 +144,10 @@ fn push_ai_step(
                 .collect(),
         )
     };
+    if content.is_none() && tool_calls.is_none() {
+        // 空 `ai` 记录（无文本、无工具调用）不构成助手消息；跳过以免请求体非法。
+        return next;
+    }
     messages.push(ChatMessage {
         role: "assistant".to_string(),
         content,
@@ -126,14 +176,6 @@ fn push_ai_step(
         }
     }
     end
-}
-
-/// 在全部记录中查找首个匹配 `call_id` 的工具结果。
-fn find_result<'a>(records: &'a [Record], call_id: &str) -> Option<&'a yaa_msg::ToolResult> {
-    records.iter().find_map(|record| match record {
-        Record::ToolResult(result) if result.call_id == call_id => Some(result),
-        _ => None,
-    })
 }
 
 /// 组装 `tool` 消息内容：stdout，追加独立标注的 stderr，再追加超时/截断提示。
@@ -177,13 +219,17 @@ mod tests {
     }
 
     fn result(call_id: &str, stdout: &str) -> Record {
+        result_with_code(call_id, stdout, 0)
+    }
+
+    fn result_with_code(call_id: &str, stdout: &str, code: i32) -> Record {
         Record::ToolResult(ToolResult {
             id: format!("res-{call_id}"),
             ts: 2,
             call_id: call_id.to_string(),
             stdout: stdout.to_string(),
             stderr: String::new(),
-            code: 0,
+            code,
             timed_out: false,
             truncated: false,
             output_files: None,
@@ -298,6 +344,87 @@ mod tests {
     fn unconsumed_tool_result_is_dropped() {
         let messages = render(&[result("nobody", "stray")]);
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn empty_ai_record_renders_no_message() {
+        // 既无文本也无工具调用的 `ai` 记录不得渲染为 assistant 消息（请求体非法）。
+        let messages = render(&[Record::ai("m", "h", "")]);
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn failed_hook_is_not_rendered() {
+        let records = vec![
+            hook_call("h1", "system_prompt", false),
+            result_with_code("h1", "SYS", 3),
+            Record::user("你好"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["user"]);
+        assert_eq!(messages[0].content.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn only_latest_successful_hook_is_rendered() {
+        let records = vec![
+            hook_call("h1", "system_prompt", false),
+            result_with_code("h1", "OLD", 0),
+            hook_call("h2", "system_prompt", false),
+            result_with_code("h2", "NEW", 0),
+            Record::user("你好"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["system", "user"]);
+        assert_eq!(messages[0].content.as_deref(), Some("NEW"));
+        assert_eq!(messages[1].content.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn later_failed_hook_keeps_earlier_success() {
+        // 只有「配对结果成功」的调用才是候选项：后一次失败不抹掉更早的成功提示词。
+        let records = vec![
+            hook_call("h1", "system_prompt", false),
+            result_with_code("h1", "OLD", 0),
+            hook_call("h2", "system_prompt", false),
+            result_with_code("h2", "BROKEN", 1),
+            Record::user("你好"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["system", "user"]);
+        assert_eq!(messages[0].content.as_deref(), Some("OLD"));
+        assert_eq!(messages[1].content.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn two_successful_hooks_precede_user_in_record_order() {
+        let records = vec![
+            hook_call("s1", "system_prompt", false),
+            result("s1", "SYS"),
+            hook_call("u1", "user_prompt", false),
+            result("u1", "USR"),
+            Record::user("你好"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["system", "system", "user"]);
+        assert_eq!(messages[0].content.as_deref(), Some("SYS"));
+        assert_eq!(messages[1].content.as_deref(), Some("USR"));
+        assert_eq!(messages[2].content.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn failed_hook_between_successes_does_not_render() {
+        let records = vec![
+            hook_call("s1", "system_prompt", false),
+            result("s1", "SYS"),
+            hook_call("s2", "user_prompt", false),
+            result_with_code("s2", "USR", 2),
+            Record::user("你好"),
+            Record::ai("m", "h", "回复"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["system", "user", "assistant"]);
+        assert_eq!(messages[0].content.as_deref(), Some("SYS"));
     }
 
     #[test]

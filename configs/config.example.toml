@@ -7,11 +7,14 @@
 # 提示词钩子每会话执行一次，llm 钩子每次运行执行一次。
 
 [hooks]
-# 内置模板由 `yaa --get-prompt system` 提供，可在此自由拼接。
-system_prompt = "echo \"工作目录：$(pwd)\" && yaa --get-prompt system"
+# 内置模板由 `"$YAA_BIN" --get-prompt system` 提供，可在此自由拼接。
+# `$YAA_BIN` 是当前 yaa 可执行文件的绝对路径，避免 PATH 中没有 yaa 时钩子失败。
+system_prompt = "echo \"工作目录：$(pwd)\" && \"$YAA_BIN\" --get-prompt system"
 # 没有 AGENTS.md 时输出为空，不当作失败。
 user_prompt = "if [ -f \"$GLB_CFG/AGENTS.md\" ]; then cat \"$GLB_CFG/AGENTS.md\"; fi"
 llm = "cat $YAA_CONFIG_HOME/llm.toml"
+# 单次钩子执行硬超时（秒），覆盖启动与读尽输出；超时整组击杀，绝不挂起。
+timeout_secs = 30
 
 [shell]
 # 单条命令超时（秒）。

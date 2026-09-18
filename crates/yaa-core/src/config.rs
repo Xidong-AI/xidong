@@ -9,13 +9,18 @@ use serde::Deserialize;
 
 use crate::paths;
 
-/// 默认系统提示词钩子：调用 `yaa --get-prompt system` 拼入内置模板。
-pub const DEFAULT_SYSTEM_PROMPT: &str = r#"echo "工作目录：$(pwd)" && yaa --get-prompt system"#;
+/// 默认系统提示词钩子：调用 `"$YAA_BIN" --get-prompt system` 拼入内置模板。
+///
+/// 用 `$YAA_BIN`（当前可执行文件绝对路径）而非裸 `yaa`，否则 PATH 中没有 yaa 时钩子
+/// 会静默失败；`hook_env` 负责注入该变量。
+pub const DEFAULT_SYSTEM_PROMPT: &str =
+    r#"echo "工作目录：$(pwd)" && "$YAA_BIN" --get-prompt system"#;
 /// 默认用户提示词钩子。
 pub const DEFAULT_USER_PROMPT: &str = "cat $GLB_CFG/AGENTS.md";
 /// 默认模型配置钩子。
 pub const DEFAULT_LLM: &str = "cat $YAA_CONFIG_HOME/llm.toml";
 
+const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const DEFAULT_MAX_STREAM_CHARS: usize = 32768;
 const DEFAULT_HEAD_CHARS: usize = 8192;
@@ -30,12 +35,14 @@ pub struct Config {
     pub agent: AgentConfig,
 }
 
-/// 钩子命令。
+/// 钩子命令与执行限额。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hooks {
     pub system_prompt: String,
     pub user_prompt: String,
     pub llm: String,
+    /// 单次钩子执行的硬超时（秒），覆盖启动与读尽输出的全过程。
+    pub timeout_secs: u64,
 }
 
 /// Shell 工具限额，可直接转成 `yaa_shell::ShellLimits`。
@@ -59,6 +66,7 @@ impl Default for Hooks {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             user_prompt: DEFAULT_USER_PROMPT.to_string(),
             llm: DEFAULT_LLM.to_string(),
+            timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
         }
     }
 }
@@ -106,6 +114,7 @@ struct RawHooks {
     system_prompt: Option<String>,
     user_prompt: Option<String>,
     llm: Option<String>,
+    timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,7 +148,9 @@ impl Config {
         };
         let raw: RawConfig = toml::from_str(&text)
             .map_err(|err| anyhow::anyhow!("解析配置失败 {}：{err}", path.display()))?;
-        Ok(merge(raw))
+        let config = merge(raw);
+        validate(&config)?;
+        Ok(config)
     }
 
     /// 用 `$YAA_CONFIG_HOME`/`XDG` 规则定位并加载配置。
@@ -164,6 +175,9 @@ fn merge(raw: RawConfig) -> Config {
         if let Some(value) = hooks.llm {
             config.hooks.llm = value;
         }
+        if let Some(value) = hooks.timeout_secs {
+            config.hooks.timeout_secs = value;
+        }
     }
     if let Some(shell) = raw.shell {
         if let Some(value) = shell.timeout_secs {
@@ -187,6 +201,34 @@ fn merge(raw: RawConfig) -> Config {
     config
 }
 
+/// 校验限额，非法时返回清晰错误而不是静默错误行为。
+fn validate(config: &Config) -> anyhow::Result<()> {
+    if config.hooks.timeout_secs < 1 {
+        anyhow::bail!(
+            "配置非法：hooks.timeout_secs 必须 >= 1，当前为 {}。",
+            config.hooks.timeout_secs
+        );
+    }
+    if config.shell.timeout_secs < 1 {
+        anyhow::bail!(
+            "配置非法：shell.timeout_secs 必须 >= 1，当前为 {}。",
+            config.shell.timeout_secs
+        );
+    }
+    let kept = config
+        .shell
+        .head_chars
+        .saturating_add(config.shell.tail_chars);
+    if kept > config.shell.max_stream_chars {
+        anyhow::bail!(
+            "配置非法：shell.head_chars + shell.tail_chars（{}）不能超过 shell.max_stream_chars（{}）。",
+            kept,
+            config.shell.max_stream_chars
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +248,7 @@ mod tests {
 system_prompt = "echo system"
 user_prompt = "echo user"
 llm = "cat llm.toml"
+timeout_secs = 7
 
 [shell]
 timeout_secs = 5
@@ -221,6 +264,7 @@ max_steps = 7
         assert_eq!(config.hooks.system_prompt, "echo system");
         assert_eq!(config.hooks.user_prompt, "echo user");
         assert_eq!(config.hooks.llm, "cat llm.toml");
+        assert_eq!(config.hooks.timeout_secs, 7);
         assert_eq!(
             config.shell,
             ShellConfig {
@@ -245,6 +289,7 @@ timeout_secs = 9
         assert_eq!(config.shell.timeout_secs, 9);
         assert_eq!(config.shell.head_chars, DEFAULT_HEAD_CHARS);
         assert_eq!(config.hooks.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(config.hooks.timeout_secs, DEFAULT_HOOK_TIMEOUT_SECS);
         assert_eq!(config.agent.max_steps, DEFAULT_MAX_STEPS);
     }
 
@@ -259,6 +304,57 @@ timeout_secs = 9
     fn invalid_toml_is_an_error() {
         let file = write_config("this is not = = toml");
         assert!(Config::load(file.path()).is_err());
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected() {
+        let file = write_config("[shell]\ntimeout_secs = 0\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("timeout_secs"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn zero_hook_timeout_is_rejected() {
+        let file = write_config("[hooks]\ntimeout_secs = 0\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("hooks.timeout_secs"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn head_plus_tail_exceeding_max_is_rejected() {
+        let file = write_config(
+            r#"
+[shell]
+max_stream_chars = 10
+head_chars = 8
+tail_chars = 5
+"#,
+        );
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("max_stream_chars"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn head_plus_tail_equal_to_max_is_accepted() {
+        let file = write_config(
+            r#"
+[shell]
+max_stream_chars = 10
+head_chars = 8
+tail_chars = 2
+"#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.shell.max_stream_chars, 10);
     }
 
     #[test]

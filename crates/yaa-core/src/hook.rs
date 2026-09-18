@@ -9,11 +9,15 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
 /// 单流输出上限（1 MiB）。超过即报错，不截断。
 const MAX_STREAM_BYTES: usize = 1024 * 1024;
+
+/// `killpg` 之后回收直接子进程的兜底宽限期。
+const REAP_GRACE: Duration = Duration::from_secs(2);
 
 /// 一次钩子执行的结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,21 +36,42 @@ pub enum HookError {
     TooLarge { stream: &'static str },
     #[error("钩子子进程缺少 {0} 管道")]
     MissingPipe(&'static str),
+    #[error("钩子执行超过 {secs} 秒超时，已终止整个进程组。")]
+    Timeout { secs: u64 },
 }
 
 type Result<T> = std::result::Result<T, HookError>;
 
 /// 执行钩子命令。
-pub async fn run(command: &str, cwd: &Path, env: &BTreeMap<String, String>) -> Result<HookOutcome> {
-    let mut child = tokio::process::Command::new("sh")
-        .arg("-c")
+///
+/// 硬性约束：从 `spawn` 到读尽两个流的**整个**过程都受 `timeout_secs` 约束。
+/// `sh` 以独立进程组启动，超时时对**整组**发 SIGKILL，因此即使钩子留下的后台子进程
+/// 仍攥着管道，`run` 也会在截止期内返回 `HookError::Timeout`，绝不永久挂起。
+pub async fn run(
+    command: &str,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    timeout_secs: u64,
+) -> Result<HookOutcome> {
+    let start = Instant::now();
+    let deadline = Duration::from_secs(timeout_secs);
+
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .envs(env)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        // 让 `sh` 自建进程组，超时时可击杀整组（含攥住管道的孙进程）。
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn()?;
+    // `process_group(0)` 下子进程组 id == 子进程 pid。
+    let pid = child.id();
 
     let stdout = child
         .stdout
@@ -57,22 +82,58 @@ pub async fn run(command: &str, cwd: &Path, env: &BTreeMap<String, String>) -> R
         .take()
         .ok_or(HookError::MissingPipe("stderr"))?;
 
-    let (out, err) = match drain_both(stdout, stderr).await {
-        Ok(pair) => pair,
-        Err(err) => {
-            // 超限时 `drain_both` 已停止读取；必须杀死进程，避免其阻塞在写管道上。
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+    let drain_deadline = deadline.saturating_sub(start.elapsed());
+    let (out, err) = match tokio::time::timeout(drain_deadline, drain_both(stdout, stderr)).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(err)) => {
+            // 超限时 `drain_both` 已停止读取；必须杀死进程组，避免其阻塞在写管道上。
+            kill_group(pid, &mut child);
+            reap(&mut child).await;
             return Err(err);
+        }
+        Err(_) => {
+            // 进程组里可能有攥住管道、永不 EOF 的后台子进程：整组击杀后立即返回。
+            kill_group(pid, &mut child);
+            reap(&mut child).await;
+            return Err(HookError::Timeout { secs: timeout_secs });
         }
     };
 
-    let status = child.wait().await?;
-    Ok(HookOutcome {
-        stdout: String::from_utf8_lossy(&out).into_owned(),
-        stderr: String::from_utf8_lossy(&err).into_owned(),
-        code: status.code().unwrap_or(-1),
-    })
+    // 管道已 EOF，但子进程可能尚未退出；再以剩余预算回收，整体仍不越过截止期。
+    let wait_budget = deadline
+        .saturating_sub(start.elapsed())
+        .max(Duration::from_millis(50));
+    match tokio::time::timeout(wait_budget, child.wait()).await {
+        Ok(status) => Ok(HookOutcome {
+            stdout: String::from_utf8_lossy(&out).into_owned(),
+            stderr: String::from_utf8_lossy(&err).into_owned(),
+            code: status?.code().unwrap_or(-1),
+        }),
+        Err(_) => {
+            kill_group(pid, &mut child);
+            reap(&mut child).await;
+            Err(HookError::Timeout { secs: timeout_secs })
+        }
+    }
+}
+
+/// 对整进程组发送 SIGKILL，并兜底直接杀子进程。
+fn kill_group(pid: Option<u32>, child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        // SAFETY: `pid` 是 `process_group(0)` 建立的子进程组 id，向整组发 SIGKILL
+        // 是唯一目的；参数有效，无内存影响。
+        unsafe {
+            libc::killpg(pid as i32, libc::SIGKILL);
+        }
+    }
+    // 进程组可能已不存在或非 unix：直接对子进程兜底。
+    let _ = child.start_kill();
+}
+
+/// 有界回收直接子进程，绝不永久阻塞。
+async fn reap(child: &mut tokio::process::Child) {
+    let _ = tokio::time::timeout(REAP_GRACE, child.wait()).await;
 }
 
 /// 并发读取两个流，任一流超过上限即返回错误。
@@ -137,6 +198,9 @@ pub fn fingerprint(name: &str, command: &str, extra: &str) -> String {
 mod tests {
     use super::*;
 
+    /// 常规测试用的宽松超时。
+    const TEST_TIMEOUT: u64 = 30;
+
     fn empty_env() -> BTreeMap<String, String> {
         BTreeMap::new()
     }
@@ -144,7 +208,9 @@ mod tests {
     #[tokio::test]
     async fn captures_stdout_and_code() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = run("echo hello", dir.path(), &empty_env()).await.unwrap();
+        let outcome = run("echo hello", dir.path(), &empty_env(), TEST_TIMEOUT)
+            .await
+            .unwrap();
         assert_eq!(outcome.stdout, "hello\n");
         assert_eq!(outcome.code, 0);
     }
@@ -152,9 +218,14 @@ mod tests {
     #[tokio::test]
     async fn captures_nonzero_code_and_stderr() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = run("echo oops >&2; exit 3", dir.path(), &empty_env())
-            .await
-            .unwrap();
+        let outcome = run(
+            "echo oops >&2; exit 3",
+            dir.path(),
+            &empty_env(),
+            TEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.code, 3);
         assert_eq!(outcome.stderr, "oops\n");
     }
@@ -164,7 +235,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut env = empty_env();
         env.insert("GLB_CFG".to_string(), "/cfg".to_string());
-        let outcome = run("printf '%s' \"$GLB_CFG\"", dir.path(), &env)
+        let outcome = run("printf '%s' \"$GLB_CFG\"", dir.path(), &env, TEST_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(outcome.stdout, "/cfg");
@@ -174,8 +245,48 @@ mod tests {
     async fn oversized_output_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         // 输出 2 MiB：超过上限必须报错而非截断。
-        let outcome = run("head -c 2097152 /dev/zero", dir.path(), &empty_env()).await;
+        let outcome = run(
+            "head -c 2097152 /dev/zero",
+            dir.path(),
+            &empty_env(),
+            TEST_TIMEOUT,
+        )
+        .await;
         assert!(matches!(outcome, Err(HookError::TooLarge { .. })));
+    }
+
+    #[tokio::test]
+    async fn hanging_hook_times_out_promptly() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let outcome = run("sleep 30", dir.path(), &empty_env(), 1).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, Err(HookError::Timeout { secs: 1 })),
+            "应返回 Timeout：{outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "超时应及时返回：{elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_child_holding_pipes_times_out_promptly() {
+        // `sh` 立即退出，但后台 `sleep` 继承并攥住 stdout/stderr 管道：
+        // 直接子进程的 kill 不够，必须整组击杀才不会永久挂起。
+        let dir = tempfile::tempdir().unwrap();
+        let started = Instant::now();
+        let outcome = run("sleep 30 &", dir.path(), &empty_env(), 1).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(outcome, Err(HookError::Timeout { secs: 1 })),
+            "应返回 Timeout：{outcome:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "超时应及时返回：{elapsed:?}"
+        );
     }
 
     #[test]
