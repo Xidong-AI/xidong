@@ -107,13 +107,14 @@ max_tokens  = 4096
 
 规则与不变量：
 
-1. 钩子以 `sh -c "<命令>"` 执行，cwd 为进程工作目录，环境含 `GLB_CFG`、`YAA_CONFIG_HOME`、`YAA_DATA_HOME`。
-2. **提示词钩子输出 = 完整系统/用户提示词**（替换语义，不叠加内置模板）。默认配置的钩子通过调用 `yaa --get-prompt system` 主动拼入内置模板。因此纯 `echo hi` 的钩子不会得到工具说明——这是使用者责任，默认配置给出可运行范例。
-3. **`llm` 钩子不落历史、不渲染**。其 stdout 含密钥，若按 `design.md` 记为 `tool_call`/`tool_result` 会同时污染 JSONL 与模型上下文。只记录一条 redacted 记录（不含 stdout，仅退出码与配置指纹），且渲染器永不将其变成消息。
-4. **钩子缓存判定键 = (钩子名，fingerprint, 成功)**。`fingerprint` = hash(命令 + 关键输入 + `yaa` 版本)。命令变化、内置模板升级或上次失败都会使缓存失效并重跑。失败不写成功标记，下次运行重试。
+1. 钩子以 `sh -c "<命令>"` 执行，cwd 为进程工作目录，环境含 `GLB_CFG`、`YAA_CONFIG_HOME`、`YAA_DATA_HOME`、`YAA_BIN`（当前 `yaa` 可执行文件路径，使默认钩子不依赖 `PATH`）。
+2. **提示词钩子输出 = 完整系统/用户提示词**（替换语义，不叠加内置模板）。默认配置的钩子通过调用 `"$YAA_BIN" --get-prompt system` 主动拼入内置模板。因此纯 `echo hi` 的钩子不会得到工具说明——这是使用者责任，默认配置给出可运行范例。
+3. **`llm` 钩子不落历史、不渲染**。其 stdout 含密钥，若按 `design.md` 记为 `tool_call`/`tool_result` 会同时污染 JSONL 与模型上下文。只记录一条 redacted 记录（不含 stdout 与命令，仅退出码与配置指纹），且渲染器永不将其变成消息。
+4. **钩子缓存判定键 = (钩子名，fingerprint, 成功)**。`fingerprint` = hash(命令 + cwd + 配置根 + 数据根 + `yaa` 版本)：换目录或升级都会失效并重跑。失败不写成功标记，下次运行重试。
 5. **`yaa --get-prompt <name>` 必须在加载 config、解析会话、执行任何钩子之前短路**，只打印内置模板。否则 `system_prompt` 钩子内部调用它会形成递归环。补一条递归防护测试。
 6. 钩子输出有**独立上限**（不复用 Shell 的截断）：超限直接报错退出，绝不静默裁掉提示词。
-7. 提示词钩子的执行记为 `tool_call(origin="hook")` + `tool_result`，渲染时转为一条 `system` 消息。
+7. 钩子执行有**硬超时**，并以进程组方式整组击杀（与 Shell 同一套方案），避免配置钩子挂死拖住 `yaa`。
+8. 提示词钩子的执行记为 `tool_call(origin="hook")` + `tool_result`；只有 `code == 0` 且是该钩子名最新的一条才会被渲染成 `system` 消息，失败与被取代的记录仅作审计保留。
 
 ## 记录 schema（阶段 1 冻结）
 
@@ -136,7 +137,7 @@ system      { type, id, ts, source, scope, content }
 
 ### 追加的原子性
 
-`yaa-store::append(&[Record])` 把整批记录序列化到一个 `Vec<u8>`，一次 `write_all`（`O_APPEND`）+ `fsync`。禁止对文件句柄逐条 `serde::to_writer`（多 syscall 会在同会话并发时交织出半行）。断电只会留下撕裂的尾行，`load` 读取时截断最后一个不完整行，丢弃半条记录。
+`yaa-store::append(&[Record])` 把整批记录序列化到一个 `Vec<u8>`，一次 `write_all`（`O_APPEND`）+ `fsync`。禁止对文件句柄逐条 `serde::to_writer`（多 syscall 会在同会话并发时交织出半行）。断电只会留下撕裂的尾行；**`append` 在写入前先修补尾行**：尾段能解析则补一个换行保留，否则截断到最后一个换行之后。`load` 同样容忍撕裂尾行。
 
 ## 渲染管线
 
@@ -144,7 +145,7 @@ system      { type, id, ts, source, scope, content }
 
 | 记录 | 渲染结果 |
 | ---- | -------- |
-| `tool_call(origin=hook)` + 配对 `tool_result` | `system` 消息（内容取 `stdout`） |
+| 每个钩子名最新一条 `tool_call(origin=hook)`，且配对 `tool_result` 的 `code == 0` | `system` 消息（内容取 `stdout`），置于消息列表最前 |
 | `user` | `user` 消息 |
 | `ai` + 其后 `tool_call(origin=ai)` | 一条 `assistant` 消息，工具调用进 `tool_calls` |
 | 配对 `tool_result` | `tool` 消息，`tool_call_id` 关联 |
@@ -153,15 +154,17 @@ system      { type, id, ts, source, scope, content }
 
 - 分组规则：按 `ai` 步骤切分，步骤内工具调用按出现顺序排列，`tool_result` 按 `call_id` 配对。
 - **失配兜底**：`ai` 步骤里的 `call_id` 若无对应 `tool_result`（断电、中断），渲染器合成一条 `tool` 消息（内容为中断标记），保证 `assistant.tool_calls` 后紧跟配对的 `tool` 消息，请求体始终合法。
+- **钩子去重**：每个钩子名只取最新一条 `code == 0` 且非 redacted 的调用，旧提示词与失败输出不进入上下文。
+- **空回合**：既无文本又无工具调用的 `ai` 记录不渲染消息（避免产生 `{"role":"assistant"}`）。
 - 工具以 OpenAI function schema 暴露，仅一个 `shell` 函数，参数 `command`（必填）与 `description`（可选）。
 - `tool_schema_hash` = hash(本轮暴露的 tools schema)，写入 `ai` 记录，用于历史兼容与缓存失效判定。
 
 ## 唯一工具：Shell
 
 - 执行 `sh -c <command>`，`stdin = null`（否则 `echo ... | yaa` 时工具子进程会偷走 stdin）。
-- **进程组**：`process_group(0)` 启动；超时时对整组 `killpg`，避免 `sh -c` 的孙进程持有管道导致读取挂死或孤儿继续运行。
+- **进程组**：`process_group(0)` 启动；超时时对整组 `killpg`，避免 `sh -c` 的孙进程持有管道导致读取挂死或孤儿继续运行。读取线程的等待也纳入同一时限：直接子进程退出但孙进程仍持有管道时不得无限等待，超时后放弃该流输出（`// PJ568 方案` 标注）。
 - **流式有界读取**：边读边写完整输出文件，内存中只保留头 `head_chars` 与尾 `tail_chars`。禁止先 `wait_with_output` 再截断（`yes` 之类会 OOM）。
-- 每个流一个完整输出文件，文件名 = 本地生成的 ULID + 流后缀（**不用模型给的 `call_id` 当文件名**，避免路径穿越与覆盖）；`output_files.stdout` / `output_files.stderr` 记相对**数据根**的路径。
+- 每个流一个完整输出文件，文件名 = 本地生成的 ULID + 流后缀（**不用模型给的 `call_id` 当文件名**，避免路径穿越与覆盖）；`output_files.stdout` / `output_files.stderr` 记相对**数据根**的路径；会话在数据根之外（`--session <任意路径>`）时回退记绝对路径，绝不静默留空。
 - 截断按**流分别计**的字符数（stdout、stderr 各自独立），入记录时做 lossy UTF-8，原始字节写文件。
 - 超时以 `timed_out: true` 标记，不借用 `code=-1`。
 - 阶段 1 默认 allow，无规则（审批在阶段 2；审批规则必须豁免 `origin=hook`，否则钩子会被卡死）。
@@ -206,11 +209,13 @@ async fn run_agent_loop(session, cfg, guard) -> Result<ExitCode> {
 - store 预留 `read_from(&session, offset) -> (Vec<Record>, new_offset)` 供阶段 4 跟随使用；`load` 容忍撕裂尾行。
 - `load` 每步重读，阶段 4 的 inbox 插入才能在下一轮被看到。
 - `store::ensure_prompt_hooks` 实为 core 函数（命名保留，但归属 core）。
+- **用户记录先落盘**：`run` 一进入就 append `user`，再执行钩子与模型调用；钩子或 `llm` 配置失败也不会丢失用户输入。
+- **空回复**：无文本且无工具调用时，记一条空 `ai` 记录、向 stderr 发提示并结束回合（退出 `0`），且该记录不渲染消息。
 
 ### 错误与退出策略
 
 - 模型 429/5xx/网络错误：指数退避重试 3 次；仍失败则以模型错误退出。此时历史停在「工具批次已完成」的合法状态，下次运行可续接。
-- 退出码：`0` 成功，`1` 通用错误，`2` 用法错误，`3` 配置/钩子错误，`4` 模型错误，`5` 达到 `max_steps`。
+- 退出码：`0` 成功，`1` 通用错误，`2` 用法错误，`3` 配置/钩子错误（含钩子执行失败），`4` 模型错误，`5` 达到 `max_steps`。
 - 空回复（无内容且无工具调用）视为回合结束，退出 `0`，并给出 stderr 提示。
 - 半批次收尾：模型失败或 Ctrl-C 后，已写入的 `tool_result` 保留；缺失的结果由渲染器兜底（见上）。
 
