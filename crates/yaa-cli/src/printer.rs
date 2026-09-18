@@ -68,10 +68,7 @@ impl EventSink for StderrSink {
             Event::HookStarted { name, command } => {
                 self.start_block();
                 Self::write_block_text(&format!("# {}", hook_description(&name)));
-                // `llm` 钩子命令可能内联密钥，绝不打印。
-                if name != "llm" {
-                    Self::write_block_text(&format!("% {command}"));
-                }
+                Self::write_block_text(&format!("% {command}"));
             }
             Event::Ai {
                 content,

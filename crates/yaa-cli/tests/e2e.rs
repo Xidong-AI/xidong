@@ -737,6 +737,16 @@ async fn default_transcript_prints_process_blocks() {
     assert!(stderr.contains("% echo SYS"), "stderr：{stderr}");
     assert!(stderr.contains("# 注入用户提示词"), "stderr：{stderr}");
     assert!(stderr.contains("% echo USR"), "stderr：{stderr}");
+    // 所有钩子一视同仁：`llm` 钩子同样打印命令，但其 stdout（含密钥）永不打印。
+    assert!(stderr.contains("# 加载模型配置"), "stderr：{stderr}");
+    assert!(
+        stderr.contains("% cat $YAA_CONFIG_HOME/llm.toml"),
+        "钩子命令应统一打印：{stderr}"
+    );
+    assert!(
+        !stderr.contains("sk-secret"),
+        "llm 钩子 stdout 含密钥，不得打印：{stderr}"
+    );
     assert!(stderr.contains("# 运行测试命令"), "stderr：{stderr}");
     assert!(
         stderr.contains("% printf 'OUT''TOKEN"),
