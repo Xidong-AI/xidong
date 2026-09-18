@@ -117,6 +117,7 @@ pub fn build_request(
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatResponse {
     pub content: Option<String>,
+    pub reasoning: Option<String>,
     pub tool_calls: Vec<AssistantToolCall>,
     pub finish_reason: Option<String>,
 }
@@ -132,6 +133,14 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse> {
     let content = message
         .get("content")
         .and_then(|value| value.as_str())
+        .map(str::to_string);
+
+    // 思考内容优先读 `reasoning_content`，缺失时回退 `reasoning`；两者都非字符串或
+    // 都没有则为 `None`。
+    let reasoning = message
+        .get("reasoning_content")
+        .and_then(|value| value.as_str())
+        .or_else(|| message.get("reasoning").and_then(|value| value.as_str()))
         .map(str::to_string);
 
     let tool_calls = message
@@ -153,6 +162,7 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse> {
 
     Ok(ChatResponse {
         content,
+        reasoning,
         tool_calls,
         finish_reason,
     })
@@ -333,6 +343,61 @@ model = "m"
         assert_eq!(response.content.as_deref(), Some("你好"));
         assert!(response.tool_calls.is_empty());
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn parse_reasoning_content() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "答案",
+                    "reasoning_content": "先想一下"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response = parse_response(&body).unwrap();
+        assert_eq!(response.reasoning.as_deref(), Some("先想一下"));
+    }
+
+    #[test]
+    fn parse_reasoning_fallback_field() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "答案",
+                    "reasoning": "回退思考"
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        let response = parse_response(&body).unwrap();
+        assert_eq!(response.reasoning.as_deref(), Some("回退思考"));
+    }
+
+    #[test]
+    fn parse_reasoning_missing_or_non_string_is_none() {
+        let missing = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "答案"},
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(parse_response(&missing).unwrap().reasoning, None);
+
+        let non_string = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "答案",
+                    "reasoning_content": {"nested": true}
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(parse_response(&non_string).unwrap().reasoning, None);
     }
 
     #[test]

@@ -60,6 +60,17 @@ tail_chars = 16
 max_steps = 10
 "#;
 
+/// 钩子 stdout 含标记的配置：命令字面量用 shell 拼接隐藏标记，只有输出才含完整 token。
+const HOOK_OUTPUT_CONFIG_TOML: &str = r#"
+[hooks]
+system_prompt = "printf 'HOOK''OUTTOKEN'"
+user_prompt = "printf 'USER''TOKEN'"
+llm = "cat $YAA_CONFIG_HOME/llm.toml"
+
+[agent]
+max_steps = 10
+"#;
+
 /// 假服务端共享状态：按序返回脚本化响应，并记录每个请求体与 `Authorization` 头。
 #[derive(Clone)]
 struct ServerState {
@@ -115,20 +126,43 @@ fn tool_call_response() -> Value {
 
 /// 指定 `call_id` 与命令的工具调用响应。
 fn tool_call_response_with(call_id: &str, command: &str) -> Value {
+    tool_call_response_full(call_id, command, None, None)
+}
+
+/// 完整工具调用响应：可指定 `description` 与 `reasoning_content`。
+fn tool_call_response_full(
+    call_id: &str,
+    command: &str,
+    description: Option<&str>,
+    reasoning: Option<&str>,
+) -> Value {
+    let mut arguments = serde_json::Map::new();
+    arguments.insert("command".to_string(), json!(command));
+    if let Some(description) = description {
+        arguments.insert("description".to_string(), json!(description));
+    }
+
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    message.insert("content".to_string(), Value::Null);
+    if let Some(reasoning) = reasoning {
+        message.insert("reasoning_content".to_string(), json!(reasoning));
+    }
+    message.insert(
+        "tool_calls".to_string(),
+        json!([{
+            "id": call_id,
+            "type": "function",
+            "function": {
+                "name": "shell",
+                "arguments": Value::Object(arguments).to_string()
+            }
+        }]),
+    );
+
     json!({
         "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": "shell",
-                        "arguments": json!({"command": command}).to_string()
-                    }
-                }]
-            },
+            "message": Value::Object(message),
             "finish_reason": "tool_calls"
         }]
     })
@@ -683,4 +717,135 @@ async fn multi_word_prompt_joined() {
         records[0]["content"], "你好 世界 ！",
         "多词位置参数应以单个空格连接"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_transcript_prints_process_blocks() {
+    let (addr, _state) = start_server(vec![
+        // 命令字面量不含 `OUTTOKEN`，只有 shell 拼接后的 stdout 才是它。
+        tool_call_response_full("call_1", "printf 'OUT''TOKEN'", Some("运行测试命令"), None),
+        text_response("FINALTOKEN"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+
+    let output = env.run(&["你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+
+    assert!(stderr.contains("# 注入系统提示词"), "stderr：{stderr}");
+    assert!(stderr.contains("% echo SYS"), "stderr：{stderr}");
+    assert!(stderr.contains("# 注入用户提示词"), "stderr：{stderr}");
+    assert!(stderr.contains("% echo USR"), "stderr：{stderr}");
+    assert!(stderr.contains("# 运行测试命令"), "stderr：{stderr}");
+    assert!(
+        stderr.contains("% printf 'OUT''TOKEN"),
+        "工具块应打印解析后的真实命令：{stderr}"
+    );
+    assert!(stderr.contains("---"), "多个块之间应有分隔线：{stderr}");
+    assert!(
+        stderr.trim_end().ends_with("---"),
+        "最终回复前应有分隔线：{stderr}"
+    );
+    assert!(!stderr.contains("OUTTOKEN"), "默认不打命令输出：{stderr}");
+    assert!(
+        !stderr.contains("FINALTOKEN"),
+        "末步正文只走 stdout：{stderr}"
+    );
+    assert!(stdout_of(&output).contains("FINALTOKEN"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verbose_shows_reasoning_and_outputs() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response_full("call_1", "printf 'OUT''TOKEN'", None, Some("THINKTOKEN")),
+        text_response("FINALTOKEN"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+
+    let output = env.run(&["--verbose", "你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+
+    assert!(
+        stderr.contains("# 思考"),
+        "verbose 应打印思考标题：{stderr}"
+    );
+    assert!(
+        stderr.contains("THINKTOKEN"),
+        "verbose 应打印思考内容：{stderr}"
+    );
+    assert!(
+        stderr.contains("OUTTOKEN"),
+        "verbose 应打印命令输出：{stderr}"
+    );
+
+    assert!(
+        stderr.trim_end().ends_with("---"),
+        "最终回复前应有分隔线：{stderr}"
+    );
+
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("FINALTOKEN"), "stdout：{stdout}");
+    assert!(
+        !stdout.contains("OUTTOKEN"),
+        "stdout 不应含命令输出：{stdout}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_suppresses_transcript() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response_full("call_1", "printf 'OUT''TOKEN'", None, None),
+        text_response("FINALTOKEN"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+
+    let output = env.run(&["--quiet", "你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    let stderr = stderr_of(&output);
+
+    assert!(stderr.is_empty(), "quiet 应让 stderr 完全干净：{stderr}");
+    assert!(stdout_of(&output).contains("FINALTOKEN"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trace_flag_is_removed() {
+    let env = TestEnv::new(0);
+    let output = env.run(&["--trace", "你好"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "已删除的 --trace 应为用法错误，stderr：{}",
+        stderr_of(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hook_output_is_never_printed() {
+    // 默认与 verbose 都只显示钩子的描述与命令，输出一律不打印（尤其 `llm` 钩子输出含密钥）。
+    for args in [vec!["你好"], vec!["--verbose", "你好"]] {
+        let (addr, _state) = start_server(vec![text_response("FINALTOKEN")]).await;
+        let env = TestEnv::new(addr.port());
+        env.write_config(HOOK_OUTPUT_CONFIG_TOML);
+
+        let output = env.run(&args);
+        assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+        let stderr = stderr_of(&output);
+
+        assert!(
+            stderr.contains("# 注入系统提示词"),
+            "钩子描述应打印（{args:?}）：{stderr}"
+        );
+        assert!(
+            stderr.contains("% printf 'HOOK''OUTTOKEN'"),
+            "钩子命令应打印（{args:?}）：{stderr}"
+        );
+        assert!(
+            !stderr.contains("HOOKOUTTOKEN") && !stderr.contains("USERTOKEN"),
+            "钩子输出不得打印（{args:?}）：{stderr}"
+        );
+    }
 }

@@ -50,6 +50,7 @@ cp configs/config.example.toml ~/.config/yaa/config.toml
 
 ```bash
 yaa 你好                          # a single run, multiple steps internally
+yaa read the file here            # multiple positional args join with spaces
 yaa                               # read the prompt from stdin
 echo "summarize this repo" | yaa
 yaa --clear                       # archive the current directory's session
@@ -58,10 +59,12 @@ yaa --get-prompt system           # print the built-in system prompt template
 yaa --cwd /path/to/project 你好    # set the working directory
 yaa --session /path/to/default.jsonl 你好
 yaa --config /path/to/config.toml 你好
-yaa --verbose                     # hook and tool events on stderr
-yaa --trace                       # tool commands on stderr
+yaa --verbose                     # also show reasoning and command output
 yaa --quiet                       # print only the final reply
 ```
+
+By default the process log goes to stderr: hook and tool commands are printed as `# description` / `% command` blocks separated by `---`, together with the assistant text of non-final steps; the final reply goes to stdout only, so `yaa 你好 > reply.txt` stays clean.
+`--verbose` adds the model's reasoning and tool command output; hooks only show their description and command, and hook output is never printed. `--quiet` suppresses the whole process log.
 
 Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook error, `4` model error, `5` reached `max_steps`.
 

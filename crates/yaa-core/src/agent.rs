@@ -161,12 +161,10 @@ impl Runner<'_> {
                 }
             };
             self.sink.emit(Event::Ai {
-                content_len: response
-                    .content
-                    .as_deref()
-                    .map(|text| text.chars().count())
-                    .unwrap_or(0),
-                tool_calls: response.tool_calls.len(),
+                content: response.content.clone().unwrap_or_default(),
+                reasoning: response.reasoning.clone(),
+                // `final_step` 用**原始**工具调用判断，避免清洗结果影响「是否末步」。
+                final_step: response.tool_calls.is_empty(),
             });
 
             // 既无文本也无工具调用：不算错误（退出码仍为 0），但要明确告知用户，
@@ -203,12 +201,6 @@ impl Runner<'_> {
             yaa_store::append(&self.session, &batch)?;
 
             if tool_calls.is_empty() {
-                self.sink.emit(Event::TurnEnd {
-                    reason: response
-                        .finish_reason
-                        .clone()
-                        .unwrap_or_else(|| "no_tool_calls".to_string()),
-                });
                 return Ok(ExitCode::Success);
             }
 
@@ -254,10 +246,6 @@ impl Runner<'_> {
                         return Ok(Some(ExitCode::Config));
                     }
                 };
-            self.sink.emit(Event::HookFinished {
-                name: name.to_string(),
-                code: outcome.code,
-            });
 
             // 成功与否都成对写入：失败不写成功标记，下次运行按指纹重试。
             let call_id = format!("hook-{name}-{}", ulid::Ulid::new());
@@ -317,11 +305,6 @@ impl Runner<'_> {
                     return Ok(Err(ExitCode::Config));
                 }
             };
-        self.sink.emit(Event::HookFinished {
-            name: name.to_string(),
-            code: outcome.code,
-        });
-
         // 只记指纹，命令与 stdout 都可能内联密钥，一律不落盘；也不配 tool_result，
         // 渲染器永不消费它。
         let audit = Record::tool_call(
@@ -356,9 +339,35 @@ impl Runner<'_> {
 
     /// 解析并执行一次模型工具调用，返回 `tool_result` 记录（错误也编码为记录）。
     async fn execute_tool_call(&self, call: &AssistantToolCall) -> Record {
+        // 先解析参数，解析完成后才上报一次 `ToolStarted`：
+        // - shell 且 JSON 合法且有字符串 `command`：命令用解析值，描述取非空 `description`；
+        // - 其余情况（非 shell、JSON 非法、缺 `command`）：命令回退为原始参数，描述置空。
+        let (parsed, parse_error) = if call.name == "shell" {
+            match serde_json::from_str::<serde_json::Value>(&call.arguments) {
+                Ok(value) => (Some(value), None),
+                Err(err) => (None, Some(err)),
+            }
+        } else {
+            (None, None)
+        };
+        let command = parsed
+            .as_ref()
+            .and_then(|value| value.get("command"))
+            .and_then(|value| value.as_str());
+        // 只在命令可用时才展示描述，避免「缺 command」的失败调用仍带出描述。
+        let description = command.and_then(|_| {
+            parsed
+                .as_ref()
+                .and_then(|value| value.get("description"))
+                .and_then(|value| value.as_str())
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        });
+
         self.sink.emit(Event::ToolStarted {
             call_id: call.id.clone(),
-            command: call.arguments.clone(),
+            command: command.unwrap_or(call.arguments.as_str()).to_string(),
+            description,
         });
 
         if call.name != "shell" {
@@ -366,15 +375,11 @@ impl Runner<'_> {
             return self.finish_tool_call(call, -1, false, false, message);
         }
 
-        let parsed: serde_json::Value = match serde_json::from_str(&call.arguments) {
-            Ok(value) => value,
-            Err(err) => {
-                let message = format!("工具参数不是合法 JSON：{err}");
-                return self.finish_tool_call(call, -1, false, false, message);
-            }
-        };
-        let Some(command) = parsed.get("command").and_then(|value| value.as_str()) else {
-            let message = "工具参数缺少字符串字段 `command`。".to_string();
+        let Some(command) = command else {
+            let message = match &parse_error {
+                Some(err) => format!("工具参数不是合法 JSON：{err}"),
+                None => "工具参数缺少字符串字段 `command`。".to_string(),
+            };
             return self.finish_tool_call(call, -1, false, false, message);
         };
 
@@ -392,6 +397,8 @@ impl Runner<'_> {
                     code: output.code,
                     timed_out: output.timed_out,
                     truncated: output.truncated,
+                    stdout: output.stdout.clone(),
+                    stderr: output.stderr.clone(),
                 });
                 shell_output_to_record(&output, self.data_root)
             }
@@ -416,6 +423,8 @@ impl Runner<'_> {
             code,
             timed_out,
             truncated,
+            stdout: String::new(),
+            stderr: stderr.clone(),
         });
         Record::tool_result(
             call.id.clone(),
@@ -624,6 +633,7 @@ mod tests {
     fn text_response(content: &str) -> ChatResponse {
         ChatResponse {
             content: Some(content.to_string()),
+            reasoning: None,
             tool_calls: Vec::new(),
             finish_reason: Some("stop".to_string()),
         }
@@ -632,6 +642,7 @@ mod tests {
     fn call_response(call_id: &str, arguments: &str) -> ChatResponse {
         ChatResponse {
             content: None,
+            reasoning: None,
             tool_calls: vec![AssistantToolCall {
                 id: call_id.to_string(),
                 name: "shell".to_string(),
@@ -644,6 +655,7 @@ mod tests {
     fn calls_response(calls: &[(&str, &str)]) -> ChatResponse {
         ChatResponse {
             content: None,
+            reasoning: None,
             tool_calls: calls
                 .iter()
                 .map(|(id, arguments)| AssistantToolCall {
@@ -887,6 +899,7 @@ mod tests {
         };
         let model = FakeModel::new(vec![ChatResponse {
             content: None,
+            reasoning: None,
             tool_calls: Vec::new(),
             finish_reason: Some("stop".to_string()),
         }]);

@@ -18,6 +18,7 @@
 | D10 | 状态根按 XDG 拆分：`YAA_CONFIG_HOME` + `YAA_DATA_HOME`，`GLB_CFG` 指向配置根 | 用户选择 |
 | D11 | 提示词钩子为替换语义：钩子 stdout 即完整提示词 | 用户选择；默认配置由 `yaa --get-prompt` 拼内置模板 |
 | D12 | `ai` 与 `tool_call` 保持分离记录，以单批缓冲原子追加 | 用户选择；忠于 `design.md:31-33` |
+| D13 | 过程记录默认打到 stderr（`# 描述` / `% 命令` / 块间 `---`，含非末步模型正文）；`--verbose` 追加思考与命令输出；删除 `--trace` | 用户要求对齐 `design.md` 示例观感；`--quiet` 保留为仅最终回复 |
 
 ## 对 design.md 的更正
 
@@ -222,16 +223,18 @@ async fn run_agent_loop(session, cfg, guard) -> Result<ExitCode> {
 ## CLI（阶段 1）
 
 ```plaintext
-yaa [PROMPT]              # 空则从 stdin 读
+yaa [PROMPT]...           # 多个位置参数以空格连接；空则从 stdin 读
 yaa --clear               # 归档当前会话
 yaa --status              # 打印会话摘要
 yaa --session <path>      # 指定会话文件
 yaa --get-prompt system|user
 yaa --config <path>
 yaa --cwd <path>          # 改变进程工作目录
-yaa --verbose | --quiet
-yaa --trace               # 工具调用打到 stderr
+yaa --verbose             # 追加思考内容与命令输出
+yaa --quiet               # 只打印最终回复
 ```
+
+过程记录默认打到 stderr：钩子与工具命令为 `# 描述` + `% 命令`，块间 `---`；非末步的模型正文也在此打印，末步回复只走 stdout（见 D13）。
 
 后移到阶段 2 及以后：`--json`（事件 schema 未定，随 core 的 `EventSink` 一起定义）、`--no-store`、`--approve`、`--notify --to`。
 

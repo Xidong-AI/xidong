@@ -50,6 +50,7 @@ cp configs/config.example.toml ~/.config/yaa/config.toml
 
 ```bash
 yaa 你好                          # 单次运行，内部可多步
+yaa 检查目录 /path                # 多个位置参数以空格连接为提示词
 yaa                               # 从 stdin 读提示词
 echo "总结这个仓库" | yaa
 yaa --clear                       # 归档当前目录的会话
@@ -58,10 +59,12 @@ yaa --get-prompt system           # 打印内置系统提示词模板
 yaa --cwd /path/to/project 你好    # 指定工作目录
 yaa --session /path/to/default.jsonl 你好
 yaa --config /path/to/config.toml 你好
-yaa --verbose                     # 钩子与工具事件打到 stderr
-yaa --trace                       # 工具命令打到 stderr
+yaa --verbose                     # 追加思考内容与命令输出
 yaa --quiet                       # 只打印最终回复
 ```
+
+默认把过程记录打到 stderr：钩子与工具命令按 `# 描述` / `% 命令` 成块打印，块间以 `---` 分隔，并打印非末步的模型正文；末步回复只走 stdout，因此 `yaa 你好 > 回复.txt` 仍然只得到最终回复。
+`--verbose` 在此基础上追加模型的思考内容与工具命令输出；钩子只显示描述与命令，其输出一律不打印。`--quiet` 则抑制全部过程记录。
 
 退出码：`0` 成功，`1` 通用错误，`2` 用法错误，`3` 配置或钩子错误，`4` 模型错误，`5` 达到 `max_steps`。
 

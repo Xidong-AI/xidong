@@ -189,7 +189,7 @@ async fn run_agent(
     config_root: &Path,
     data_root: &Path,
 ) -> Result<i32, CliError> {
-    let sink = StderrSink::new(cli.verbose, cli.trace, cli.quiet);
+    let sink = StderrSink::new(cli.verbose, cli.quiet);
 
     let config_path = cli
         .config
@@ -229,12 +229,16 @@ async fn run_agent(
     // stdout 只承载「成功的最终助手文本」：失败回合（模型/配置/用法错误）的原因已由
     // stderr 报告，若再打印上一条历史回复会把过期答案伪装成本次结果。
     match exit {
-        ExitCode::Success => print_final_ai(&resolved.session)?,
+        ExitCode::Success => {
+            sink.finish_transcript();
+            print_final_ai(&resolved.session)?;
+        }
         ExitCode::MaxSteps => {
             eprintln!(
                 "警告：达到最大步数 {}，已停止；以下为当前最终回复。",
                 config.agent.max_steps
             );
+            sink.finish_transcript();
             print_final_ai(&resolved.session)?;
         }
         // 其他退出码：stdout 保持干净。

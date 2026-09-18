@@ -9,24 +9,27 @@ pub enum Event {
     Notice { content: String },
     /// 钩子开始执行。
     HookStarted { name: String, command: String },
-    /// 钩子执行结束。
-    HookFinished { name: String, code: i32 },
     /// 收到一次模型回复。
     Ai {
-        content_len: usize,
-        tool_calls: usize,
+        content: String,
+        reasoning: Option<String>,
+        final_step: bool,
     },
     /// 工具开始执行。
-    ToolStarted { call_id: String, command: String },
+    ToolStarted {
+        call_id: String,
+        command: String,
+        description: Option<String>,
+    },
     /// 工具执行结束。
     ToolFinished {
         call_id: String,
         code: i32,
         timed_out: bool,
         truncated: bool,
+        stdout: String,
+        stderr: String,
     },
-    /// 回合结束。
-    TurnEnd { reason: String },
 }
 
 /// 事件接收器。
@@ -74,13 +77,10 @@ mod tests {
             command: "cat llm.toml".to_string(),
         });
         sink.emit(Event::Ai {
-            content_len: 3,
-            tool_calls: 2,
+            content: "你好".to_string(),
+            reasoning: Some("思考".to_string()),
+            final_step: false,
         });
-        sink.emit(Event::TurnEnd {
-            reason: "stop".to_string(),
-        });
-
         assert_eq!(
             sink.take(),
             vec![
@@ -89,11 +89,9 @@ mod tests {
                     command: "cat llm.toml".to_string(),
                 },
                 Event::Ai {
-                    content_len: 3,
-                    tool_calls: 2,
-                },
-                Event::TurnEnd {
-                    reason: "stop".to_string(),
+                    content: "你好".to_string(),
+                    reasoning: Some("思考".to_string()),
+                    final_step: false,
                 },
             ]
         );

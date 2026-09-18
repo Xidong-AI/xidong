@@ -156,15 +156,14 @@ $ yaa --approve
 ## 参数（待定）
 
 ```plaintext
-yaa [PROMPT]                 # 空则从 stdin 读
+yaa [PROMPT]...              # 多个位置参数以空格连接；空则从 stdin 读
 yaa -- "[PROMPT]"            # 同上
 yaa --status                 # 看会话摘要
 yaa --session $path_to/session.jsonl
 yaa --clear                  # 内部归档我希望在当前目录的会话已有一个 yaa 在运行循环中的时候再运行 `yaa "内容"` 能把这个消息插入并继续输出直到循环结束。
-yaa --verbose
+yaa --verbose                # 追加思考内容与命令输出
 yaa --quiet                  # 仅打印最终结果输出
 yaa --get-prompt system|……   # 仅打印相关提示词
-yaa --trace                  # 工具调用打到 stderr
 yaa --json                   # 结构化事件
 yaa --approve                # 同意一次
 yaa --cwd="……"               # 设置会话目录

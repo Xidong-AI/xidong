@@ -46,8 +46,4 @@ pub struct Cli {
     /// 只在 stdout 打印最终回复。
     #[arg(long)]
     pub quiet: bool,
-
-    /// 把每个工具命令打到 stderr。
-    #[arg(long)]
-    pub trace: bool,
 }
