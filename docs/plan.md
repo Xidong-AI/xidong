@@ -49,7 +49,7 @@ yaa-msg  ←  yaa-store  ←  yaa-core  ←  yaa-cli
 ```
 
 - `yaa-shell` 不依赖 `yaa-msg`：它自持 `ShellLimits`，返回纯输出结构，由 `yaa-core` 组装成记录。
-- `yaa-cli` 只依赖 `yaa-core`：`--clear`/`--status`/`--get-prompt` 由 core 提供，不额外连 store，避免多边。
+- `yaa-cli` 依赖 `yaa-core`，并直接依赖 `yaa-msg`/`yaa-store` 实现 `--clear`/`--status` 的会话运维；stdout/stderr 策略完全在 cli。
 - `config` 类型归 `yaa-core`；`yaa-store` 只接受 `Path`，不依赖 config。
 - `yaa-core` 通过 `EventSink`（trait 或闭包）向 cli 输出事件，stdout/stderr 策略完全在 cli。
 
