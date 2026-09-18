@@ -5,13 +5,15 @@
 
 use sha2::{Digest, Sha256};
 
-const SYSTEM_TEMPLATE: &str = r#"你是 YAA，一个以 Shell 为唯一工具的智能体。
+const SYSTEM_TEMPLATE: &str = r#"当前智能体环境是 YAA，一个以 Shell 为唯一工具的智能体。
 
 可用工具只有 `shell` 一个函数。需要执行命令时，调用 `shell`，参数为：
+
 - `command`（必填）：要执行的 shell 命令字符串。
 - `description`（可选）：一句话说明命令用途。
 
 规则：
+
 1. 一次只调用一个 `shell`，等待结果返回后再决定下一步。
 2. 不要编造命令输出；观察真实结果后再回答。
 3. 任务完成后用自然语言给出最终答复，不要继续调用工具。
