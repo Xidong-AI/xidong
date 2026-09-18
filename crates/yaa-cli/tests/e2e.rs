@@ -210,30 +210,34 @@ async fn e2e_tool_call_then_finish() {
         stdout_of(&output)
     );
 
-    // 断言 2：JSONL 顺序。
+    // 断言 2：JSONL 顺序。用户记录先落盘（配置/钩子失败也不丢用户输入），
+    // 随后才是提示词钩子与 llm 审计记录。
     let session = env.session_file();
     let records = read_jsonl(&session);
 
-    assert_eq!(records[0]["type"], "tool_call");
-    assert_eq!(records[0]["origin"], "hook");
-    assert_eq!(records[0]["hook"]["name"], "system_prompt");
-    assert_eq!(records[1]["type"], "tool_result");
+    assert_eq!(records[0]["type"], "user");
+    assert_eq!(records[0]["content"], "你好");
 
-    assert_eq!(records[2]["type"], "tool_call");
-    assert_eq!(records[2]["hook"]["name"], "user_prompt");
-    assert_eq!(records[3]["type"], "tool_result");
+    assert_eq!(records[1]["type"], "tool_call");
+    assert_eq!(records[1]["origin"], "hook");
+    assert_eq!(records[1]["hook"]["name"], "system_prompt");
+    assert_eq!(records[2]["type"], "tool_result");
 
-    let user_pos = records
-        .iter()
-        .position(|record| record["type"] == "user")
-        .expect("应有 user 记录");
+    assert_eq!(records[3]["type"], "tool_call");
+    assert_eq!(records[3]["hook"]["name"], "user_prompt");
+    assert_eq!(records[4]["type"], "tool_result");
+
+    let user_pos = 0usize;
     let llm_pos = records
         .iter()
         .position(|record| record["type"] == "tool_call" && record["hook"]["name"] == "llm")
         .expect("应有 llm 审计记录");
-    assert!(llm_pos < user_pos, "llm 审计记录应在 user 之前");
+    assert!(llm_pos > user_pos, "llm 审计记录应在 user 之后");
     assert_eq!(records[llm_pos]["redacted"], true, "llm 记录必须 redacted");
-    assert_eq!(records[user_pos]["content"], "你好");
+    assert_eq!(
+        records[llm_pos]["command"], "",
+        "llm 审计记录不得保存可能内联密钥的命令"
+    );
 
     let ai_pos = records
         .iter()
