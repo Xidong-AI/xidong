@@ -28,7 +28,7 @@
 3. **单根 `$GLB_CFG`**：`design.md:186` 让配置、会话、历史同根。更正为按 XDG 拆分配置根与数据根（见「状态根目录」），`GLB_CFG` 仅作为配置根暴露给钩子。
 4. **`turn_end` 记录**：`design.md:342` 出现但不在记录清单内。约定：**无 `tool_call` 的 `ai` 记录即为回合结束**，不引入独立类型。
 5. **记录缺 `id`**：`design.md:31,32,37` 的 `user`/`ai`/`system` 无 `id`，无法支撑阶段 4 的幂等去重（`design.md:361,366`）。更正为**所有记录都有 `id`**，工具结果另用 `call_id` 关联。
-6. **截断产物无载体**：`design.md:50` 未定义完整输出的路径字段。更正为 `tool_result` 增加可选 `output_file` 与 `truncated`。
+6. **截断产物无载体**：`design.md:50` 未定义完整输出的路径字段。更正为 `tool_result` 增加可选 `output_files`（stdout/stderr 分两个文件）与 `truncated`。
 7. **`client_id`/`turn_id`**（`design.md:301`）预留进 schema，阶段 4 使用。
 
 ## 目标架构（阶段 1）
@@ -64,13 +64,13 @@ $YAA_CONFIG_HOME   默认 ${XDG_CONFIG_HOME:-$HOME/.config}/yaa
 
 $YAA_DATA_HOME     默认 ${XDG_DATA_HOME:-$HOME/.local/share}/yaa
   sessions/<sid>/default.jsonl
-  sessions/<sid>/outputs/<ulid>.out
+  sessions/<sid>/outputs/<ulid>.{stdout,stderr}.out
   sessions/<sid>/summaries/<key>.json      # 阶段 3 摘要缓存
   history/<sid>/sessions-<ts>.jsonl
 ```
 
 - 启动时导出 `YAA_CONFIG_HOME`、`YAA_DATA_HOME`，并令 `GLB_CFG=$YAA_CONFIG_HOME` 兼容 `design.md` 的钩子写法。
-- **会话根 = JSONL 文件的父目录**。这样 `--session <path>` 指向任意文件时，`outputs/` 等相对资源定位一致。
+- **会话根 = JSONL 文件的父目录**，`outputs/` 挂在会话根下。`output_files` 存相对**数据根**的路径，归档后仍可解析。
 - `<sid>` = `hex(sha256(canonical_cwd))` 前 32 位十六进制（128 位）。
 - `--cwd <path>` 的语义固定为：**改变进程工作目录**，同时用于 sid 计算、钩子 cwd 与 Shell cwd（三处一致）。不存在时明确报错。
 - `canonicalize` 失败（目录已删、符号链接断裂）时回退词法规范化并给出警告，不静默。
@@ -125,7 +125,7 @@ ai          { type, id, ts, model, tool_schema_hash, content }
 tool_call   { type, id, ts, origin: hook|ai|user, call_id, command, description,
               hook?: {name, fingerprint}, redacted? }
 tool_result { type, id, ts, call_id, stdout, stderr, code, timed_out,
-              truncated, output_file? }
+              truncated, output_files?: { stdout?, stderr? } }
 system      { type, id, ts, source, scope, content }
 ```
 
@@ -161,11 +161,11 @@ system      { type, id, ts, source, scope, content }
 - 执行 `sh -c <command>`，`stdin = null`（否则 `echo ... | yaa` 时工具子进程会偷走 stdin）。
 - **进程组**：`process_group(0)` 启动；超时时对整组 `killpg`，避免 `sh -c` 的孙进程持有管道导致读取挂死或孤儿继续运行。
 - **流式有界读取**：边读边写完整输出文件，内存中只保留头 `head_chars` 与尾 `tail_chars`。禁止先 `wait_with_output` 再截断（`yes` 之类会 OOM）。
-- 完整输出文件名 = 本地生成的 ULID（**不用模型给的 `call_id` 当文件名**，避免路径穿越与覆盖），`output_file` 记相对会话根的路径。
+- 每个流一个完整输出文件，文件名 = 本地生成的 ULID + 流后缀（**不用模型给的 `call_id` 当文件名**，避免路径穿越与覆盖）；`output_files.stdout` / `output_files.stderr` 记相对**数据根**的路径。
 - 截断按**流分别计**的字符数（stdout、stderr 各自独立），入记录时做 lossy UTF-8，原始字节写文件。
 - 超时以 `timed_out: true` 标记，不借用 `code=-1`。
 - 阶段 1 默认 allow，无规则（审批在阶段 2；审批规则必须豁免 `origin=hook`，否则钩子会被卡死）。
-- 输出文件清理策略：阶段 1 随 `--clear` 一并移入 `history/`；磁盘无界增长作为已知限制记录，阶段 3 再引入保留策略。
+- 输出文件清理策略：**`--clear` 不移动 `outputs/`**，归档记录中的相对路径继续有效；磁盘无界增长作为已知限制记录，阶段 3 再引入保留策略。
 
 ## Agent loop 与并发形状（阶段 1）
 
@@ -243,7 +243,7 @@ yaa --trace               # 工具调用打到 stderr
 1. `yaa "你好"` 在无工具调用时打印模型回复，`default.jsonl` 留下提示词钩子的 `tool_call`/`tool_result`、`user`、`ai`。
 2. 再次 `yaa "继续"` 能读到上一轮并正确渲染续接；**断言第二跳请求体**符合 OpenAI 消息序列。
 3. 构造需要 Shell 的多步任务，工具结果回填并循环至最终回答。
-4. `--clear` 把 `default.jsonl` 与 `outputs/` 移入 `history/<sid>/sessions-<ts>/` 后开新历史。
+4. `--clear` 把 `default.jsonl` 移入 `history/<sid>/sessions-<ts>.jsonl` 后开新历史；`outputs/` 留在原地，归档记录的相对路径仍有效。
 5. 集成测试用本地假 OpenAI 服务器，断言 JSONL 序列与 Shell 副作用；**断言请求体与 JSONL 均不含 `api_key`**。
 6. 递归防护测试：`system_prompt` 钩子内部调用 `yaa --get-prompt system` 能正常返回而非递归。
 7. 中断测试：模型返回 `tool_calls` 后进程被杀，下次运行渲染器合成中断 `tool` 消息，请求体合法。
