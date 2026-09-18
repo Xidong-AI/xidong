@@ -1,0 +1,15 @@
+# yaa 模型供应配置示例。
+#
+# 复制到 $YAA_CONFIG_HOME/llm.toml（默认 ~/.config/yaa/llm.toml），由 `llm` 钩子
+# 读取并输出给 yaa。文件含密钥，请勿提交到版本库。
+
+base_url = "https://api.deepseek.com"
+api_key = "sk-……"
+model = "deepseek-chat"
+
+# 以下均为可选，缺省值为 provider = "openai"、temperature = 0.7、max_tokens = 4096。
+provider = "openai"
+temperature = 0.7
+max_tokens = 4096
+
+# base_url 已以 /v1 结尾时直接补 /chat/completions，否则补 /v1/chat/completions。

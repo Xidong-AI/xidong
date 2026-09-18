@@ -8,66 +8,65 @@
 ## 提交信息格式
 
 提交信息应遵循 [PJ568 提交说明规范](https://github.com/PJ-568/git-commit-regulation)。
+仓库自带校验钩子，首次克隆后启用：
 
-## 客户端
+```bash
+git config core.hooksPath .githooks
+```
 
-### 客户端代码格式
+`commit-msg` 钩子校验提交信息语法与排版（需要 `node`；已安装 `autocorrect` 时一并检查中英符号空格），`pre-commit` 钩子对暂存文件运行 `autocorrect --lint`。
 
-1. 使用两个空格缩进。
+## 项目结构
 
-### 引入图标
+```plaintext
+crates/
+  yaa-cli/    二进制 yaa：参数解析、入口、stdout/stderr 策略
+  yaa-core/   配置与路径、钩子、模型调用、渲染、agent loop、事件
+  yaa-store/  会话 JSONL 读写、按偏移读、归档
+  yaa-shell/  唯一工具：执行、超时、截断、完整输出落盘
+  yaa-msg/    记录类型与序列化
+```
 
-1. 在 [tabler icons](https://tabler.io/icons) 中选择合适的图标时，请使用 `.svg` 格式。
-2. 将 `svg` 代码转为 CSS 中的 `background-image:url(data:..)` 格式并存入 `client/css/icon.css` 文件夹中。
-3. 在 HTML 中引入。
+设计背景见 [docs/design.md](docs/design.md)，实施计划见 [docs/plan.md](docs/plan.md)。
 
-## 服务端
+## 开发环境
 
-### 范围
-
-项目当前定义的范围如下：
-
-- `智能体（agent）`：智能体核心实现
-- `核心（core）`：基础数据结构与框架
-- `命令行（cli）`：命令行接口
-- `网页（web）`：网页接口
-- `工具（agent/tools）`：智能体工具实现
-
-### 服务端开发环境配置
-
-1. 安装 cargo 和 Rust。
+1. 安装 cargo 与 Rust。
 2. 配置 cargo 镜像源（可选）。
-3. VSCode 配置：
+3. 编辑器：安装 rust-analyzer 扩展。
 
-   - 安装 rust-analyzer 扩展。
+## 代码格式
 
-### 服务端测试
+- Rust 使用四个空格缩进，提交前运行 `cargo fmt`。
+- Markdown、TOML 等文本文件使用 `autocorrect --fix <路径>` 规范中英符号间空格。
 
-- 运行 `cargo check` 命令，确保没有代码格式错误。
-- 运行 `cargo test` 命令，确保所有测试用例通过。
-- 运行 `cargo run` 命令以测试命令行交互模式：
-- 运行 `cargo run --serve` 命令，可通过以下命令测试服务模式：
+## 检查与测试
 
-  ```bash
-  curl -v -X POST -H "Authorization: YAA-API-KEY yaa" -H "Content-Type: application/json" -d '{ "id": "12345", "title": "测试会话", "startTime": "2025-04-07T12:00:00Z", "character": "测试角色", "status": "in-progress", "messages": [{ "role": "user", "content": "测试消息" }] }' http://127.0.0.1:12345
-  ```
+每次原子性修改后，以下命令都应通过：
 
-### 服务端编译
+```bash
+cargo fmt --all -- --check
+cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cargo test
+autocorrect --lint crates docs
+```
 
-- 运行 `cargo build` 命令以编译 Debug 版本的二进制文件。
-- 运行 `cargo build --release` 命令以编译更小更快的发行版本的二进制文件。
+仓库的提交钩子会拒绝包含警告或排版问题的代码。
+
+端到端测试位于 `crates/yaa-cli/tests/e2e.rs`，它启动一个本地假 OpenAI 兼容服务并用真实二进制跑通「钩子注入 → 工具调用 → 最终回复」，不访问网络。
 
 ## 提交更改
 
 1. Fork 此仓库，在您的仓库新建一个基于此仓库默认分支（branch）的分支。
-2. 在该新建分支对项目进行更改，确保语法不存在问题（运行 `cargo check` 不报错）后应用更改您的仓库。
+2. 在该新建分支对项目进行更改，确保上述检查全部通过后推送您的仓库。
 3. 向我们的仓库提交拉取请求。请确保您遵循了上述说明。
 4. 我们将定期审查拉取请求，并告知您我们的问题以及在合并您的拉取请求之前需要进行的任何更改。
 5. 我们希望您在 15 日内作出回应，之后如果没有显示活动，您的拉取请求可能会被关闭。
 
 ### 注意事项
 
-- 单次 Pull Request 不应提交过多修改，请确保每次提交都针对特定的功能且务必说明本次改动的具体目的，例如：修复某 bug 、优化某方法 等，方便进行 Code Review；
+- 单次 Pull Request 不应提交过多修改，请确保每次提交都针对特定的功能且务必说明本次改动的具体目的，例如：修复某 bug、优化某方法等，方便进行 Code Review；
 - 对于 bug 的修复，应该将本次 Pull Request 和相对应 bug 的 issue 关联起来，让别人知道该问题已经被修复；
 - 对于较大的新功能，你需要先提交 Issues，例如 "添加 XXX 功能"，确认该功能有被添加的必要后，再开始工作；
 - 对于一些主观的样式、交互逻辑调整：如颜色、图标的使用，某些预设配置的增减修改等，一般不予通过。但可以在 Discussions 中进行讨论；

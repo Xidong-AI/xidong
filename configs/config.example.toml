@@ -1,0 +1,27 @@
+# yaa 配置示例。
+#
+# 复制到 $YAA_CONFIG_HOME/config.toml（默认 ~/.config/yaa/config.toml）。
+# 钩子是一段 shell 命令，以 `sh -c` 执行，stdout 即其结果：
+#   - system_prompt / user_prompt：输出完整提示词（替换语义，不叠加内置模板）；
+#   - llm：输出模型供应配置的 TOML（格式见 llm.example.toml）。
+# 提示词钩子每会话执行一次，llm 钩子每次运行执行一次。
+
+[hooks]
+# 内置模板由 `yaa --get-prompt system` 提供，可在此自由拼接。
+system_prompt = "echo \"工作目录：$(pwd)\" && yaa --get-prompt system"
+# 没有 AGENTS.md 时输出为空，不当作失败。
+user_prompt = "if [ -f \"$GLB_CFG/AGENTS.md\" ]; then cat \"$GLB_CFG/AGENTS.md\"; fi"
+llm = "cat $YAA_CONFIG_HOME/llm.toml"
+
+[shell]
+# 单条命令超时（秒）。
+timeout_secs = 120
+# 单流输出上限（字符）；超过后仅保留头部 head_chars 与尾部 tail_chars，
+# 完整输出写入会话目录的 outputs/。
+max_stream_chars = 32768
+head_chars = 8192
+tail_chars = 2048
+
+[agent]
+# 单个回合内最多模型步数。
+max_steps = 30
