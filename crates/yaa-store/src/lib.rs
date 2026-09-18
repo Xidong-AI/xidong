@@ -206,7 +206,10 @@ mod tests {
         data.push('\n');
         fs::write(&session.file, data).unwrap();
 
-        assert!(matches!(load(&session).unwrap_err(), StoreError::Corrupt { .. }));
+        assert!(matches!(
+            load(&session).unwrap_err(),
+            StoreError::Corrupt { .. }
+        ));
     }
 
     #[test]
@@ -284,8 +287,12 @@ mod tests {
 
         // 追加一条尚未落尾换行的记录：增量读取不应消费它。
         let mut file = OpenOptions::new().append(true).open(&session.file).unwrap();
-        file.write_all(serde_json::to_string(&Record::user("半条")).unwrap().as_bytes())
-            .unwrap();
+        file.write_all(
+            serde_json::to_string(&Record::user("半条"))
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
         file.sync_all().unwrap();
 
         let (records, offset) = read_from(&session, 0).unwrap();

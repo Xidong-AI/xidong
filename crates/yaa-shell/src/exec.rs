@@ -33,8 +33,14 @@ pub(crate) fn run_blocking(
     let mut child = command.spawn()?;
     let pgid = child.id() as i32;
 
-    let stdout = child.stdout.take().ok_or(ShellError::MissingPipe("stdout"))?;
-    let stderr = child.stderr.take().ok_or(ShellError::MissingPipe("stderr"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(ShellError::MissingPipe("stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(ShellError::MissingPipe("stderr"))?;
     let full_out = Arc::new(FullOutput::new(output_dir, "stdout"));
     let full_err = Arc::new(FullOutput::new(output_dir, "stderr"));
 

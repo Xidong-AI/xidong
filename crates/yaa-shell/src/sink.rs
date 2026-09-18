@@ -34,10 +34,15 @@ impl FullOutput {
     }
 
     fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
-        let mut guard = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         if guard.is_none() {
             fs::create_dir_all(&self.dir)?;
-            let path = self.dir.join(format!("{}.{}.out", ulid::Ulid::new(), self.suffix));
+            let path = self
+                .dir
+                .join(format!("{}.{}.out", ulid::Ulid::new(), self.suffix));
             let file = File::create(&path)?;
             *guard = Some((path, file));
         }
@@ -49,7 +54,10 @@ impl FullOutput {
 
     /// 完整输出文件路径；未发生截断时为 `None`。
     pub(crate) fn path(&self) -> Option<PathBuf> {
-        let guard = self.inner.lock().unwrap_or_else(|poison| poison.into_inner());
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         guard.as_ref().map(|(path, _)| path.clone())
     }
 }

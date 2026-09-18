@@ -44,7 +44,11 @@ impl Record {
     }
 
     /// 模型回复。
-    pub fn ai(model: impl Into<String>, tool_schema_hash: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn ai(
+        model: impl Into<String>,
+        tool_schema_hash: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Record::Ai(Ai {
             id: new_id(),
             ts: now_ms(),
@@ -297,7 +301,10 @@ mod tests {
             (ToolOrigin::Ai, "ai"),
             (ToolOrigin::User, "user"),
         ] {
-            assert_eq!(serde_json::to_string(&origin).expect("serialize"), format!("\"{tag}\""));
+            assert_eq!(
+                serde_json::to_string(&origin).expect("serialize"),
+                format!("\"{tag}\"")
+            );
         }
     }
 

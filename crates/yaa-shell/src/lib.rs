@@ -94,7 +94,9 @@ mod tests {
     #[tokio::test]
     async fn truncates_large_output_and_writes_full_file() {
         let dir = tempfile::tempdir().unwrap();
-        let out = run(&cmd("seq 1 100000"), &limits(), dir.path()).await.unwrap();
+        let out = run(&cmd("seq 1 100000"), &limits(), dir.path())
+            .await
+            .unwrap();
 
         assert!(out.truncated);
         assert!(out.stdout.chars().count() < 100_000);
