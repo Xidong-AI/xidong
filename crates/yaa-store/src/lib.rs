@@ -107,6 +107,12 @@ pub fn append(session: &Session, records: &[Record]) -> Result<()> {
         serde_json::to_writer(&mut batch, record)?;
         batch.push(b'\n');
     }
+    // 目录创建放在真正写入处：会话解析本身只读，`--status`/`--clear` 不该物化空目录。
+    if let Some(parent) = session.file.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -414,5 +420,23 @@ mod tests {
         let session = session_in(dir.path());
         append(&session, &[]).unwrap();
         assert!(!session.file.exists());
+    }
+
+    #[test]
+    fn append_creates_missing_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            dir.path()
+                .join("sessions")
+                .join("sid")
+                .join("default.jsonl"),
+        );
+        assert!(!session.root.exists());
+
+        let record = Record::user("自动建目录");
+        append(&session, std::slice::from_ref(&record)).unwrap();
+
+        assert!(session.root.is_dir(), "append 应创建缺失的会话目录");
+        assert_eq!(load(&session).unwrap(), vec![record]);
     }
 }

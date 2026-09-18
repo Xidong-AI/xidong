@@ -23,8 +23,9 @@ pub struct Resolved {
 
 /// 解析会话。
 ///
-/// `session_arg` 给出时直接以其构造 [`yaa_store::Session`]，不再计算 sid/创建目录；
-/// 否则按规范化工作目录计算 sid 并创建会话目录。
+/// `session_arg` 给出时直接以其构造 [`yaa_store::Session`]；否则按规范化工作目录计算
+/// sid。本函数是只读的：不创建任何目录，目录创建交给真正写入的
+/// [`yaa_store::append`]，使 `--status`/`--clear` 不会物化空的会话目录。
 pub fn resolve(
     cwd: &Path,
     session_arg: Option<&Path>,
@@ -49,7 +50,6 @@ pub fn resolve(
 
     let sid = sid_for(&cwd_absolute);
     let dir = data_root.join("sessions").join(&sid);
-    std::fs::create_dir_all(&dir)?;
     let session = yaa_store::Session::new(dir.join("default.jsonl"));
     Ok(Resolved {
         session,
@@ -107,7 +107,12 @@ mod tests {
         assert!(!first.warned);
         assert_eq!(first.session.root, data.join("sessions").join(&first.sid));
         assert_eq!(first.session.file, first.session.root.join("default.jsonl"));
-        assert!(first.session.root.is_dir());
+        // 解析是只读的：--status/--clear 不得物化空会话目录，写入时才创建。
+        assert!(
+            !first.session.root.exists(),
+            "resolve 不得创建会话目录：{}",
+            first.session.root.display()
+        );
         assert_eq!(
             outputs_dir(&first.session),
             first.session.root.join("outputs")
