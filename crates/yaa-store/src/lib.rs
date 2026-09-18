@@ -69,15 +69,35 @@ pub fn read_from(session: &Session, offset: u64) -> Result<(Vec<Record>, u64)> {
     let mut data = Vec::new();
     file.read_to_end(&mut data)?;
 
+    // 末尾没有换行时，若整段就是一条可解析的完整记录（例如落到一半且尚未补换行），
+    // 则与 `load` 保持一致地消费它并把偏移推进到文件末尾。
     let end = match data.iter().rposition(|b| *b == b'\n') {
         Some(pos) => pos + 1,
-        None => return Ok((Vec::new(), offset)),
+        None => {
+            if !data.is_empty()
+                && let Ok(record) = serde_json::from_slice::<Record>(&data)
+            {
+                return Ok((vec![record], offset + data.len() as u64));
+            }
+            return Ok((Vec::new(), offset));
+        }
     };
-    let records = parse_lines(&data[..end], false)?;
+    let mut records = parse_lines(&data[..end], false)?;
+    let trailing = &data[end..];
+    if !trailing.is_empty()
+        && let Ok(record) = serde_json::from_slice::<Record>(trailing)
+    {
+        records.push(record);
+        return Ok((records, offset + data.len() as u64));
+    }
     Ok((records, offset + end as u64))
 }
 
 /// 原子追加一批记录：整批序列化到一个缓冲区，单次 `write_all` 后 `sync_all`。
+///
+/// 追加前先修复文件末尾：若最后一个换行之后的尾部能解析为完整记录，就补一个换行
+/// 把它封口；若不能解析（断电撕裂的半行），就截断丢弃。这样新批次不会与残段粘连
+/// 而产生中部解析错误。
 pub fn append(session: &Session, records: &[Record]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -90,9 +110,49 @@ pub fn append(session: &Session, records: &[Record]) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
+        .read(true)
         .open(&session.file)?;
+    repair_trailing(&mut file)?;
+    file.seek(SeekFrom::End(0))?;
     file.write_all(&batch)?;
     file.sync_all()?;
+    Ok(())
+}
+
+/// 修复文件末尾的残段，使下一次追加从干净的换行边界开始。
+///
+/// 常见路径（文件以换行结尾，或为空）只读末尾一个字节，避免每次追加都整读文件；
+/// 只有确实存在无换行尾部时才回退到整读以定位残段。
+fn repair_trailing(file: &mut File) -> Result<()> {
+    let len = file.seek(SeekFrom::End(0))?;
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(len - 1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut data = Vec::new();
+    file.read_to_end(&mut data)?;
+
+    // 最后一个换行之后即残段起点；整份文件都没有换行时起点为 0。
+    let start = data
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    if serde_json::from_slice::<Record>(&data[start..]).is_ok() {
+        // 完整但未落尾换行的末条记录：补换行封口，保留内容。
+        file.seek(SeekFrom::End(0))?;
+        file.write_all(b"\n")?;
+    } else {
+        // 断电撕裂的半行：截断丢弃，避免与新批次粘连。
+        file.set_len(start as u64)?;
+    }
     Ok(())
 }
 
@@ -285,18 +345,66 @@ mod tests {
         fs::write(&session.file, data).unwrap();
         let len = fs::metadata(&session.file).unwrap().len();
 
-        // 追加一条尚未落尾换行的记录：增量读取不应消费它。
+        // 追加一段解析不出的撕裂残段：增量读取不应消费它。
         let mut file = OpenOptions::new().append(true).open(&session.file).unwrap();
-        file.write_all(
-            serde_json::to_string(&Record::user("半条"))
-                .unwrap()
-                .as_bytes(),
-        )
-        .unwrap();
+        file.write_all(br#"{"type":"user","id":"torn"#).unwrap();
         file.sync_all().unwrap();
 
         let (records, offset) = read_from(&session, 0).unwrap();
         assert_eq!(records, vec![record]);
+        assert_eq!(offset, len);
+    }
+
+    #[test]
+    fn append_repairs_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        let good = Record::user("good");
+        append(&session, std::slice::from_ref(&good)).unwrap();
+
+        // 模拟断电：完整记录后留下半行。
+        let mut file = OpenOptions::new().append(true).open(&session.file).unwrap();
+        file.write_all(br#"{"type":"user","id":"torn"#).unwrap();
+        file.sync_all().unwrap();
+
+        let new = Record::user("new");
+        append(&session, std::slice::from_ref(&new)).unwrap();
+
+        // 撕裂残段被丢弃，而不是与新记录粘连成非法 JSON。
+        assert_eq!(load(&session).unwrap(), vec![good, new]);
+    }
+
+    #[test]
+    fn append_preserves_complete_trailing_record_without_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        let first = Record::user("一");
+        let second = Record::user("二");
+        let mut data = serde_json::to_string(&first).unwrap();
+        data.push('\n');
+        data.push_str(&serde_json::to_string(&second).unwrap()); // 无尾换行
+        fs::write(&session.file, data).unwrap();
+
+        let third = Record::user("三");
+        append(&session, std::slice::from_ref(&third)).unwrap();
+
+        assert_eq!(load(&session).unwrap(), vec![first, second, third]);
+    }
+
+    #[test]
+    fn read_from_consumes_parseable_trailing_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        let first = Record::user("一");
+        let second = Record::user("二");
+        let mut data = serde_json::to_string(&first).unwrap();
+        data.push('\n');
+        data.push_str(&serde_json::to_string(&second).unwrap()); // 无尾换行
+        fs::write(&session.file, data).unwrap();
+        let len = fs::metadata(&session.file).unwrap().len();
+
+        let (records, offset) = read_from(&session, 0).unwrap();
+        assert_eq!(records, vec![first, second]);
         assert_eq!(offset, len);
     }
 

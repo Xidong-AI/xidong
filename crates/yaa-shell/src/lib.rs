@@ -166,6 +166,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_child_holding_pipe_does_not_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut limits = limits();
+        limits.timeout_secs = 1;
+
+        // 后台子进程继承并攥住 stdout/stderr 管道，但直接子进程（sh）立即退出。
+        // 调用必须在硬上限内返回，而不是等后台进程 30 秒后释放管道。
+        let start = Instant::now();
+        let out = run(&cmd("sleep 30 &"), &limits, dir.path()).await.unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "应在硬上限内返回，实际耗时 {:?}",
+            start.elapsed()
+        );
+        let _ = out;
+    }
+
+    #[tokio::test]
     async fn stdin_is_null_so_cat_exits() {
         let dir = tempfile::tempdir().unwrap();
         let start = Instant::now();
