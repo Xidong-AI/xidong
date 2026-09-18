@@ -1,0 +1,16 @@
+[package]
+name = "yaa-shell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tokio.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true

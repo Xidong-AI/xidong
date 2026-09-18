@@ -1,25 +1,24 @@
-[package]
-name = "yaa"
-version = "2.17.0"
-authors = ["PJ568 <pj568@pj568.eu.org>"]
-edition = "2024"
-description = "`yaa` means Yet Another Agent, which can analyze and understand natural language instructions and automatically create, plan, execute, and check tasks."
-license = "MIT"
+[workspace]
+resolver = "2"
+members = ["crates/*"]
 
-[dependencies]
-actix-cors = "0.7.1"
-actix-web = "4.10.2"
-actix-web-lab = "0.24.1"
-anyhow = "1.0.80"
-async-trait = "0.1.88"
-chrono = { version = "0.4.40", features = ["serde"] }
-clap = { version = "4.5.4", features = ["derive"] }
-futures = "0.3.31"
-reqwest = { version = "0.12.15", features = ["json"] }
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-thiserror = "2.0.12"
-tokio = { version = "1.44.2", features = ["full"] }
-uuid = { version = "1.16.0", features = ["v4", "serde"] }
-wasi = "0.14.2"
-wasm-bindgen = "0.2.100"
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["PJ568 <pj568@pj568.eu.org>"]
+repository = "https://github.com/Byte-tea/yaa"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+clap = { version = "4", features = ["derive"] }
+ulid = "1"
+sha2 = "0.10"
+libc = "0.2"
+tempfile = "3"

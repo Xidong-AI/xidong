@@ -1,0 +1,16 @@
+[package]
+name = "yaa-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "yaa"
+path = "src/main.rs"
+
+[dependencies]
+yaa-core = { path = "../yaa-core" }
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

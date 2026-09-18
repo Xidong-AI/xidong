@@ -1,14 +1,16 @@
-name: 编译服务端
+name: 编译
 
 on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-server.yaml'
-      - 'src/**'
+      - '.github/workflows/build.yaml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/**'
 
 concurrency:
-  group: "server"
+  group: "build"
   cancel-in-progress: true
 
 permissions:
@@ -16,8 +18,8 @@ permissions:
   id-token: write
 
 jobs:
-  build-server:
-    name: 编译服务端（${{ matrix.os }}）
+  build:
+    name: 编译（${{ matrix.os }}）
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -66,25 +68,25 @@ jobs:
             ~/.cargo/git/db/
           key: ${{ matrix.os }}-cargo-${{ hashFiles('./Cargo.lock') }}
 
-      - name: 编译服务端
+      - name: 编译
         run: |
-          cargo build --release
+          cargo build --release --bin yaa
 
       - name: 收集包
         run: |
-          mkdir -p yaa_server_${{ matrix.build }}
+          mkdir -p yaa_${{ matrix.build }}
           if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            cp target/release/yaa.exe yaa_server_${{ matrix.build }}/
+            cp target/release/yaa.exe yaa_${{ matrix.build }}/
           else
-            cp target/release/yaa yaa_server_${{ matrix.build }}/
+            cp target/release/yaa yaa_${{ matrix.build }}/
           fi
         shell: bash
 
       - name: 上传包
         uses: actions/upload-artifact@v4
         with:
-          name: yaa_server_${{ matrix.os }}.zip
-          path: yaa_server_${{ matrix.build }}/**/*
+          name: yaa_${{ matrix.build }}
+          path: yaa_${{ matrix.build }}/**/*
           retention-days: 3
 
       - name: 保存 Rust 缓存

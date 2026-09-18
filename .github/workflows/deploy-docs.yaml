@@ -6,7 +6,6 @@ on:
     paths:
       - '.github/workflows/deploy-docs.yaml'
       - 'assets/**'
-      - 'client/**'
       - '**.md'
 
 concurrency:
@@ -27,11 +26,7 @@ jobs:
 
     - name: 检出仓库
       uses: actions/checkout@v4
-    
-    - name: 删除不需要部署的文件
-      run: |
-        rm -rf src/
-    
+
     - name: 部署 markdown.html
       uses: PJ-568/MARKDOWN.HTML@v1.18.2
 
