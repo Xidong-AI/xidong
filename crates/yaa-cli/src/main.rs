@@ -207,9 +207,10 @@ async fn run_agent(
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
 
-    let prompt = match cli.prompt {
-        Some(prompt) => prompt,
-        None => read_stdin().await?,
+    let prompt = if cli.prompt.is_empty() {
+        read_stdin().await?
+    } else {
+        cli.prompt.join(" ")
     };
 
     let runner = yaa_core::agent::Runner {

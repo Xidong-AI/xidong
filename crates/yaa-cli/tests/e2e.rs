@@ -668,3 +668,19 @@ async fn status_on_missing_session_creates_no_directory() {
         env.data_home.join("sessions").display()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn multi_word_prompt_joined() {
+    let (addr, _state) = start_server(vec![text_response("完成")]).await;
+    let env = TestEnv::new(addr.port());
+
+    let output = env.run(&["你好", "世界", "！"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = read_jsonl(&env.session_file());
+    assert_eq!(records[0]["type"], "user");
+    assert_eq!(
+        records[0]["content"], "你好 世界 ！",
+        "多词位置参数应以单个空格连接"
+    );
+}

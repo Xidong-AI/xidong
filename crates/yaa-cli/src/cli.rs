@@ -11,9 +11,9 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "yaa", version, about, long_about = None)]
 pub struct Cli {
-    /// 用户提示词；缺失时从 stdin 读到 EOF。
-    #[arg(value_name = "PROMPT")]
-    pub prompt: Option<String>,
+    /// 用户提示词；可含空格（多个词以单个空格连接），缺失时从 stdin 读到 EOF。
+    #[arg(value_name = "PROMPT", num_args = 0..)]
+    pub prompt: Vec<String>,
 
     /// 归档当前会话。
     #[arg(long)]
