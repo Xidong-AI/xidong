@@ -11,9 +11,11 @@ use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
+use axum::http::{HeaderMap, header};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 /// 测试配置：三个钩子都用确定性输出，`llm` 钩子从临时配置根读取含密钥的 TOML。
@@ -30,16 +32,55 @@ timeout_secs = 30
 max_steps = 10
 "#;
 
-/// 假服务端共享状态：按序返回脚本化响应，并记录每个收到的请求体。
+/// 递归防护配置：`system_prompt` 钩子调用二进制自身的 `--get-prompt system`。
+const RECURSION_CONFIG_TOML: &str = r#"
+[hooks]
+system_prompt = '"$YAA_BIN" --get-prompt system'
+user_prompt = "echo USR"
+llm = "cat $YAA_CONFIG_HOME/llm.toml"
+
+[agent]
+max_steps = 10
+"#;
+
+/// 小阈值截断配置：头 32 + 尾 16 ≤ 上限 64，保证大输出必被截断。
+const TRUNCATION_CONFIG_TOML: &str = r#"
+[hooks]
+system_prompt = "echo SYS"
+user_prompt = "echo USR"
+llm = "cat $YAA_CONFIG_HOME/llm.toml"
+
+[shell]
+timeout_secs = 30
+max_stream_chars = 64
+head_chars = 32
+tail_chars = 16
+
+[agent]
+max_steps = 10
+"#;
+
+/// 假服务端共享状态：按序返回脚本化响应，并记录每个请求体与 `Authorization` 头。
 #[derive(Clone)]
 struct ServerState {
     requests: Arc<Mutex<Vec<Value>>>,
+    auth: Arc<Mutex<Vec<Option<String>>>>,
     responses: Arc<Mutex<VecDeque<Value>>>,
 }
 
 /// 处理一次 Chat Completions 请求。
-async fn chat(State(state): State<ServerState>, Json(body): Json<Value>) -> Json<Value> {
+async fn chat(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
     state.requests.lock().unwrap().push(body);
+    state.auth.lock().unwrap().push(
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
     let response = state
         .responses
         .lock()
@@ -53,6 +94,7 @@ async fn chat(State(state): State<ServerState>, Json(body): Json<Value>) -> Json
 async fn start_server(responses: Vec<Value>) -> (SocketAddr, ServerState) {
     let state = ServerState {
         requests: Arc::new(Mutex::new(Vec::new())),
+        auth: Arc::new(Mutex::new(Vec::new())),
         responses: Arc::new(Mutex::new(responses.into())),
     };
     let app = Router::new()
@@ -68,17 +110,22 @@ async fn start_server(responses: Vec<Value>) -> (SocketAddr, ServerState) {
 
 /// 首个响应：助手发起一个 `shell` 工具调用。
 fn tool_call_response() -> Value {
+    tool_call_response_with("call_1", "echo hi")
+}
+
+/// 指定 `call_id` 与命令的工具调用响应。
+fn tool_call_response_with(call_id: &str, command: &str) -> Value {
     json!({
         "choices": [{
             "message": {
                 "role": "assistant",
                 "content": null,
                 "tool_calls": [{
-                    "id": "call_1",
+                    "id": call_id,
                     "type": "function",
                     "function": {
                         "name": "shell",
-                        "arguments": "{\"command\":\"echo hi\"}"
+                        "arguments": json!({"command": command}).to_string()
                     }
                 }]
             },
@@ -134,6 +181,11 @@ impl TestEnv {
         }
     }
 
+    /// 覆盖 `config.toml`。
+    fn write_config(&self, text: &str) {
+        std::fs::write(self.config_home.join("config.toml"), text).unwrap();
+    }
+
     /// 构造指向真实二进制、环境隔离的命令。
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_yaa"));
@@ -151,15 +203,19 @@ impl TestEnv {
     }
 
     /// 默认会话文件 `<data>/sessions/<sid>/default.jsonl`。
+    ///
+    /// `sid` 由规范化工作目录的 sha256 前 32 位十六进制决定，与 core 的算法一致；
+    /// 直接从 sid 拼路径，避免扫描 `sessions/` 带来的歧义。
     fn session_file(&self) -> PathBuf {
-        let sessions = self.data_home.join("sessions");
-        for entry in std::fs::read_dir(&sessions).unwrap() {
-            let candidate = entry.unwrap().path().join("default.jsonl");
-            if candidate.exists() {
-                return candidate;
-            }
-        }
-        panic!("未找到会话 JSONL：{}", sessions.display());
+        let canon = self.work.canonicalize().unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(canon.as_os_str().as_encoded_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        let sid = &digest[..32];
+        self.data_home
+            .join("sessions")
+            .join(sid)
+            .join("default.jsonl")
     }
 }
 
@@ -183,6 +239,14 @@ fn prompt_hook_calls(records: &[Value]) -> usize {
                     || record["hook"]["name"] == "user_prompt")
         })
         .count()
+}
+
+/// 从记录中找指定 `call_id` 的 `tool_result`。
+fn tool_result<'a>(records: &'a [Value], call_id: &str) -> &'a Value {
+    records
+        .iter()
+        .find(|record| record["type"] == "tool_result" && record["call_id"] == call_id)
+        .unwrap_or_else(|| panic!("应有 call_id = {call_id} 的工具结果"))
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -275,6 +339,24 @@ async fn e2e_tool_call_then_finish() {
     let body_text = serde_json::to_string(&requests).unwrap();
     assert!(!body_text.contains("sk-secret"), "请求体不得含 api_key");
 
+    // 断言 5a：首个请求的 system 消息含两个提示词钩子的输出。
+    let first_system: String = requests[0]["messages"]
+        .as_array()
+        .expect("首个请求应含 messages")
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        first_system.contains("SYS"),
+        "首个请求应含系统提示词：{first_system}"
+    );
+    assert!(
+        first_system.contains("USR"),
+        "首个请求应含用户提示词：{first_system}"
+    );
+
     let messages = requests[1]["messages"]
         .as_array()
         .expect("请求体应含 messages");
@@ -291,6 +373,29 @@ async fn e2e_tool_call_then_finish() {
     assert_eq!(
         following["tool_call_id"], assistant["tool_calls"][0]["id"],
         "tool 消息的 tool_call_id 必须与 assistant 配对"
+    );
+    // 断言 5b：第二跳的 tool 消息回填了 Shell stdout。
+    let tool_content = following["content"].as_str().unwrap_or_default();
+    assert!(
+        tool_content.contains("hi\n"),
+        "tool 消息应含 shell stdout：{tool_content}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authorization_header_is_sent_on_every_request() {
+    let (addr, state) = start_server(vec![tool_call_response(), text_response("完成")]).await;
+    let env = TestEnv::new(addr.port());
+
+    let output = env.run(&["你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let auth = state.auth.lock().unwrap().clone();
+    assert_eq!(auth.len(), 2, "应有两次请求");
+    assert!(
+        auth.iter()
+            .all(|value| value.as_deref() == Some("Bearer sk-secret")),
+        "每个请求都应携带 `Bearer sk-secret`（证明 llm 钩子输出被消费）：{auth:?}"
     );
 }
 
@@ -313,6 +418,150 @@ async fn get_prompt_short_circuits_without_session() {
         stderr_of(&unknown).contains("未知"),
         "stderr：{}",
         stderr_of(&unknown)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_prompt_hook_calling_get_prompt_does_not_recurse() {
+    // 验收标准 6：默认钩子通过 `yaa --get-prompt system` 拼内置模板，必须能正常返回。
+    let (addr, state) = start_server(vec![text_response("完成")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(RECURSION_CONFIG_TOML);
+
+    let output = env.run(&["你好"]);
+    assert!(
+        output.status.success(),
+        "递归防护失败，退出码 {:?}，stderr：{}",
+        output.status.code(),
+        stderr_of(&output)
+    );
+
+    let requests = state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "应完成一次模型请求");
+    let has_builtin = requests[0]["messages"]
+        .as_array()
+        .expect("请求体应含 messages")
+        .iter()
+        .filter(|message| message["role"] == "system")
+        .filter_map(|message| message["content"].as_str())
+        .any(|content| content.contains("你是 YAA"));
+    assert!(has_builtin, "首个请求应含内置系统模板文本");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_output_is_truncated_and_full_file_persisted() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response_with("call_big", "seq 1 200"),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(TRUNCATION_CONFIG_TOML);
+
+    let output = env.run(&["你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = read_jsonl(&env.session_file());
+    let result = tool_result(&records, "call_big");
+    assert_eq!(result["truncated"], true, "大输出应标记截断");
+
+    let stdout_path = result["output_files"]["stdout"]
+        .as_str()
+        .expect("截断应记录 stdout 文件");
+    assert!(
+        !stdout_path.starts_with('/'),
+        "数据根内应为相对路径：{stdout_path}"
+    );
+    assert!(
+        stdout_path.starts_with("sessions/"),
+        "应为相对数据根且位于 sessions/ 下：{stdout_path}"
+    );
+
+    let full_path = env.data_home.join(stdout_path);
+    let full = std::fs::read_to_string(&full_path)
+        .unwrap_or_else(|err| panic!("完整输出文件应存在 {}：{err}", full_path.display()));
+    let in_record = result["stdout"].as_str().unwrap_or_default();
+    assert!(
+        full.chars().count() > in_record.chars().count(),
+        "完整文件（{} 字符）应长于记录内文本（{} 字符）",
+        full.chars().count(),
+        in_record.chars().count()
+    );
+    assert!(full.trim_end().ends_with("200"), "完整文件应含全部输出");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_outside_data_root_keeps_absolute_output_path() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response_with("call_big", "seq 1 200"),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(TRUNCATION_CONFIG_TOML);
+
+    // 会话文件放在数据根之外的兄弟目录。
+    let session_path = env
+        .data_home
+        .parent()
+        .unwrap()
+        .join("outside")
+        .join("custom.jsonl");
+    assert!(!session_path.starts_with(&env.data_home));
+
+    let output = env
+        .command()
+        .arg("--session")
+        .arg(&session_path)
+        .arg("你好")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = read_jsonl(&session_path);
+    let result = tool_result(&records, "call_big");
+    assert_eq!(result["truncated"], true);
+
+    let stdout_path = result["output_files"]["stdout"]
+        .as_str()
+        .expect("截断应记录 stdout 文件");
+    let path = Path::new(stdout_path);
+    assert!(
+        path.is_absolute(),
+        "数据根之外必须回退记绝对路径：{stdout_path}"
+    );
+    assert!(path.exists(), "输出文件应存在：{stdout_path}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_llm_hook_exits_with_config_code() {
+    let env = TestEnv::new(0);
+    // 删除 llm.toml：`cat` 钩子失败，属配置/钩子错误（退出码 3）。
+    std::fs::remove_file(env.config_home.join("llm.toml")).unwrap();
+
+    let output = env.run(&["你好"]);
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "llm 配置缺失应为配置错误，stderr：{}",
+        stderr_of(&output)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_flag_is_usage_error() {
+    let env = TestEnv::new(0);
+    let output = env.run(&["--definitely-not-a-flag"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "未知参数应为用法错误，stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).is_empty(),
+        "用法错误不应污染 stdout：{}",
+        stdout_of(&output)
     );
 }
 
@@ -386,4 +635,36 @@ async fn clear_archives_default_jsonl() {
         }
     }
     assert!(archived.is_some(), "history 下应有 sessions-<ts>.jsonl");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_on_missing_session_creates_no_directory() {
+    // `--status` 是只读运维：解析会话不得物化空的 `sessions/<sid>/` 目录。
+    let env = TestEnv::new(0);
+
+    let output = env.run(&["--status"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !env.data_home.join("sessions").exists(),
+        "--status 不得创建会话目录：{}",
+        env.data_home.join("sessions").display()
+    );
+
+    let clear = env.run(&["--clear"]);
+    assert_eq!(
+        clear.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&clear)
+    );
+    assert!(
+        !env.data_home.join("sessions").exists(),
+        "--clear 不得创建会话目录：{}",
+        env.data_home.join("sessions").display()
+    );
 }

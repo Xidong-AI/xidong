@@ -428,6 +428,27 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_after_result_is_stray_and_dropped() {
+        // 交错序列 [ai, tc, tr, tc, tr]：一个 ai 步骤只独占紧随其后的工具调用段，
+        // 结果之后再出现的 tc/tr 不构成新的 ai 步骤，作为游离记录丢弃。
+        // 固化该行为，避免将来静默改变历史重建方式。
+        let records = vec![
+            Record::ai("m", "h", ""),
+            ai_call("c1", r#"{"command":"a"}"#),
+            result("c1", "A"),
+            ai_call("c2", r#"{"command":"b"}"#),
+            result("c2", "B"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["assistant", "tool"]);
+        let calls = messages[0].tool_calls.as_ref().unwrap();
+        assert_eq!(calls.len(), 1, "只有紧邻 ai 的 c1 进入 tool_calls");
+        assert_eq!(calls[0].id, "c1");
+        assert_eq!(messages[1].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(messages[1].content.as_deref(), Some("A"));
+    }
+
+    #[test]
     fn stderr_and_timeout_and_truncation_are_labelled() {
         let records = vec![
             Record::ai("m", "h", ""),
