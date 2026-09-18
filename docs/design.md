@@ -41,7 +41,7 @@
 渲染时语义转换为对应接口格式的消息，所以模型始终看到的是结构和内容合规的上下文。
 如开头的提示词注入被格式化为 OpenAI 的 `system` 而非 `assistant.tool_calls` 和 `tool`。
 
-上下文压缩参考 DSH (DeepSeek Harness) 的 `compaction-basic` 的机制，无模型调用。
+上下文压缩参考 DSH (DeepSeek Harness) 的 `compaction-basic` 的机制。
 压缩只发生在渲染阶段，原始 JSONL 不变。
 压缩保留未完成工具调用。
 
