@@ -18,17 +18,40 @@ permissions:
   id-token: write
 
 jobs:
+  check:
+    name: 检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 编译检查
+        run: cargo check --all-targets
+
+      - name: Clippy 检查
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: 测试
+        run: cargo test
+
   build:
     name: 编译（${{ matrix.os }}）
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        build: [linux, macos, windows]
+        build: [linux, macos]
         include:
           - build: linux
             os: ubuntu-latest
-          - build: windows
-            os: windows-latest
           - build: macos
             os: macos-latest
     steps:
@@ -42,13 +65,6 @@ jobs:
         with:
           toolchain: stable
           target: x86_64-unknown-linux-musl
-
-      - name: 为 windows-latest 安装 Rust
-        if: matrix.os == 'windows-latest'
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable-x86_64-msvc
-          target: x86_64-pc-windows-msvc
 
       - name: 为 macos-latest 安装 Rust
         if: matrix.os == 'macos-latest'
@@ -75,11 +91,7 @@ jobs:
       - name: 收集包
         run: |
           mkdir -p yaa_${{ matrix.build }}
-          if [ "${{ matrix.os }}" == "windows-latest" ]; then
-            cp target/release/yaa.exe yaa_${{ matrix.build }}/
-          else
-            cp target/release/yaa yaa_${{ matrix.build }}/
-          fi
+          cp target/release/yaa yaa_${{ matrix.build }}/
         shell: bash
 
       - name: 上传包
