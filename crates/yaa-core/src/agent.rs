@@ -218,9 +218,8 @@ impl Runner<'_> {
             }
         }
 
-        self.sink.emit(Event::Notice {
-            content: format!("达到最大步数 {}，已停止。", self.config.agent.max_steps),
-        });
+        // 达到步数上限不在此发事件：`ExitCode::MaxSteps` 已是明确信号，具体警告与
+        // 「是否仍打印部分回复」的显示策略完全由 CLI 决定（避免 stderr 重复告警）。
         Ok(ExitCode::MaxSteps)
     }
 

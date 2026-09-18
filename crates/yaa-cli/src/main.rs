@@ -5,12 +5,69 @@ mod printer;
 
 use std::path::{Path, PathBuf};
 
+use anyhow::anyhow;
 use clap::Parser;
 use tokio::io::AsyncReadExt;
+use yaa_core::agent::ExitCode;
 use yaa_msg::Record;
 
 use cli::Cli;
 use printer::StderrSink;
+
+/// 带退出码的分发错误。
+///
+/// `dispatch` 内部可能产生三类错误，必须映射到不同退出码：用法问题（2）、
+/// 配置或钩子问题（3）、其余非预期错误（1）。退出码取自
+/// [`ExitCode::code`]，避免在各处硬编码数字。
+#[derive(Debug)]
+struct CliError {
+    exit: ExitCode,
+    source: anyhow::Error,
+}
+
+impl CliError {
+    /// 用法错误（退出码 2）。
+    fn usage(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            exit: ExitCode::Usage,
+            source: source.into(),
+        }
+    }
+
+    /// 配置或钩子错误（退出码 3）。
+    fn config(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            exit: ExitCode::Config,
+            source: source.into(),
+        }
+    }
+}
+
+impl From<anyhow::Error> for CliError {
+    fn from(source: anyhow::Error) -> Self {
+        Self {
+            exit: ExitCode::Error,
+            source,
+        }
+    }
+}
+
+impl From<std::io::Error> for CliError {
+    fn from(source: std::io::Error) -> Self {
+        Self {
+            exit: ExitCode::Error,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for CliError {}
 
 #[tokio::main]
 async fn main() {
@@ -34,19 +91,21 @@ async fn main() {
     let code = match dispatch(cli).await {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("错误：{err:#}");
-            1
+            eprintln!("错误：{err}");
+            err.exit.code()
         }
     };
     std::process::exit(code);
 }
 
 /// 执行一次命令，返回进程退出码。
-async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
+async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     // `--cwd` 改变进程工作目录，供会话 id 计算、钩子与 Shell 三处一致使用。
+    // 路径不存在属用法问题（退出码 2），不是配置错误。
     if let Some(cwd) = &cli.cwd {
-        std::env::set_current_dir(cwd)
-            .map_err(|err| anyhow::anyhow!("无法切换到工作目录 {}：{err}", cwd.display()))?;
+        std::env::set_current_dir(cwd).map_err(|err| {
+            CliError::usage(anyhow!("无法切换到工作目录 {}：{err}", cwd.display()))
+        })?;
     }
 
     let env = |key: &str| std::env::var(key).ok();
@@ -55,10 +114,10 @@ async fn dispatch(cli: Cli) -> anyhow::Result<i32> {
     let data_root = yaa_core::paths::data_root(&env, &home);
 
     if cli.clear {
-        return clear(&cli, &data_root);
+        return clear(&cli, &data_root).map_err(CliError::from);
     }
     if cli.status {
-        return status(&cli, &data_root);
+        return status(&cli, &data_root).map_err(CliError::from);
     }
 
     run_agent(cli, &env, &home, &config_root, &data_root).await
@@ -83,6 +142,8 @@ fn clear(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
 
 /// 打印会话摘要。
 fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
+    // 本函数仅做只读运维：会话解析不得创建目录（由 yaa_store::append 负责写入时创建）。
+
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
     if !resolved.session.file.exists() {
@@ -127,7 +188,7 @@ async fn run_agent(
     home: &Path,
     config_root: &Path,
     data_root: &Path,
-) -> anyhow::Result<i32> {
+) -> Result<i32, CliError> {
     let sink = StderrSink::new(cli.verbose, cli.trace, cli.quiet);
 
     let config_path = cli
@@ -140,7 +201,8 @@ async fn run_agent(
             content: format!("警告：配置不存在，使用默认配置：{}", config_path.display()),
         });
     }
-    let config = yaa_core::config::Config::load(&config_path)?;
+    // 配置读取/解析失败是配置错误（退出码 3），不是通用错误。
+    let config = yaa_core::config::Config::load(&config_path).map_err(CliError::config)?;
 
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
@@ -163,16 +225,34 @@ async fn run_agent(
         .run(&prompt, |cfg| yaa_core::agent::OpenAiModel { cfg })
         .await?;
 
-    // 最终助手文本走 stdout；取历史中最后一条 `ai` 记录的内容。
-    let records = yaa_store::load(&resolved.session)?;
+    // stdout 只承载「成功的最终助手文本」：失败回合（模型/配置/用法错误）的原因已由
+    // stderr 报告，若再打印上一条历史回复会把过期答案伪装成本次结果。
+    match exit {
+        ExitCode::Success => print_final_ai(&resolved.session)?,
+        ExitCode::MaxSteps => {
+            eprintln!(
+                "警告：达到最大步数 {}，已停止；以下为当前最终回复。",
+                config.agent.max_steps
+            );
+            print_final_ai(&resolved.session)?;
+        }
+        // 其他退出码：stdout 保持干净。
+        _ => {}
+    }
+
+    Ok(exit.code())
+}
+
+/// 打印历史中最后一条非空 `ai` 内容；没有则什么都不打印。
+fn print_final_ai(session: &yaa_store::Session) -> anyhow::Result<()> {
+    let records = yaa_store::load(session)?;
     if let Some(content) = records.iter().rev().find_map(|record| match record {
         Record::Ai(ai) if !ai.content.is_empty() => Some(ai.content.as_str()),
         _ => None,
     }) {
         println!("{content}");
     }
-
-    Ok(exit.code())
+    Ok(())
 }
 
 /// 读取 stdin 到 EOF。
