@@ -22,7 +22,7 @@
 
 ## 对 design.md 的更正
 
-这些更正必须在动代码前确认，因为它们决定了不可变的 JSONL schema。
+第 1–7 条必须在动代码前确认，因为它们决定了不可变的 JSONL schema；第 8–11 条为实现阶段 1 时发现、事后补记，不改变已冻结的 schema，但修正 design.md 对行为的描述。
 
 1. **压缩并非无模型调用**（`design.md:44`）。`@deepseek-ai/dsh-compaction-basic` 出厂必发一次摘要 LLM 调用；真正无模型的是伴生包 `dsh-compaction-tool-result-pruner`（纯头尾截断）。按 D3 两者都实现。
 2. **压缩归属**：`design.md:19` 把「压缩摘要」列在 `yaa-store`，但 `design.md:45` 说压缩只发生在渲染阶段。更正为：**压缩属 `yaa-core` 的渲染管线，`yaa-store` 只负责存储**。
@@ -31,6 +31,10 @@
 5. **记录缺 `id`**：`design.md:31,32,37` 的 `user`/`ai`/`system` 无 `id`，无法支撑阶段 4 的幂等去重（`design.md:361,366`）。更正为**所有记录都有 `id`**，工具结果另用 `call_id` 关联。
 6. **截断产物无载体**：`design.md:50` 未定义完整输出的路径字段。更正为 `tool_result` 增加可选 `output_files`（stdout/stderr 分两个文件）与 `truncated`。
 7. **`client_id`/`turn_id`**（`design.md:301`）预留进 schema，阶段 4 使用。
+8. **钩子不经 `shell` 工具执行**（`design.md:12`）。design 说系统生命周期钩子「触发 Shell 工具调用」实现。更正为：钩子由 `yaa-core` 的独立执行器（`crates/yaa-core/src/hook.rs`）以 `sh -c` 运行，与 `shell` 工具**不共用策略**——钩子单流超过 1 MiB 直接报错退出，不截断、不产生 `output_files`。只有审计记录以 `origin=hook` 的 `tool_call`/`tool_result` 表示，供渲染与缓存判定；「钩子就是同一个 Shell 工具」的表述不成立。
+9. **用户记录先于提示词钩子落盘**（`design.md:27-31`）。design 的 JSONL 示例把钩子注入记录排在 `user` 之前；更正为 `user` 最先落盘、提示词钩子记录在其后（见「Agent loop」的用户记录先落盘）。渲染时钩子仍被提升到消息列表最前，模型上下文不变；好处是钩子失败也不丢用户输入。
+10. **钩子 `tool_call` 不写 `description`**（`design.md:27`）。design 示例带 `"description":"注入系统提示词"`；更正为钩子记录不落 `description`，该文案是 `yaa-cli` 展示层按钩子名现算的（`crates/yaa-cli/src/printer.rs`），不入 JSONL。
+11. **中断 `tool_result` 有两种互补补法**（`design.md:427-431`、本文件「渲染管线」失配兜底）。阶段 1 由渲染器在内存中合成中断 `tool` 消息，保证请求体合法，**不写回** JSONL；阶段 6 的「补中断 `tool_result`」则是把它作为记录持久化落盘。两者不冲突：前者保证任意时刻请求合法，后者让历史事实源自身自洽。
 
 ## 目标架构（阶段 1）
 

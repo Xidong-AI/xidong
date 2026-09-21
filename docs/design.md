@@ -3,19 +3,22 @@
 设想一个基于 Rust 的极致轻量的智能体（AI Agent）。
 每个模块都分 crate 开发，先用 Cargo workspace 管理，边界稳定后考虑拆分仓库。
 
+> 本文是构想稿。实现现状，以及本文与实现的已知不一致处，以 [`docs/plan.md`](plan.md) 为准。
+> 其在“对 design.md 的更正”部分逐条列出。
+
 用 `yaa` 运行的非交互式命令。
 
 ## 模块设计
 
 对每个模块做最小化设计。智能体只有 Shell 命令这一个工具调用。
 为确保高度可维护性，模块数量和功能数量应做到最少。
-系统生命周期钩子：比如上下文和提示词注入也是系统内部钩子触发 Shell 工具调用实现的。
+系统生命周期钩子：比如上下文和提示词注入，也由系统内部钩子触发 Shell 命令实现；钩子命令与智能体工具调用分开执行、策略不同，但同样以 `origin=hook` 的 `tool_call`/`tool_result` 记录，供审计与缓存判定。
 
 可能先做三到四个 crate 吧：
 
 - `yaa-cli`：参数解析、入口、stdout/stderr 策略。
-- `yaa-core`：智能体循环（Agent loop）、提示词组装、模型调用、消息模型。
-- `yaa-store`：会话 JSONL、归档、加载、压缩摘要。
+- `yaa-core`：智能体循环（Agent loop）、提示词组装、模型调用、消息模型、压缩并渲染上下文视图。
+- `yaa-store`：会话 JSONL、归档、加载。
 - `yaa-shell`：唯一工具，负责执行命令、超时、截断、策略。
 - `yaa-msg`：消息类型。
 
@@ -24,24 +27,28 @@
 历史消息管理框架模块以消息队列的形式存储历史消息。
 
 ```jsonl
-{"type":"tool_call","origin":"hook","ts":...,"id":"call_xxx","command":"echo \"工作目录：$(pwd)\" && yaa --get-prompt \"system\"","description":"注入系统提示词"}
-{"type":"tool_result","ts":...,"id":"call_xxx","stdout":"...","stderr":"...","code":0}
-{"type":"tool_call","origin":"hook","ts":...,"id":"call_xxx","command":"cat $GLB_CFG/AGENTS.md","description":"注入用户提示词"}
-{"type":"tool_result","ts":...,"id":"call_xxx","stdout":"...","stderr":"...","code":0}
-{"type":"user","ts":...,"content":"你好"}
-{"type":"ai","ts":...,"model":"...","tool_schema_hash":"...","content":"..."}
-{"type":"tool_call","origin":"ai|user","ts":...,"id":"call_xxx","command":"...","description":"……"}
-{"type":"approval_pending","ts":...,"id":"call_xxx","command":"...","matched_rule":"..."}
-{"type":"approval_resolved","ts":...,"id":"call_xxx","decision":"approve|deny"}
-{"type":"tool_result","ts":...,"id":"call_xxx","stdout":"...","stderr":"...","code":0}
-{"type":"system","source":"notify|error|...","scope":"ai|shell|store|...","ts":...,"content":"（系统警告、后台任务返回或错误等的消息）"}
+{"type":"user","ts":...,"id":"01J...","content":"你好"}
+{"type":"tool_call","origin":"hook","ts":...,"id":"01J...","call_id":"call_xxx","command":"echo \"工作目录：$(pwd)\" && \"$YAA_BIN\" --get-prompt \"system\"","hook":{"name":"system_prompt","fingerprint":"..."},"redacted":false}
+{"type":"tool_result","ts":...,"id":"01J...","call_id":"call_xxx","stdout":"...","stderr":"...","code":0,"timed_out":false,"truncated":false}
+{"type":"tool_call","origin":"hook","ts":...,"id":"01J...","call_id":"call_xxx","command":"cat $YAA_CONFIG_HOME/AGENTS.md","hook":{"name":"user_prompt","fingerprint":"..."},"redacted":false}
+{"type":"tool_result","ts":...,"id":"01J...","call_id":"call_xxx","stdout":"...","stderr":"...","code":0,"timed_out":false,"truncated":false}
+{"type":"ai","ts":...,"id":"01J...","model":"...","tool_schema_hash":"...","content":"..."}
+{"type":"tool_call","origin":"ai|user","ts":...,"id":"01J...","call_id":"call_xxx","command":"...","description":"……","redacted":false}
+{"type":"approval_pending","ts":...,"id":"01J...","call_id":"call_xxx","command":"...","matched_rule":"..."}
+{"type":"approval_resolved","ts":...,"id":"01J...","call_id":"call_xxx","decision":"approve|deny"}
+{"type":"tool_result","ts":...,"id":"01J...","call_id":"call_xxx","stdout":"...","stderr":"...","code":0,"timed_out":false,"truncated":true,"output_files":{"stdout":"sessions/<sid>/outputs/01J....stdout.out"}}
+{"type":"system","source":"notify|error|...","scope":"ai|shell|store|...","ts":...,"id":"01J...","content":"（系统警告、后台任务返回或错误等的消息）"}
 ```
+
+> `ts` 为 Unix 毫秒；`id` 为 ULID，全记录唯一；`tool_result` 用 `call_id` 与 `tool_call` 配对。
+>
+> 提示词钩子记录在 `user` 之后写入（用户输入先落盘），渲染时才提升为消息列表最前的 `system`；钩子的 `tool_call` 不写 `description`，该文案由 CLI 展示层现算。
 
 过往历史消息不可变，上下文只是基于历史消息构造的渲染视图。
 渲染时语义转换为对应接口格式的消息，所以模型始终看到的是结构和内容合规的上下文。
 如开头的提示词注入被格式化为 OpenAI 的 `system` 而非 `assistant.tool_calls` 和 `tool`。
 
-上下文压缩参考 DSH (DeepSeek Harness) 的 `compaction-basic` 的机制。
+上下文压缩参考 DSH (DeepSeek Harness) 的 `compaction-basic`：先跑无模型的头尾 pruner，仍超阈值再发一次摘要 LLM 调用。
 压缩只发生在渲染阶段，原始 JSONL 不变。
 压缩保留未完成工具调用。
 
@@ -52,11 +59,15 @@
 目录结构：
 
 ```plaintext
-$GLB_CFG/sessions/<sid>/default.jsonl          # 主历史，主要由前台 yaa 维护
-$GLB_CFG/history/<sid>/sessions-xxx.jsonl      # 主历史归档后存放的位置
+$YAA_CONFIG_HOME/config.toml                                      # 配置根
+$YAA_DATA_HOME/sessions/<sid>/default.jsonl                       # 主历史，主要由前台 yaa 维护
+$YAA_DATA_HOME/sessions/<sid>/outputs/<ulid>.{stdout,stderr}.out  # 截断后的完整输出
+$YAA_DATA_HOME/history/<sid>/sessions-<ts>.jsonl                  # 主历史归档后存放的位置
 ```
 
-> 主循环每一步重读会话文件，完后拿文件锁（flock 或 `O_APPEND`）写一些消息，写完释放。
+> 状态根按 XDG 拆分：配置根 `$YAA_CONFIG_HOME`，数据根 `$YAA_DATA_HOME`（见 plan.md D10）。
+>
+> 主循环每一步重读会话文件；写入以整批单次 `O_APPEND` + `fsync` 完成，不逐条写。
 >
 > 当前工作目录规范化后哈希得 `<sid>`。
 
@@ -67,11 +78,11 @@ $GLB_CFG/history/<sid>/sessions-xxx.jsonl      # 主历史归档后存放的位�
 ```zsh
 $ yaa 你好吗？
 # 注入系统提示词
-% echo "工作目录：$(pwd)" && yaa --get-prompt "system"
+% echo "工作目录：$(pwd)" && "$YAA_BIN" --get-prompt system
 
 ---
 # 注入用户提示词
-% cat $GLB_CFG/AGENTS.md
+% cat $YAA_CONFIG_HOME/AGENTS.md
 
 ---
 我很好，谢谢，您还有什么需要帮助的吗？
@@ -80,16 +91,16 @@ $ yaa 不用了，只是确认是否能正常回复。
 好的，需要帮助时随时叫我。
 
 $ yaa --clear
-# 归档历史消息
-% mv $GLB_CFG/sessions/<sid>/default.jsonl $GLB_CFG/history/<sid>/sessions-$(date ……).jsonl
+# 归档历史消息（内部完成，不经过 Shell 钩子）
+$YAA_DATA_HOME/history/<sid>/sessions-<ts>.jsonl
 
 $ yaa 不用子智能体，帮我查未来五天的天气并写入到文件 \`/home/pj568/桌面/temp.txt\`。
 # 注入系统提示词
-% echo "工作目录：$(pwd)" && yaa --get-prompt "system"
+% echo "工作目录：$(pwd)" && "$YAA_BIN" --get-prompt system
 
 ---
 # 注入用户提示词
-% cat $GLB_CFG/AGENTS.md
+% cat $YAA_CONFIG_HOME/AGENTS.md
 
 ---
 当前工作目录已在 `/home/pj568/桌面/`。
@@ -132,7 +143,7 @@ EOF
 `/home/pj568/桌面/temp.txt`
 
 $ yaa 我已查看，删掉它。
-# 删除 temp.txt
+# 删除 temp.txt（阶段 2：命中规则后拦截）
 % rm /home/pj568/桌面/temp.txt
 匹配到 `rm`，是否批准执行 `rm /home/pj568/桌面/temp.txt`？
 
@@ -148,19 +159,20 @@ $ yaa --approve
 删除完毕。
 ```
 
-遇到拦截时退出，`--approve` 允许执行并继续，直接写提示词等情况默认拒绝并提示已被拒绝。
+遇到拦截时退出，`--approve` 允许执行并继续，直接写提示词等情况默认拒绝并提示已被拒绝（审批整体属阶段 2）。
 
-这段伪代码示例还是构想阶段，什么都还没定下来。
-如提示词打印等部分功能是否应该做成一个单独的命令还是作为 yaa 的子命令等。
+本节是使用效果示意，非逐字规范：具体参数以下文“参数（待定）”为准，实现状态见 `docs/plan.md`。示例里的 `yaa-webfetch` 是外部辅助命令，不属于 `yaa` 自带工具；提示词打印已定为 `yaa --get-prompt` 子命令。
 
 ## 参数（待定）
+
+阶段 1 已实现 `--status`/`--session`/`--clear`/`--verbose`/`--quiet`/`--get-prompt`/`--cwd`/`--config`；`--json`/`--no-store`/`--approve` 属阶段 2，`--notify` 属阶段 5。
 
 ```plaintext
 yaa [PROMPT]...              # 多个位置参数以空格连接；空则从 stdin 读
 yaa -- "[PROMPT]"            # 同上
 yaa --status                 # 看会话摘要
 yaa --session $path_to/session.jsonl
-yaa --clear                  # 内部归档我希望在当前目录的会话已有一个 yaa 在运行循环中的时候再运行 `yaa "内容"` 能把这个消息插入并继续输出直到循环结束。
+yaa --clear                  # 归档当前目录的会话；若已有 runner 在跑，此时再运行 `yaa "内容"` 会把消息排入 inbox 并跟随输出到循环结束（阶段 4）。
 yaa --verbose                # 追加思考内容与命令输出
 yaa --quiet                  # 仅打印最终结果输出
 yaa --get-prompt system|……   # 仅打印相关提示词
@@ -174,7 +186,7 @@ yaa --config $path_to/config.toml
 ……
 ```
 
-## 审批
+## 审批（阶段 2）
 
 `yaa --approve` 同意第一个未批准或拒绝的 `pending` 命令执行并继续智能体循环，一次性调用多个命令都被拦截时需连续执行多次此命令。
 
@@ -182,14 +194,16 @@ yaa --config $path_to/config.toml
 
 ## 配置文件
 
-配置文件 `$GLB_CFG/config.toml` 内配置各部分的钩子调用的命令、命令和目录拦截放行规则、压缩触发条件、timeout 和 max-steps 什么的。
+配置文件 `$YAA_CONFIG_HOME/config.toml` 内配置各部分的钩子调用的命令、命令和目录拦截放行规则、压缩触发条件、timeout 和 max-steps 什么的。
 钩子调用的命令包括默认的系统命令也可替换，模型供应各项配置也是通过钩子命令获取的。
+
+阶段 1 已实现钩子命令、timeout 与 max-steps；拦截放行规则属阶段 2，压缩触发条件属阶段 3。
 
 ### 规则
 
 和 OpenCode 相似，默认 allow，可配置 deny 和 ask 名单通配符什么的。
 
-## 后台命令
+## 后台命令（阶段 5）
 
 `<任何命令> | yaa --notify &` 执行后不阻塞主循环，待后台任务完毕后能把消息和压缩的执行结果以系统消息发回 inbox。
 其中执行结果的压缩复用工具调用的过长截断压缩加外部完整原始输出文件。
@@ -233,7 +247,7 @@ some-cmd | yaa --notify --to "$YAA_PARENT" &
 | 主循环运行中 | 主循环的下一个循环开始时 |
 | 主循环已退出 | 下次该目录 `yaa` 启动时  |
 
-## 单 runner 与多客户端注入
+## 单 runner 与多客户端注入（阶段 4）
 
 ### 目标
 
@@ -247,9 +261,10 @@ some-cmd | yaa --notify --to "$YAA_PARENT" &
 ### 文件布局
 
 ```plaintext
-$GLB_CFG/sessions/<sid>/
+$YAA_DATA_HOME/sessions/<sid>/
   default.jsonl          # 主历史，只由 runner 写
   runner.lock            # runner 长期 flock/fcntl 锁
+  outputs/               # 截断工具的完整输出
   inbox/
     tmp/                 # 临时文件，不参与消费
     pending/             # 待消费消息，每个消息一个文件
@@ -329,7 +344,8 @@ fn run_agent_loop(session, runner_guard) {
         let ctx = render_context(history); // 压缩只发生在这里
         let resp = model.chat(ctx);
 
-        append_history(session, ai_message(resp));
+        // `ai` 与其全部 `tool_call` 以单批原子追加（见 plan.md D12）
+        append_history(session, ai_step_records(resp));
 
         if resp.has_tool_calls() {
             for call in resp.tool_calls {
@@ -338,7 +354,7 @@ fn run_agent_loop(session, runner_guard) {
             }
             // 工具批次结束，下一轮开头消费 inbox
         } else {
-            append_history(session, turn_end(resp));
+            // 无 `tool_call` 的 `ai` 记录即为回合结束，不引入独立 `turn_end` 类型
         }
     }
 }
@@ -411,7 +427,9 @@ runner 退出条件：
 
 只要默认注入客户端都会“跟随并尝试接管”，消息最终会被处理。
 
-### 断电恢复
+### 断电恢复（阶段 6）
+
+阶段 1 只做到「容忍撕裂尾行」：`load`/`append` 会把最后一个换行之后的残段解析或截断，缺失的配对由渲染器在内存中合成中断 `tool` 消息以保证请求体合法（见 plan.md 更正 11）。下面的落盘补写属阶段 6。
 
 断电后所有进程死亡，内核自动释放 `flock`。`runner.lock` 文件残留无害。新 `yaa` 启动后：
 
@@ -427,7 +445,7 @@ runner 退出条件：
 补中断结果示例：
 
 ```json
-{"type":"tool_result","id":"call_xxx","stdout":"","stderr":"runner interrupted by power loss","code":-1,"ts":...}
+{"type":"tool_result","id":"01J...","call_id":"call_xxx","stdout":"","stderr":"runner interrupted by power loss","code":-1,"timed_out":false,"truncated":false,"ts":...}
 ```
 
 ### 不变量
