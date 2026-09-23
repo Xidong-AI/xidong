@@ -155,19 +155,19 @@ async fn notify(
     let limits = notify_limits(cli, env, home);
 
     if cli.command.is_empty() {
-        // stdin 形态：读取时施加上限，超出即视为截断（无完整输出文件）。
-        let (mut body, truncated) = read_stdin_limited(limits.max_stream_chars).await?;
-        if truncated {
-            if !body.ends_with('\n') {
-                body.push('\n');
-            }
-            body.push_str(&format!(
-                "[truncated] 输入超过上限 {} 字符，仅保留前部分。",
-                limits.max_stream_chars
-            ));
-        }
-        let content = envelope(comment, &body);
-        yaa_store::append(&session, &[Record::system("notify", content, None, None)])?;
+        // stdin 形态：复用 `yaa-exec` 的截断/落盘策略，与 `--` 形态完全一致：
+        // 超限时正文为头尾拼接并带标记，完整输入落盘并记入 `output_files`。
+        let outputs_dir = yaa_core::session::outputs_dir(&session);
+        let captured = yaa_exec::capture_reader(std::io::stdin(), &limits, &outputs_dir).await?;
+        let output_files = captured.file.as_deref().map(|path| yaa_msg::OutputFiles {
+            stdout: Some(yaa_core::tools::shell::relativize(path, data_root)),
+            stderr: None,
+        });
+        let content = envelope(comment, &captured.text);
+        yaa_store::append(
+            &session,
+            &[Record::system("notify", content, None, output_files)],
+        )?;
         return Ok(0);
     }
 
@@ -477,21 +477,6 @@ async fn read_stdin() -> anyhow::Result<String> {
     let mut buffer = String::new();
     tokio::io::stdin().read_to_string(&mut buffer).await?;
     Ok(buffer)
-}
-
-/// 读取 stdin 至多 `max_bytes + 1` 字节；超出即为截断，正文截到 `max_bytes`。
-///
-/// 返回正文与「是否截断」标记。按字节计数与 `--notify` 的「读取字节数」语义一致；
-/// 截断可能落在多字节字符中间，故用 lossy 解码。
-async fn read_stdin_limited(max_bytes: usize) -> anyhow::Result<(String, bool)> {
-    let mut handle = tokio::io::stdin().take(max_bytes as u64 + 1);
-    let mut bytes = Vec::new();
-    handle.read_to_end(&mut bytes).await?;
-    let truncated = bytes.len() > max_bytes;
-    if truncated {
-        bytes.truncate(max_bytes);
-    }
-    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
 }
 
 /// 用户主目录，仅作为未设置 `YAA_*`/`XDG_*` 时的路径回退。

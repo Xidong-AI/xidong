@@ -44,6 +44,17 @@ pub struct ShellOutput {
     pub stderr_file: Option<PathBuf>,
 }
 
+/// 一个被捕获的流（如 stdin）的截断结果与完整输出文件。
+#[derive(Debug, Clone)]
+pub struct CapturedStream {
+    /// 入记录文本：未截断为全量，截断为头尾拼接并带 `... [truncated] ...` 标记。
+    pub text: String,
+    /// 是否发生了截断。
+    pub truncated: bool,
+    /// 仅在发生截断时给出，绝对路径，指向完整输入。
+    pub file: Option<PathBuf>,
+}
+
 /// Shell 执行错误。
 #[derive(Debug, thiserror::Error)]
 pub enum ShellError {
@@ -71,6 +82,37 @@ pub async fn run(
     tokio::task::spawn_blocking(move || exec::run_blocking(&cmd, &limits, &output_dir))
         .await
         .map_err(|e| ShellError::Join(e.to_string()))?
+}
+
+/// 用与命令流相同的截断/落盘策略捕获任意 `Read`（如 stdin）。
+///
+/// 复用 [`sink::Sink`] 与 [`sink::FullOutput`]：内存中只保留头 `head_chars` 与尾
+/// `tail_chars`，一旦超过 `max_stream_chars` 就把完整输入写入 `output_dir` 下的
+/// `<ULID>.stdin.out` 并返回其绝对路径。阻塞读取在 `spawn_blocking` 中执行。
+pub async fn capture_reader<R>(
+    reader: R,
+    limits: &ShellLimits,
+    output_dir: &Path,
+) -> Result<CapturedStream>
+where
+    R: std::io::Read + Send + 'static,
+{
+    let limits = limits.clone();
+    let output_dir = output_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let full = sink::FullOutput::new(&output_dir, "stdin");
+        let stream = sink::Sink::run(reader, &limits, &full)?;
+        let file = full
+            .path()
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
+        Ok::<_, ShellError>(CapturedStream {
+            text: stream.text,
+            truncated: stream.truncated,
+            file,
+        })
+    })
+    .await
+    .map_err(|e| ShellError::Join(e.to_string()))?
 }
 
 #[cfg(test)]
@@ -236,5 +278,50 @@ mod tests {
         assert!(!out.truncated);
         assert!(out.stdout_file.is_none());
         assert!(out.stderr_file.is_none());
+    }
+
+    #[tokio::test]
+    async fn capture_reader_small_input_has_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = capture_reader(
+            std::io::Cursor::new(b"hello\n".to_vec()),
+            &limits(),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!captured.truncated);
+        assert!(captured.file.is_none());
+        assert_eq!(captured.text, "hello\n");
+    }
+
+    #[tokio::test]
+    async fn capture_reader_truncates_and_writes_full_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let input: String = (1..=100_000).map(|n| format!("{n}\n")).collect();
+
+        let captured = capture_reader(
+            std::io::Cursor::new(input.clone().into_bytes()),
+            &limits(),
+            dir.path(),
+        )
+        .await
+        .unwrap();
+
+        assert!(captured.truncated);
+        assert!(captured.text.contains("\n... [truncated] ...\n"));
+        assert!(captured.text.starts_with("1\n2\n"));
+        assert!(captured.text.trim_end().ends_with("100000"));
+        assert!(captured.text.chars().count() < input.chars().count());
+
+        let file = captured.file.expect("截断应落盘完整输入");
+        assert!(file.is_absolute());
+        assert!(file.to_string_lossy().ends_with(".stdin.out"));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            input,
+            "完整输出文件应保留全部原始输入"
+        );
     }
 }

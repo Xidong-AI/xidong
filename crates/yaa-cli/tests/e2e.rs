@@ -832,6 +832,11 @@ fn notify_command_and_stdin_forms_write_envelopes() {
         "stdin 形态不应记 command：{}",
         records[0]
     );
+    assert!(
+        records[0].get("output_files").is_none(),
+        "短输入的 stdin 形态不应落盘完整输出：{}",
+        records[0]
+    );
 
     let env = TestEnv::new(0);
     let output = env.run(&["--notify", "--", "echo", "x"]);
@@ -950,13 +955,15 @@ fn notify_timeout_flag_kills_long_command() {
     assert_eq!(records[0]["command"], "sleep 30");
 }
 
-/// T3：stdin 形态按 `YAA_NOTIFY_MAX_STREAM_CHARS` 加上限，超出即视为截断。
+/// stdin 形态复用 `yaa-exec`：超限时截断、落盘完整输入并记入 `output_files`。
 #[test]
-fn notify_stdin_truncates_at_env_limit() {
+fn notify_stdin_truncates_and_records_output_files() {
     let env = TestEnv::new(0);
     let mut command = env.command();
     command
         .env("YAA_NOTIFY_MAX_STREAM_CHARS", "8")
+        .env("YAA_NOTIFY_HEAD_CHARS", "4")
+        .env("YAA_NOTIFY_TAIL_CHARS", "2")
         .arg("--notify=管道")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -981,14 +988,79 @@ fn notify_stdin_truncates_at_env_limit() {
         records[0].get("command").is_none(),
         "stdin 形态不记 command"
     );
+
+    let relative = records[0]["output_files"]["stdout"]
+        .as_str()
+        .expect("stdin 截断应记录完整输出文件")
+        .to_string();
     assert!(
-        records[0].get("output_files").is_none(),
-        "stdin 形态不落盘完整输出"
+        !relative.starts_with('/'),
+        "数据根内应为相对路径：{relative}"
     );
+    let full = env.data_home.join(&relative);
+    assert!(full.exists(), "完整输出文件应存在：{}", full.display());
+    assert_eq!(
+        std::fs::read_to_string(&full).unwrap(),
+        "0123456789ABC",
+        "完整输出文件应保留全部原始输入"
+    );
+
     let content = records[0]["content"].as_str().unwrap();
     assert!(
-        content.contains("输入超过上限 8 字符"),
+        content.contains("... [truncated] ..."),
         "正文应体现截断：{content}"
+    );
+    assert!(
+        content.starts_with("<管道>\n0123"),
+        "正文应保留头部：{content}"
+    );
+    assert!(content.contains("BC\n</管道>"), "正文应保留尾部：{content}");
+}
+
+/// stdin 形态超限的通知在第二跳请求体中体现截断提示与相对路径。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_stdin_truncation_is_visible_to_model_with_path() {
+    let (addr, state) = start_server(vec![text_response("第一答"), text_response("第二答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(TRUNCATION_CONFIG);
+
+    let first = env.run(&["你好"]);
+    assert!(first.status.success(), "stderr：{}", stderr_of(&first));
+
+    let long_input = "abcdefghij".repeat(20);
+    let notify = env.run_with_stdin(&["--notify=长输入"], &long_input);
+    assert_eq!(
+        notify.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&notify)
+    );
+
+    let relative = read_jsonl(&env.session_file())
+        .iter()
+        .find(|record| record["type"] == "system" && record["source"] == "notify")
+        .and_then(|record| record["output_files"]["stdout"].as_str())
+        .expect("超限通知应记录完整输出文件")
+        .to_string();
+
+    let second = env.run(&["继续"]);
+    assert!(second.status.success(), "stderr：{}", stderr_of(&second));
+
+    let requests = state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let joined = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("[truncated] 仅保留头尾输出，完整内容见输出文件"),
+        "第二跳请求应含截断提示：{joined}"
+    );
+    assert!(
+        joined.contains(&relative),
+        "第二跳请求应含完整输出相对路径 {relative}：{joined}"
     );
 }
 
