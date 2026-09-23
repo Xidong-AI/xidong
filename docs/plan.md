@@ -25,17 +25,17 @@
 | D17 | 内置模板只保留 `system`，删除 `USER_TEMPLATE`；`--get-prompt` 只认 `system`，输出「产品前导 + 工具 section」 | `user` 模板无运行时消费者，按「不定义无消费者的死分支」原则删除；工具说明随工具走 |
 | D18 | 展示文案与渲染角色由 `yaa-core` 投影层决定，`yaa-cli` 只负责样式与 stdout/stderr 分流 | 消除 CLI 硬编码映射；展示语义属上下文投影，不属于终端样式 |
 | D19 | 内容注入统一为 `yaa --notify` 外部接口（`yaa --notify="注释" -- cmd` / `cmd \| yaa --notify="注释"`），写入 `system(source=notify)` 事件、正文内联 `<注释>` 信封；`llm` 配置加载不写任何事件 | 取代 `system_prompt`/`user_prompt` 两个提示词钩子与 `origin=hook` 审计记录，注入内容成为一等事件，渲染不再需要「提升钩子」的间接层；`llm` 每次运行都执行却只累积 redacted 记录，是现状缺陷 |
-| D20 | 空会话初始化钩子 `hooks.init`：会话无任何记录时、写入 `user` 之前执行一次；yaa 忽略其 stdout，内容由命令内的 `yaa --notify` 写入；成功后写一条 `system(source=init, content="")` 簿记保证幂等；失败仍写 `user` 并按配置错误退出 | 「空会话」判定天然幂等，取代 `(名称，指纹，成功)` 缓存；簿记让不产出内容的钩子也不会反复执行 |
+| D20 | 空会话初始化钩子 `hooks.init`：会话**不存在 `system(source=init)` 记录**时、写入 `user` 之前执行一次；yaa 忽略其 stdout，内容由命令内的 `yaa --notify` 写入；成功后写一条 `system(source=init, content="")` 簿记保证幂等；失败仍写 `user` 并按配置错误退出 | 触发条件改用**簿记**而非「会话为空」，使 `yaa --notify` 先写入通知、或上轮 init 失败的会话仍会执行 init；簿记让不产出内容的钩子也不会反复执行 |
 | D21 | 记录 schema 简化：移除 `tool_call.hook`、`tool_call.redacted`、`ToolOrigin::Hook`、`HookInfo` 与 `System.scope`；`System` 新增可选 `command` 供展示 | 没有 hook 记录后这些字段失去消费者；`command` 让通知块与工具块同构（默认摘要显示命令，`--verbose` 显示内容） |
 | D22 | 上下文按稳定性分层装配（对齐 `docs/dsh-context.md`）：稳定前缀合并为一条 `system`，易变离群通知并入相邻 `user`，工具 schema 独立于消息 | 缓存友好（前缀字节稳定）；与 DSH 的 sections/contexts/messages/tools 分层一致 |
 | D23 | `ai` 记录新增可选 `reasoning`（`Option<String>`，落盘） | 思考内容既要展示（`--verbose`）又要按供应商要求回传；不落盘则两者都失去来源。接受 schema 变动与存储/隐私成本 |
 | D24 | `[llm]` 的 `provider` 字段删除，改为 `endpoint_format`（默认 `"openai"`，可选 `openai`/`deepseek`/`kimi`/`qwen`/`glm`），唯一驱动出站方言分支 | 原 `provider` 无任何消费者（死字段）。DeepSeek/Kimi/GLM/Qwen 在请求带 `tools` 时**必须**回传 `reasoning_content`（思考为空也要发 `""`），而 OpenAI 官方 Chat Completions 不认该字段，故必须按端点格式分支；见「对 design.md 的更正」第 12 条 |
 | D25 | 阶段 1 引入 `YAA_SESSION` 环境变量；`yaa --notify` 目标解析顺序 `--session` → `YAA_SESSION` → 当前 cwd 默认会话 | `init` 钩子经 `yaa --notify` 侧写，而 `--notify` 子进程只看到 cwd；外层 `yaa --session <任意路径>` 时若不传目标会写错会话 |
 | D26 | 旧会话不兼容：`load` 遇到无法解析的行报明确错误（提示 `--clear`），不静默跳过 | 新 schema 删除 `origin=hook` 等字段后旧行无法反序列化；pre-1.0 不做数据迁移，但数据损坏必须可见 |
-| D27 | `yaa --notify -- cmd` 把 cmd 的 stderr 原样透传、以 cmd 的退出码退出；`init` 失败不写 `system(source=init)` 簿记、下次运行重试 | 钩子需要感知子命令失败；不写簿记让「幂等由会话非空保证」继续成立，代价是重试可能重复部分注入 |
+| D27 | `yaa --notify -- cmd` 把 cmd 的 stderr 原样透传、以 cmd 的退出码退出；`init` 失败不写 `system(source=init)` 簿记、下次运行重试 | 钩子需要感知子命令失败；因触发条件由簿记判定（D20），不写簿记即让「下次运行自动重试」的承诺成立，代价是重试可能重复部分注入 |
 | D28 | 离群 `system(notify)` 的分组取「双向最大连续段」（见「渲染管线」表） | 设计原文「与相邻 `user` 合并」未定义方向；golden 测试需要唯一解 |
 | D29 | 「展示与模型消息同源」（D15）显式承认豁免：`reasoning` 与纯展示文本不计入一致性不变量 | `reasoning` 落盘且展示，但是否投影由 `endpoint_format` 决定；不豁免则验收第 9 条自相矛盾 |
-| D30 | 默认 `init` 钩子中「用户总提示词」改为「文件存在才 `--notify`」 | 原草案无条件 notify，`AGENTS.md` 缺失时会注入空信封，浪费 token |
+| D30 | 默认 `init` 钩子中「用户总提示词」改为「文件存在才 `--notify`」，且脚本首行加 `set -e` | 原草案无条件 notify，`AGENTS.md` 缺失时会注入空信封，浪费 token；`set -e` 避免「前两条 notify 失败、末条成功 ⇒ 整钩子退出 0 却被当成功」 |
 
 > D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。
 
@@ -51,7 +51,7 @@
 6. **截断产物无载体**：`design.md:50` 未定义完整输出的路径字段。更正为 `tool_result` 增加可选 `output_files`（stdout/stderr 分两个文件）与 `truncated`。
 7. **`client_id`/`turn_id`**（`design.md:301`）预留进 schema，阶段 4 使用。
 8. **钩子不经 `shell` 工具执行**（`design.md:12`）。design 说系统生命周期钩子「触发 Shell 工具调用」实现。更正为：`init`/`llm` 钩子由 `yaa-core` 的独立执行器（`crates/yaa-core/src/hook.rs`）以 `sh -c` 运行，与 `shell` 工具**不共用策略**——钩子单流超过 1 MiB 直接报错退出，不截断、不产生 `output_files`；「钩子就是同一个 Shell 工具」的表述不成立。
-9. **初始化注入排在 `user` 之前**（`design.md:27-31`）。design 的 JSONL 顺序在新设计下成立：`init` 只在空会话时于写入 `user` 之前执行，注入内容由命令内的 `yaa --notify` 写入，因而物理上位于 `user` 之前。`init` 失败时仍写入 `user` 并按配置错误退出。
+9. **初始化注入排在 `user` 之前**（`design.md:27-31`）。design 的 JSONL 顺序在新设计下成立：`init` 只在无 `system(source=init)` 簿记时于写入 `user` 之前执行，注入内容由命令内的 `yaa --notify` 写入，因而物理上位于 `user` 之前。`init` 失败时仍写入 `user` 并按配置错误退出。
 10. **注入不再有专用文案**。旧设计「钩子 `tool_call` 不写 `description`、由展示层现算文案」随 D19 一并移除：注入内容现在是 `system(source=notify)` 事件，展示用与工具调用一致的块样式，标题即信封中的注释。
 11. **中断 `tool_result` 有两种互补补法**（`design.md:427-431`、本文件「渲染管线」失配兜底）。阶段 1 由渲染器在内存中合成中断 `tool` 消息，保证请求体合法，**不写回** JSONL；阶段 6 的「补中断 `tool_result`」则是把它作为记录持久化落盘。两者不冲突：前者保证任意时刻请求合法，后者让历史事实源自身自洽。
 12. **`ai` 记录含 `reasoning`，思考内容按端点格式回传**（`design.md:38,42` 的示例未列）。`design.md:63` 把压缩参考 DSH，而 DSH 的思考模型适配证明该字段必须可回传。更正为：`ai` 新增可选 `reasoning`，落盘、可展示；`[llm] endpoint_format` 决定它是否作为 assistant 消息顶层 `reasoning_content` 回传——`deepseek`/`kimi`/`qwen`/`glm` 在请求带 `tools` 时即使思考为空也必须发 `""`，`openai` 不回传。
@@ -107,7 +107,7 @@ $YAA_DATA_HOME     默认 ${XDG_DATA_HOME:-$HOME/.local/share}/yaa
 
 ```toml
 [hooks]
-# 空会话初始化：仅当会话无任何记录时执行一次；stdout 不进入上下文，
+# 无 init 簿记时执行一次；stdout 不进入上下文，
 # 内容由命令内的 `yaa --notify` 写入。
 init = '''
 "$YAA_BIN" --notify="系统提示词" -- "$YAA_BIN" --get-prompt system
@@ -142,11 +142,11 @@ max_tokens  = 4096
 1. 钩子以 `sh -c "<命令>"` 执行，cwd 为进程工作目录，环境含 `GLB_CFG`、`YAA_CONFIG_HOME`、`YAA_DATA_HOME`、`YAA_SESSION`（本会话 JSONL 绝对路径）与 `YAA_BIN`（当前 `yaa` 可执行文件路径，使默认钩子不依赖 `PATH`）。
 2. **`init` 钩子只做副作用**：yaa 运行它并忽略 stdout；写入上下文的唯一方式是在命令里调用 `yaa --notify`。默认配置用三条 notify 拼出「系统提示词 / 用户总提示词 / 当前环境」；内置模板的「工具 section」由 `yaa-core::tools::shell` 提供（见 D14、D17）。
 3. **`llm` 钩子不落历史、不渲染、不展示**：其 stdout 含密钥，且每次运行都需执行以取得配置；结果只留在进程内，不写任何事件（见 D19）。
-4. **`init` 幂等由「会话非空」保证**：执行成功后追加一条 `system(source=init, content="")` 簿记；即使钩子不产出内容，下次也不会重跑。失败时仍写入 `user` 并按配置错误退出，已写入的 `notify` 记录保留。
+4. **`init` 幂等由簿记保证**：触发条件是「会话中不存在 `system(source=init)` 记录」，成功后追加一条 `system(source=init, content="")` 簿记；即使钩子不产出内容，下次也不会重跑。失败时不写簿记、仍写入 `user` 并按配置错误退出，已写入的 `notify` 记录保留；因此下次运行会自动重试。
 5. **`yaa --get-prompt system` 必须在加载 config、解析会话、执行任何钩子之前短路**，只打印内置模板。否则 `init` 钩子内部调用它会形成递归环。补一条递归防护测试。
 6. 钩子输出有**独立上限**（不复用 Shell 的截断）：超限直接报错退出，绝不静默裁掉提示词。
 7. 钩子执行有**硬超时**，并以进程组方式整组击杀（与 Shell 同一套方案），避免配置钩子挂死拖住 `yaa`。
-8. **`yaa --notify` 写入协议**：`yaa --notify="注释" -- cmd` 执行命令取 stdout 并记下 `command`，stderr 原样透传到 yaa 的 stderr，yaa 以 cmd 的退出码退出；`cmd | yaa --notify="注释"` 从 stdin 读（无 `command`），注释缺省「由用户执行」。写入一条 `system { source: "notify", command?, content: "<注释>\n<内容>\n</注释>" }`，原子追加到目标会话。目标解析顺序 `--session` → `YAA_SESSION` → 当前 cwd 默认会话（跨会话显式 `--to` 见阶段 5）。`--notify` 是短路写入路径：不加载配置、不进入 agent loop、不触发 `init`。
+8. **`yaa --notify` 写入协议**：`yaa --notify="注释" -- cmd` 执行命令取 stdout 并记下 `command`（`command` 是 **argv 以空格连接的展示摘要**，不保证可复现，**不是**可重放命令），stderr 原样透传到 yaa 的 stderr，yaa 以 cmd 的退出码退出；`cmd | yaa --notify="注释"` 从 stdin 读（无 `command`），注释缺省「由用户执行」。写入一条 `system { source: "notify", command?, content: "<注释>\n<内容>\n</注释>" }`，原子追加到目标会话。目标解析顺序 `--session` → `YAA_SESSION` → 当前 cwd 默认会话（跨会话显式 `--to` 见阶段 5）。`--notify` 是短路写入路径：不加载配置、不进入 agent loop、不触发 `init`。
 
 ## 记录 schema（阶段 1 冻结）
 
@@ -158,13 +158,13 @@ ai          { type, id, ts, model, tool_schema_hash, content, reasoning? }
 tool_call   { type, id, ts, origin: ai|user, call_id, command, description? }
 tool_result { type, id, ts, call_id, stdout, stderr, code, timed_out,
               truncated, output_files?: { stdout?, stderr? } }
-system      { type, id, ts, source, content, command? }
+system      { type, id, ts, source, command?, content }
 ```
 
 - `id` 为 ULID，全记录唯一，阶段 4 以此幂等去重。
 - `call_id` 为模型返回的工具调用 id，`tool_result` 靠它配对。
 - `ai` 与其后紧跟的 `tool_call(origin=ai)` 记录构成一个助手步骤，**两者以单次缓冲原子追加**（见下）。
-- `system.source` 目前有 `notify`（`yaa --notify` 写入的通知，正文内联 `<注释>` 信封）与 `init`（初始化簿记，空内容不渲染）；可选 `command` 只用于展示，不进入上下文。
+- `system.source` 目前有 `notify`（`yaa --notify` 写入的通知，正文内联 `<注释>` 信封）与 `init`（初始化簿记，空内容不渲染）；可选 `command` 是 argv 以空格连接的**展示摘要**（不保证可复现，不是可重放命令），只用于展示，不进入上下文。
 - `ai.reasoning` 为可选思考内容，落盘、可由 `--verbose` 展示，并按 `endpoint_format` 决定是否回传（D23/D24）。
 - 相对旧 schema 的移除项见 D21。
 - `approval_pending`/`approval_resolved` 阶段 2 引入。
@@ -182,14 +182,14 @@ system      { type, id, ts, source, content, command? }
 | 首条 `user` 之前的所有 `system` | 按物理顺序用空行拼接为**一条** `system` 消息（稳定前缀）；空内容跳过 |
 | `user` 与 `system(source=notify)` | 首条 `user` 起，二者组成的**最大连续段**按物理顺序用空行拼接为**一条** `user` 消息（双向合并，D28）；段外的通知自然单独成一条 `user` |
 | `ai` + 其后 `tool_call(origin=ai)` | 一条 `assistant` 消息，工具调用进 `tool_calls` |
-| 配对 `tool_result` | `tool` 消息，`tool_call_id` 关联 |
+| 配对 `tool_result` | `tool` 消息，`tool_call_id` 关联；按 `call_id` **全日志一次建表**配对，不要求结果紧邻 `tool_call` |
 | `tool_call(origin=user)` | 文本（`user` 或 `system`），**绝不投影为 `tool`** |
 | `system(source=init)` | 不投影（簿记） |
 | `ai.reasoning` | 落盘的思考内容；按 `endpoint_format` 决定是否作为 assistant 顶层 `reasoning_content` 回传（见下） |
 
-**思考内容回传**：`endpoint_format` 为 `openai`（或未知）时 `reasoning` 只落盘与展示、不投影；为 `deepseek`/`kimi`/`qwen`/`glm` 时，把该 assistant 消息的 `reasoning_content` 设为 `reasoning` 的值（**带 `tool_calls` 时即使为空也写 `""`**，否则 DeepSeek 系返回 400）。请求侧开关（Qwen `preserve_thinking`、GLM `clear_thinking`）阶段 1 不引入，作为将来扩展点记录。Anthropic/Responses 的签名类结构化 metadata 属后续 provider，阶段 1 不预留字段。
+**思考内容回传**：`endpoint_format` 为 `openai` 时 `reasoning` 只落盘与展示、不投影；为 `deepseek`/`kimi`/`qwen`/`glm` 时，把该 assistant 消息的 `reasoning_content` 设为 `reasoning` 的值（**带 `tool_calls` 时即使为空也写 `""`**，否则 DeepSeek 系返回 400）。未知的 `endpoint_format` 取值按配置错误处理（退出 3），不静默降级为 `openai`。请求侧开关（Qwen `preserve_thinking`、GLM `clear_thinking`）阶段 1 不引入，作为将来扩展点记录。Anthropic/Responses 的签名类结构化 metadata 属后续 provider，阶段 1 不预留字段。
 
-- **分组规则**：按 `ai` 步骤切分，步骤内工具调用按出现顺序排列，`tool_result` 按 `call_id` 配对。
+- **分组规则**：按 `ai` 步骤切分，步骤内工具调用按出现顺序排列；`tool_result` 按 `call_id` **全日志一次建表**配对（首个同 `call_id` 结果生效），不要求紧邻 `tool_call`。
 - **失配兜底**：`ai` 步骤里的 `call_id` 若无对应 `tool_result`（断电、中断），渲染器合成一条 `tool` 消息（内容为中断标记），保证 `assistant.tool_calls` 后紧跟配对的 `tool` 消息，请求体始终合法。
 - **空回合**：既无文本又无工具调用的 `ai` 记录不投影消息（避免产生 `{"role":"assistant"}`）。
 - 工具以 OpenAI function schema 暴露，仅一个 `shell` 函数，参数 `command`（必填）与 `description`（可选）。
@@ -207,7 +207,7 @@ system      { type, id, ts, source, content, command? }
 
 - 展示条目与模型消息同源；`system(source=notify)` 用与工具调用一致的块样式：默认 `# 注释` + `% 命令`（摘要，无 `command` 时只给标题），`--verbose` 追加 `content` 全文；不设专用格式（D16）。
 - 会话首条 `user` 之前的注入只在空会话首轮出现一次；之后运行不再出现（`init` 不重跑）。
-- `--quiet` 抑制全部过程输出；`--verbose` 追加 `ai.reasoning`（思考内容）、命令输出与注入内容全文。
+- `--quiet` 抑制全部过程输出，但**致命错误仍打印到 stderr**（否则用户看不到失败原因）；`--verbose` 追加 `ai.reasoning`（思考内容）、命令输出与注入内容全文。
 - 展示文案与渲染角色由投影层决定，`yaa-cli` 只决定样式与流向。
 
 ### 一致性不变量
@@ -235,7 +235,7 @@ system      { type, id, ts, source, content, command? }
 async fn main_flow(cfg) -> Result<ExitCode> {
     let session = resolve_session(&cfg)?;          // canonical cwd -> sid / --session
 
-    if store::is_empty(&session)? {                // 空会话：先初始化，再收 user
+    if !store::has_init_bookkeeping(&session)? {   // 无 init 簿记：先初始化，再收 user
         init_hook(&session, &cfg).await?;          // 经 `yaa --notify` 侧写事件 + init 簿记
     }
 
@@ -271,13 +271,13 @@ async fn run_agent_loop(session, cfg, guard) -> Result<ExitCode> {
 - `yaa-store` 保持**同步 API**（追加、按偏移读、归档）。在 core 调用点用 `spawn_blocking` 包装，不做成假 async。
 - store 预留 `read_from(&session, offset) -> (Vec<Record>, new_offset)` 供阶段 4 跟随使用；`load` 容忍撕裂尾行。
 - `load` 每步重读，阶段 4 的 inbox 插入与 `yaa --notify` 追加才能在下一轮被看到。
-- **空会话先初始化**：`is_empty` 为真时执行 `init` 钩子（D20）；钩子内经由 `yaa --notify` 写入的通知先落盘，随后才是 `init` 簿记与 `user` 记录。`init` 失败仍写入 `user`，再按配置错误退出。
+- **无初始化簿记才初始化**：会话中不存在 `system(source=init)` 记录时执行 `init` 钩子（D20）；钩子内经由 `yaa --notify` 写入的通知先落盘，随后才是 `init` 簿记与 `user` 记录。`init` 失败仍写入 `user`，再按配置错误退出；因不写簿记，下次运行自动重试。
 - **`llm` 不写事件**：只解析配置供进程使用；解析失败按配置错误退出（见 D19）。
 - **空回复**：无文本且无工具调用时，记一条空 `ai` 记录、向 stderr 发提示并结束回合（退出 `0`），且该记录不投影消息。
 
 ### 错误与退出策略
 
-- 模型 429/5xx/网络错误：指数退避重试 3 次；仍失败则以模型错误退出。此时历史停在「工具批次已完成」的合法状态，下次运行可续接。
+- 模型 429/5xx/网络错误：指数退避，总尝试最多 3 次（首发 + 2 次重试）；仍失败则以模型错误退出。此时历史停在「工具批次已完成」的合法状态，下次运行可续接。
 - 退出码：`0` 成功，`1` 通用错误，`2` 用法错误，`3` 配置/钩子错误（含钩子执行失败），`4` 模型错误，`5` 达到 `max_steps`。
 - 空回复（无内容且无工具调用）视为回合结束，退出 `0`，并给出 stderr 提示。
 - 半批次收尾：模型失败或 Ctrl-C 后，已写入的 `tool_result` 保留；缺失的结果由渲染器兜底（见上）。
@@ -356,7 +356,7 @@ pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前
 - 思考回传测试：`endpoint_format` 为 `deepseek` 等时 assistant 消息含 `reasoning_content`（带 `tool_calls` 且思考为空时为 `""`），为 `openai` 时不含。
 - 通知测试：`--notify` 两种形态写入 `system(source=notify)` 与信封正文；`--` 形态记 `command`、stdin 形态不记；注释缺省「由用户执行」；stderr 透传与退出码沿用。
 - 会话目标测试：hook 环境注入 `YAA_SESSION`；`--notify` 解析顺序 `--session` → `YAA_SESSION` → cwd 默认。
-- 初始化测试：空会话执行 `init` 并写簿记；非空会话不重跑；`init` 失败仍写 `user` 且退出码为配置错误。
+- 初始化测试：无 `system(source=init)` 簿记时执行 `init` 并写簿记（含已有 `notify` 记录的会话）；已写簿记的会话不重跑；`init` 失败仍写 `user`、不写簿记且退出码为配置错误，改好后下次运行能重试成功。
 - 展示测试：展示条目 golden；首轮注入展示一次；默认摘要与 `--verbose` 全文两种形态；`--quiet` 抑制；`llm` 不产生记录。
 - 防漂移测试：系统提示词 section 必须提及 schema 的工具名与参数名；展示 - 模型一致性不变量（见阶段 1 验收第 9 条）。
 - 集成测试：`dev-dependencies` 起极简假 OpenAI 服务（`axum` 或 `hyper`，仅测试用），按脚本返回 `tool_calls`，端到端跑通并用临时目录隔离。
@@ -375,6 +375,6 @@ pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前
 
 ## 已确认项与默认假设
 
-已确认：XDG 双根（D10）、`ai` 与 `tool_call` 分离记录 + 单批原子写（D12）、统一通知注入（D19）、空会话初始化（D20）、分层装配（D22）、`ai.reasoning` 落盘（D23）、`endpoint_format` 取代 `provider`（D24）、阶段 1 引入 `YAA_SESSION`（D25）、离群通知双向最大连续段（D28）。
+已确认：XDG 双根（D10）、`ai` 与 `tool_call` 分离记录 + 单批原子写（D12）、统一通知注入（D19）、簿记驱动的初始化（D20）、分层装配（D22）、`ai.reasoning` 落盘（D23）、`endpoint_format` 取代 `provider`（D24）、阶段 1 引入 `YAA_SESSION`（D25）、离群通知双向最大连续段（D28）。
 
 默认假设（未特别反对即执行）：截断阈值 `max_stream_chars=32768`、`head_chars=8192`、`tail_chars=2048`；`endpoint_format` 默认 `"openai"`；注入合并用空行分隔；包 `yaa-cli` 产出二进制 `yaa`；workspace 版本从 `0.1.0` 起。

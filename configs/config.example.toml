@@ -10,7 +10,9 @@
 # `$YAA_BIN` 是当前 yaa 可执行文件的绝对路径，避免 PATH 中没有 yaa 时钩子失败。
 # 内置系统提示词由 `"$YAA_BIN" --get-prompt system` 提供。
 # 没有 AGENTS.md 时不 notify，避免注入空信封。
+# 首行 `set -e` 保证任一条 notify 失败即整体失败，避免假成功。
 init = '''
+set -e
 "$YAA_BIN" --notify="系统提示词" -- "$YAA_BIN" --get-prompt system
 if [ -f "$GLB_CFG/AGENTS.md" ]; then "$YAA_BIN" --notify="用户总提示词" -- cat "$GLB_CFG/AGENTS.md"; fi
 "$YAA_BIN" --notify="当前环境" -- echo "工作目录：$(pwd)"
