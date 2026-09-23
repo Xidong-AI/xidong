@@ -4,6 +4,8 @@
 //! `items` 是纯函数，不维护第二套执行事件流。`yaa-cli` 只决定样式与 stdout/stderr
 //! 分流（D18）。
 
+use std::collections::BTreeMap;
+
 use yaa_msg::{OutputFiles, Record, System, ToolOrigin};
 
 /// 一条展示条目。
@@ -41,8 +43,12 @@ pub enum DisplayItem {
         command: String,
         matched_rule: String,
     },
-    /// 审批决策（阶段 2）：`approved` 为真表示已批准。
-    ApprovalResolved { call_id: String, approved: bool },
+    /// 审批决策（阶段 2）：`approved` 为真表示已批准；`command` 为被决策调用的命令。
+    ApprovalResolved {
+        call_id: String,
+        command: String,
+        approved: bool,
+    },
 }
 
 /// 展示条目的接收端。
@@ -60,6 +66,15 @@ impl Sink for NullSink {
 
 /// 把一段记录投影为展示条目（纯函数）。
 pub fn items(records: &[Record]) -> Vec<DisplayItem> {
+    // `call_id` → 命令：审批决策块需回带被决策的命令（R5）；同 id 以后者为准。
+    let commands: BTreeMap<&str, &str> = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolCall(call) => Some((call.call_id.as_str(), call.command.as_str())),
+            _ => None,
+        })
+        .collect();
+
     let mut items = Vec::new();
     for (index, record) in records.iter().enumerate() {
         match record {
@@ -104,6 +119,11 @@ pub fn items(records: &[Record]) -> Vec<DisplayItem> {
             }),
             Record::ApprovalResolved(resolved) => items.push(DisplayItem::ApprovalResolved {
                 call_id: resolved.call_id.clone(),
+                command: commands
+                    .get(resolved.call_id.as_str())
+                    .copied()
+                    .unwrap_or_default()
+                    .to_string(),
                 approved: resolved.decision == yaa_msg::ApprovalDecision::Approve,
             }),
             // `tool_call(origin=user)` 不产出条目。
@@ -366,12 +386,35 @@ mod tests {
                     command: "echo hi".to_string(),
                     matched_rule: "echo *".to_string(),
                 },
+                // 无对应 `tool_call` 记录时命令为空串。
                 DisplayItem::ApprovalResolved {
                     call_id: "c1".to_string(),
+                    command: String::new(),
                     approved: false,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn approval_resolved_carries_command_from_tool_call() {
+        let records = vec![
+            Record::tool_call(ToolOrigin::Ai, "c1", "echo hi", Some("打招呼".into())),
+            Record::approval_pending("c1", "echo hi", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Approve),
+        ];
+        let resolved = items(&records)
+            .into_iter()
+            .find_map(|item| match item {
+                DisplayItem::ApprovalResolved {
+                    call_id,
+                    command,
+                    approved,
+                } => Some((call_id, command, approved)),
+                _ => None,
+            })
+            .expect("应有审批决策条目");
+        assert_eq!(resolved, ("c1".to_string(), "echo hi".to_string(), true));
     }
 
     #[test]
