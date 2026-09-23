@@ -9,7 +9,7 @@ authors.workspace = true
 [dependencies]
 yaa-msg = { path = "../yaa-msg" }
 yaa-store = { path = "../yaa-store" }
-yaa-shell = { path = "../yaa-shell" }
+yaa-exec = { path = "../yaa-exec" }
 tokio.workspace = true
 reqwest.workspace = true
 serde.workspace = true

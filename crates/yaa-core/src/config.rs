@@ -45,7 +45,7 @@ pub struct Hooks {
     pub timeout_secs: u64,
 }
 
-/// Shell 工具限额，可直接转成 `yaa_shell::ShellLimits`。
+/// Shell 工具限额，可直接转成 `yaa_exec::ShellLimits`。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShellConfig {
     pub timeout_secs: u64,
@@ -91,9 +91,9 @@ impl Default for AgentConfig {
 }
 
 impl ShellConfig {
-    /// 转换为 `yaa_shell` 的限额结构。
-    pub fn to_limits(&self) -> yaa_shell::ShellLimits {
-        yaa_shell::ShellLimits {
+    /// 转换为 `yaa_exec` 的限额结构。
+    pub fn to_limits(&self) -> yaa_exec::ShellLimits {
+        yaa_exec::ShellLimits {
             timeout_secs: self.timeout_secs,
             max_stream_chars: self.max_stream_chars,
             head_chars: self.head_chars,

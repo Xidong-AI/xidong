@@ -1935,9 +1935,20 @@ dependencies = [
  "tokio",
  "toml",
  "ulid",
+ "yaa-exec",
  "yaa-msg",
- "yaa-shell",
  "yaa-store",
+]
+
+[[package]]
+name = "yaa-exec"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "ulid",
 ]
 
 [[package]]
@@ -1946,17 +1957,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
- "ulid",
-]
-
-[[package]]
-name = "yaa-shell"
-version = "0.1.0"
-dependencies = [
- "libc",
- "tempfile",
- "thiserror",
- "tokio",
  "ulid",
 ]
 

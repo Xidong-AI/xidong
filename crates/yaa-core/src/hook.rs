@@ -4,7 +4,7 @@
 //! 独立 1 MiB 硬上限：超限立即终止进程并报错，绝不静默截断（提示词钩子的输出即
 //! 完整提示词，静默裁掉会破坏语义）。
 //!
-//! 不依赖 `yaa-shell`：Shell 工具的流式截断策略与钩子的「超限即错」策略不同。
+//! 不依赖 `yaa-exec`：Shell 工具的流式截断策略与钩子的「超限即错」策略不同。
 
 use std::collections::BTreeMap;
 use std::path::Path;

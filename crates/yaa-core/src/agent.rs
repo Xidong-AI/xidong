@@ -383,14 +383,14 @@ impl Runner<'_> {
             return self.finish_tool_call(call, -1, false, false, message);
         };
 
-        let shell_cmd = yaa_shell::ShellCommand {
+        let shell_cmd = yaa_exec::ShellCommand {
             call_id: call.id.clone(),
             command: command.to_string(),
         };
         let limits = self.config.shell.to_limits();
         let output_dir = session::outputs_dir(&self.session);
 
-        match yaa_shell::run(&shell_cmd, &limits, &output_dir).await {
+        match yaa_exec::run(&shell_cmd, &limits, &output_dir).await {
             Ok(output) => {
                 self.sink.emit(Event::ToolFinished {
                     call_id: output.call_id.clone(),
@@ -535,7 +535,7 @@ fn persisted_arguments(arguments: &str) -> String {
 }
 
 /// 把 Shell 输出转成 `tool_result` 记录，`output_files` 相对数据根。
-fn shell_output_to_record(output: &yaa_shell::ShellOutput, data_root: &Path) -> Record {
+fn shell_output_to_record(output: &yaa_exec::ShellOutput, data_root: &Path) -> Record {
     let output_files = if output.stdout_file.is_some() || output.stderr_file.is_some() {
         let stdout = output
             .stdout_file
@@ -563,7 +563,7 @@ fn shell_output_to_record(output: &yaa_shell::ShellOutput, data_root: &Path) -> 
 
 /// 把绝对路径相对化到数据根；不在数据根下时退化为绝对路径字符串。
 ///
-/// `yaa_shell` 返回的是 `canonicalize` 后的路径，而 `data_root` 可能是未规范化的
+/// `yaa_exec` 返回的是 `canonicalize` 后的路径，而 `data_root` 可能是未规范化的
 /// 符号链接目录，因此先按原值匹配，再退回规范化后的数据根（`canonicalize` 失败则
 /// 忽略）。两者都不匹配时（如 `--session` 指向数据根之外）保留绝对路径，绝不返回
 /// `None`——否则 `truncated` 为真时模型会被误导去一个不存在的相对文件找完整输出。
@@ -1192,7 +1192,7 @@ mod tests {
         std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
         std::fs::write(&outside, "完整内容").unwrap();
 
-        let output = yaa_shell::ShellOutput {
+        let output = yaa_exec::ShellOutput {
             call_id: "c1".to_string(),
             stdout: "head ... [truncated] ... tail".to_string(),
             stderr: String::new(),
@@ -1224,7 +1224,7 @@ mod tests {
         std::fs::create_dir_all(inside.parent().unwrap()).unwrap();
         std::fs::write(&inside, "完整内容").unwrap();
 
-        let output = yaa_shell::ShellOutput {
+        let output = yaa_exec::ShellOutput {
             call_id: "c1".to_string(),
             stdout: "head ... [truncated] ... tail".to_string(),
             stderr: String::new(),
