@@ -135,7 +135,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// 按 shell 分隔符朴素拆段，识别引号以免在引号内误切。
 ///
-/// 引号不配平时返回 `None`（交调用方按 ask 处理）。单个 `&` 不是分隔符。
+/// 引号不配平时返回 `None`（交调用方按 ask 处理）。`&` 与 `;`/`&&`/`|` 同级作为
+/// 分隔符（后台执行 `cmd &` 会把前后命令拆开），但重定向里的 `&` 不是分隔符：
+/// `2>&1`、`1>&2`、`>&` 的 `&` 前是 `>`，`&>file` 的 `&` 后是 `>`，两者均原样保留。
 fn split_segments(command: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -184,10 +186,15 @@ fn split_segments(command: &str) -> Option<Vec<String>> {
             }
             '&' => {
                 if chars.peek() == Some(&'&') {
+                    // `&&` 拆两次等价于拆一次。
                     chars.next();
                     push_segment(&mut segments, &mut current);
-                } else {
+                } else if chars.peek() == Some(&'>') || current.ends_with('>') {
+                    // 重定向：`&>file`（后随 `>`）与 `2>&1`/`1>&2`/`>&`（前为 `>`）。
                     current.push(c);
+                } else {
+                    // 单个 `&`：后台执行，与 `;` 同级拆段。
+                    push_segment(&mut segments, &mut current);
                 }
             }
             _ => current.push(c),
@@ -381,5 +388,46 @@ mod tests {
         assert_eq!(action_of(&rules, ""), Action::Allow);
         assert_eq!(action_of(&rules, "   \n  "), Action::Allow);
         assert_eq!(action_of(&rules, ";;"), Action::Allow);
+    }
+
+    #[test]
+    fn single_ampersand_splits_and_deny_is_not_bypassed() {
+        // P1：`&` 与 `;`/`&&` 同级；不拆会让 `rm *` 的 deny 被整段前缀绕过。
+        let rules = [rule("rm *", Action::Deny)];
+        assert_eq!(action_of(&rules, "true & rm -rf victim"), Action::Deny);
+    }
+
+    #[test]
+    fn single_ampersand_produces_second_segment() {
+        // 若单个 `&` 不拆，整段 `sleep 1 & echo done` 不会命中精确规则 `echo done`。
+        let rules = [rule("echo done", Action::Deny)];
+        assert_eq!(action_of(&rules, "sleep 1 & echo done"), Action::Deny);
+    }
+
+    #[test]
+    fn trailing_single_ampersand_is_a_separator() {
+        let rules = [rule("echo done", Action::Deny)];
+        assert_eq!(action_of(&rules, "sleep 1&echo done"), Action::Deny);
+    }
+
+    #[test]
+    fn redirect_ampersands_are_not_separators() {
+        // P1 约束：`2>&1`/`1>&2`/`&>` 里的 `&` 不得拆段，否则会产生 `1`、`2`、`> out` 等伪段。
+        assert_eq!(
+            action_of(&[rule("1", Action::Deny)], "echo hi 2>&1"),
+            Action::Allow
+        );
+        assert_eq!(
+            action_of(&[rule("2", Action::Deny)], "echo hi 1>&2"),
+            Action::Allow
+        );
+        assert_eq!(
+            action_of(&[rule("> *", Action::Deny)], "echo hi &> out"),
+            Action::Allow
+        );
+        // 与无重定向版本同裁决（不产生额外段）。
+        let rules = [rule("echo *", Action::Ask)];
+        assert_eq!(action_of(&rules, "echo hi 2>&1"), Action::Ask);
+        assert_eq!(action_of(&rules, "echo hi"), Action::Ask);
     }
 }
