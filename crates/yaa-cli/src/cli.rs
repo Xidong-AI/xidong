@@ -56,11 +56,11 @@ pub struct Cli {
     pub notify_timeout: Option<u64>,
 
     /// 放行最旧一条待批命令并继续 agent loop。
-    #[arg(long, conflicts_with_all = ["notify", "clear", "status", "prompt"])]
+    #[arg(long, conflicts_with_all = ["notify", "clear", "status", "prompt", "get_prompt"])]
     pub approve: bool,
 
     /// 自动放行命中 `ask` 的命令（显式 `deny` 仍强制）。
-    #[arg(long, conflicts_with = "notify")]
+    #[arg(long, conflicts_with_all = ["notify", "get_prompt"])]
     pub auto: bool,
 
     /// 把钩子、工具等事件打到 stderr。
@@ -143,5 +143,21 @@ mod tests {
 
         let err = Cli::try_parse_from(["yaa", "--approve", "某提示"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn approve_and_auto_reject_get_prompt_combination() {
+        // D4：与 `--clear`/`--status`/位置参数一致，`--get-prompt` 也不得被静默忽略。
+        for args in [
+            ["yaa", "--approve", "--get-prompt", "system"],
+            ["yaa", "--auto", "--get-prompt", "system"],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "应为参数冲突（{args:?}）"
+            );
+        }
     }
 }
