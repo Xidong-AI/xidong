@@ -207,34 +207,38 @@ impl Runner<'_> {
         };
         let model = make_model(llm_config);
 
-        // 3. 执行该 pending 的命令，追加 `tool_result`，再追加 `approval_resolved: approve`。
-        //    先执行后落 resolved 的顺序与 `design.md` 一致（结果先于决策可见）。
-        let limits = self.config.shell.to_limits();
-        let outputs_dir = session::outputs_dir(&self.session);
-        let extra_env = [("YAA_SESSION".to_string(), session_path(&self.session))];
-        let parsed = tools::shell::ParsedCall {
-            command: pending.command.clone(),
-            description: None,
-            error: None,
-        };
-        let result = self
-            .execute_call(
-                tools::shell::NAME,
-                &pending.call_id,
-                &parsed,
-                &limits,
-                &outputs_dir,
-                &extra_env,
-            )
-            .await;
-        yaa_store::append(&self.session, &[result])?;
-        yaa_store::append(
-            &self.session,
-            &[Record::approval_resolved(
-                &pending.call_id,
-                ApprovalDecision::Approve,
-            )],
-        )?;
+        let resolved = Record::approval_resolved(&pending.call_id, ApprovalDecision::Approve);
+        // 3. 若该 `call_id` 已有 `tool_result`（上次已执行、但在写 resolved 前中断），
+        //    只补 `approval_resolved: approve`，绝不重复执行、不新增结果。
+        let already_executed = records.iter().any(
+            |record| matches!(record, Record::ToolResult(result) if result.call_id == pending.call_id),
+        );
+        if already_executed {
+            yaa_store::append(&self.session, &[resolved])?;
+        } else {
+            // 4. 执行该 pending 的命令，追加 `tool_result`，再追加 `approval_resolved: approve`。
+            //    先执行后落 resolved 的顺序与 `design.md` 一致（结果先于决策可见）。
+            let limits = self.config.shell.to_limits();
+            let outputs_dir = session::outputs_dir(&self.session);
+            let extra_env = [("YAA_SESSION".to_string(), session_path(&self.session))];
+            let parsed = tools::shell::ParsedCall {
+                command: pending.command.clone(),
+                description: None,
+                error: None,
+            };
+            let result = self
+                .execute_call(
+                    tools::shell::NAME,
+                    &pending.call_id,
+                    &parsed,
+                    &limits,
+                    &outputs_dir,
+                    &extra_env,
+                )
+                .await;
+            yaa_store::append(&self.session, &[result])?;
+            yaa_store::append(&self.session, &[resolved])?;
+        }
 
         // 4. 水位取 pending 记录下标：让它与本次的 result/resolved 恰好展示一次。
         self.run_loop(&model, pending_index).await
@@ -1723,6 +1727,65 @@ mod tests {
                 .filter(|item| matches!(item, DisplayItem::ApprovalResolved { approved: true, .. }))
                 .count(),
             1
+        );
+    }
+
+    /// R3：该 `call_id` 已有 `tool_result`（上次执行后、写 resolved 前中断）时，
+    /// 放行只补 `approval_resolved: approve`，绝不重复执行命令。
+    #[tokio::test]
+    async fn approve_skips_execution_when_result_already_exists() {
+        let harness = Harness::new(approval_config("echo *", Action::Ask));
+        let sink = NullSink;
+
+        let first = FakeModel::new(vec![call_response("call_1", r#"{"command":"echo hi"}"#)]);
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| first.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Pending);
+
+        // 模拟「执行了命令、写了结果，但在写 resolved 前进程被杀」。
+        yaa_store::append(
+            &harness.session,
+            &[Record::tool_result(
+                "call_1",
+                "已有结果\n",
+                "",
+                0,
+                false,
+                false,
+                None,
+            )],
+        )
+        .unwrap();
+
+        let model = FakeModel::new(vec![text_response("完成")]);
+        let exit = harness
+            .runner(&sink)
+            .approve_pending(|_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success);
+
+        let records = harness.records();
+        let results: Vec<&Record> = records
+            .iter()
+            .filter(|r| matches!(r, Record::ToolResult(result) if result.call_id == "call_1"))
+            .collect();
+        assert_eq!(results.len(), 1, "不得重复执行新增 tool_result");
+        let Record::ToolResult(result) = results[0] else {
+            unreachable!();
+        };
+        assert_eq!(result.stdout, "已有结果\n", "应保留既有结果");
+        assert!(
+            records.iter().any(|r| matches!(
+                r,
+                Record::ApprovalResolved(resolved)
+                    if resolved.call_id == "call_1"
+                        && resolved.decision == ApprovalDecision::Approve
+            )),
+            "应补 approval_resolved: approve：{records:?}"
         );
     }
 }
