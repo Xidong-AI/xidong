@@ -56,7 +56,7 @@ pub struct Cli {
     pub notify_timeout: Option<u64>,
 
     /// 放行最旧一条待批命令并继续 agent loop。
-    #[arg(long, conflicts_with_all = ["notify", "clear", "status"])]
+    #[arg(long, conflicts_with_all = ["notify", "clear", "status", "prompt"])]
     pub approve: bool,
 
     /// 自动放行命中 `ask` 的命令（显式 `deny` 仍强制）。
@@ -133,5 +133,15 @@ mod tests {
         // `--approve` 与 `--auto` 可同时给出（先放行最旧，后续 ask 自动放行）。
         let both = Cli::parse_from(["yaa", "--approve", "--auto"]);
         assert!(both.approve && both.auto);
+    }
+
+    #[test]
+    fn approve_rejects_positional_prompt() {
+        // C2：`--approve` 不接受位置参数提示词；无参数时必须仍然可用。
+        assert!(Cli::try_parse_from(["yaa", "--approve"]).is_ok());
+        assert!(Cli::try_parse_from(["yaa", "--approve", "--auto"]).is_ok());
+
+        let err = Cli::try_parse_from(["yaa", "--approve", "某提示"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }
