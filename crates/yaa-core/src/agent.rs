@@ -87,8 +87,9 @@ pub trait Model: Send + Sync {
 pub struct OpenAiModel {
     /// 供应配置。
     pub cfg: LlmConfig,
-    /// 单次请求硬超时；由 `[agent] request_timeout_secs` 构造。
-    pub timeout: std::time::Duration,
+    /// 复用的 HTTP 客户端；超时由 `[agent] request_timeout_secs` 经
+    /// [`llm::build_client`] 构造。跨步复用以保留连接池与 keep-alive。
+    pub client: reqwest::Client,
 }
 
 impl Model for OpenAiModel {
@@ -98,7 +99,7 @@ impl Model for OpenAiModel {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<ChatResponse>> + Send + 'a>> {
         Box::pin(async move {
             let tools = tools::shell::tools();
-            llm::chat(&self.cfg, messages, &tools, self.timeout).await
+            llm::chat(&self.client, &self.cfg, messages, &tools).await
         })
     }
 

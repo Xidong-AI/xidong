@@ -449,18 +449,19 @@ async fn run_agent(
         .map_err(anyhow::Error::from)?
         .len();
     let request_timeout = std::time::Duration::from_secs(config.agent.request_timeout_secs);
+    // 客户端构造一次、经 clone 共享连接池（`Client` 内部为 Arc，克隆廉价）。
+    let client = yaa_core::llm::build_client(request_timeout)?;
     let exit = if cli.approve {
+        let client = client.clone();
         runner
-            .approve_pending(|cfg| yaa_core::agent::OpenAiModel {
-                cfg,
-                timeout: request_timeout,
-            })
+            .approve_pending(move |cfg| yaa_core::agent::OpenAiModel { cfg, client })
             .await?
     } else {
+        let client = client.clone();
         runner
-            .run(&prompt, |cfg| yaa_core::agent::OpenAiModel {
+            .run(&prompt, move |cfg| yaa_core::agent::OpenAiModel {
                 cfg,
-                timeout: request_timeout,
+                client,
             })
             .await?
     };

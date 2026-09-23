@@ -202,25 +202,32 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse> {
     })
 }
 
+/// 构造带硬超时的 HTTP 客户端；超时覆盖连接与响应体读取。
+///
+/// 由调用方**构造一次并复用**（`reqwest::Client` 内部共享连接池，克隆廉价），
+/// 避免每步模型请求都新建客户端、丢失 keep-alive 与连接池。
+pub fn build_client(timeout: Duration) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("构造 HTTP 客户端失败")
+}
+
 /// 调用模型，返回解析后的回复。
 ///
 /// 对 HTTP 429/5xx 与网络错误最多重试到 3 次总尝试，指数退避 200ms、600ms；
 /// 其他 HTTP 状态立即失败，错误信息含状态码与有界响应片段，绝不含 `api_key`。
 ///
-/// `timeout` 覆盖连接与响应体读取；请求超时**不重试**，立即返回错误，避免把
-/// 「端点无响应」拖成多轮退避。
+/// 请求超时由传入的 `client` 承担（见 [`build_client`]）；超时**不重试**，立即返回
+/// 错误，避免把「端点无响应」拖成多轮退避。
 pub async fn chat(
+    client: &reqwest::Client,
     cfg: &LlmConfig,
     messages: &[ChatMessage],
     tools: &serde_json::Value,
-    timeout: Duration,
 ) -> Result<ChatResponse> {
     let url = endpoint(&cfg.base_url);
     let body = build_request(cfg, messages, tools);
-    let client = reqwest::Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("构造 HTTP 客户端失败")?;
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 0..MAX_ATTEMPTS {
@@ -710,12 +717,13 @@ model = "m"
 
         let mut cfg = sample();
         cfg.base_url = format!("http://{addr}");
+        let client = build_client(Duration::from_millis(200)).unwrap();
         let start = std::time::Instant::now();
         let result = chat(
+            &client,
             &cfg,
             &[ChatMessage::user("hi")],
             &serde_json::json!([]),
-            Duration::from_millis(200),
         )
         .await;
         let elapsed = start.elapsed();
