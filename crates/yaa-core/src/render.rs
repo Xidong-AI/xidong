@@ -10,11 +10,13 @@
 //!   记录的 `command`/`description` 重建为规范 JSON。
 //! - 配对 `tool_result` → `tool` 消息（`tool_call_id` 关联）：**全日志一次建表**
 //!   （`call_id` → 首个结果），不要求结果紧邻 `tool_call`；顺序跟随 `tool_calls`。
-//! - 失配（中断）的 `ai` 工具调用合成一条中断 `tool` 消息，保证请求体合法。
+//! - 失配的 `ai` 工具调用合成一条 `tool` 消息，保证请求体合法：若该 `call_id` 有
+//!   `approval_pending` 且无 `approval_resolved` 且无 `tool_result`，合成「待批准、尚未
+//!   执行」占位；否则合成中断标记。
 //! - `tool_call(origin=user)` → `user` 消息，**绝不**渲染为 `tool`。
 //! - `system(source=init)`、空 `system`、空 `ai`、游离调用与未被消费的结果不投影。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use yaa_msg::{Record, ToolOrigin};
 
@@ -25,6 +27,9 @@ use crate::tools::shell;
 /// 失配工具调用的中断标记。
 const INTERRUPTED_MARKER: &str = "[interrupted] 工具结果缺失：该步骤在运行中被中断，无可用输出。";
 
+/// 未决待批工具调用的占位标记：等待批准，尚未执行。
+const PENDING_MARKER: &str = "[pending] 该工具调用等待批准，尚未执行。";
+
 /// 把历史记录渲染为 OpenAI 兼容的聊天消息序列。
 pub fn render(records: &[Record]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
@@ -32,9 +37,22 @@ pub fn render(records: &[Record]) -> Vec<ChatMessage> {
     // 全日志一次建表：`call_id` → 首个 `tool_result`。配对不要求紧邻，因此结果与
     // `tool_call` 之间夹着 `system(notify)`（外部通知）或后续记录时仍能正确配对。
     let mut results: HashMap<&str, &yaa_msg::ToolResult> = HashMap::new();
+    // 审批配对：有 `approval_pending` 且无 `approval_resolved` 且无 `tool_result` 的
+    // `call_id` 为未决待批，渲染为待批占位而非中断（D43）。
+    let mut pending_ids: HashSet<&str> = HashSet::new();
+    let mut resolved_ids: HashSet<&str> = HashSet::new();
     for record in records {
-        if let Record::ToolResult(result) = record {
-            results.entry(result.call_id.as_str()).or_insert(result);
+        match record {
+            Record::ToolResult(result) => {
+                results.entry(result.call_id.as_str()).or_insert(result);
+            }
+            Record::ApprovalPending(approval) => {
+                pending_ids.insert(approval.call_id.as_str());
+            }
+            Record::ApprovalResolved(approval) => {
+                resolved_ids.insert(approval.call_id.as_str());
+            }
+            _ => {}
         }
     }
 
@@ -90,7 +108,15 @@ pub fn render(records: &[Record]) -> Vec<ChatMessage> {
 
         match &records[index] {
             Record::Ai(ai) => {
-                index = push_ai_step(records, index, ai, &results, &mut messages);
+                index = push_ai_step(
+                    records,
+                    index,
+                    ai,
+                    &results,
+                    &pending_ids,
+                    &resolved_ids,
+                    &mut messages,
+                );
             }
             Record::ToolCall(call) if call.origin == ToolOrigin::User => {
                 messages.push(ChatMessage::user(call.command.clone()));
@@ -142,11 +168,14 @@ fn project_system(system: &yaa_msg::System) -> String {
 /// `results` 是全日志建好的 `call_id` → `tool_result` 表，因此配对不要求紧邻：
 /// 结果可以夹着 `system(notify)` 或出现在更后面。结果消息的发出顺序严格跟随
 /// `tool_calls` 顺序。
+#[allow(clippy::too_many_arguments)] // 传引用表以避免在循环内重复建表
 fn push_ai_step(
     records: &[Record],
     ai_index: usize,
     ai: &yaa_msg::Ai,
     results: &HashMap<&str, &yaa_msg::ToolResult>,
+    pending_ids: &HashSet<&str>,
+    resolved_ids: &HashSet<&str>,
     messages: &mut Vec<ChatMessage>,
 ) -> usize {
     let mut calls: Vec<&yaa_msg::ToolCall> = Vec::new();
@@ -180,16 +209,16 @@ fn push_ai_step(
     ));
 
     for call in &calls {
-        match results.get(call.call_id.as_str()) {
-            Some(result) => messages.push(ChatMessage::tool_result(
-                call.call_id.clone(),
-                tool_content(result),
-            )),
-            None => messages.push(ChatMessage::tool_result(
-                call.call_id.clone(),
-                INTERRUPTED_MARKER,
-            )),
-        }
+        let call_id = call.call_id.as_str();
+        let content = match results.get(call_id) {
+            Some(result) => tool_content(result),
+            // 未决待批（有 pending、无 resolved、无 result）表达「等待批准，尚未执行」。
+            None if pending_ids.contains(call_id) && !resolved_ids.contains(call_id) => {
+                PENDING_MARKER.to_string()
+            }
+            None => INTERRUPTED_MARKER.to_string(),
+        };
+        messages.push(ChatMessage::tool_result(call.call_id.clone(), content));
     }
     next
 }
@@ -582,6 +611,66 @@ mod tests {
             Some("OUT"),
             "审批记录不得改变 assistant/tool 配对"
         );
+    }
+
+    #[test]
+    fn pending_without_result_renders_pending_not_interrupted() {
+        // P3：未决 pending 应表达「待批准、尚未执行」，不得伪装成运行中断。
+        let records = vec![
+            Record::user("你好"),
+            Record::ai("m", "h", "", None),
+            Record::tool_call(ToolOrigin::Ai, "c1", "rm -rf /", None),
+            Record::approval_pending("c1", "rm -rf /", "rm *"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["user", "assistant", "tool"]);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+        let content = messages[2].content.as_deref().unwrap();
+        assert!(content.contains("pending"), "应为待批标记：{content}");
+        assert!(content.contains("等待批准"), "应说明尚未执行：{content}");
+        assert!(
+            !content.contains("interrupted"),
+            "未决 pending 不得使用中断标记：{content}"
+        );
+    }
+
+    #[test]
+    fn resolved_pending_without_result_is_interrupted() {
+        // 已有 approval_resolved 却仍无 tool_result（如结果缺失）→ 不再算待批。
+        let records = vec![
+            Record::user("你好"),
+            Record::ai("m", "h", "", None),
+            Record::tool_call(ToolOrigin::Ai, "c1", "rm -rf /", None),
+            Record::approval_pending("c1", "rm -rf /", "rm *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Deny),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["user", "assistant", "tool"]);
+        assert!(
+            messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("interrupted"),
+            "已决议但缺结果的调用仍是中断：{:?}",
+            messages[2].content
+        );
+    }
+
+    #[test]
+    fn pending_with_tool_result_renders_real_output() {
+        // 有 pending 但结果已到（如 --approve 后执行完毕）→ 仍以真实输出渲染。
+        let records = vec![
+            Record::user("你好"),
+            Record::ai("m", "h", "", None),
+            Record::tool_call(ToolOrigin::Ai, "c1", "echo", None),
+            Record::approval_pending("c1", "echo", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Approve),
+            result("c1", "REAL"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["user", "assistant", "tool"]);
+        assert_eq!(messages[2].content.as_deref(), Some("REAL"));
     }
 
     #[test]
