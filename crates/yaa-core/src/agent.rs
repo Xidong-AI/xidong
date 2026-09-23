@@ -483,12 +483,22 @@ impl Runner<'_> {
     }
 
     /// 启动普通 run 时把未决 pending 作废：补 `approval_resolved: deny` 与失败结果（D45）。
+    ///
+    /// 若该 `call_id` 已有 `tool_result`（执行后、写 `resolved` 前被强杀的中断态），
+    /// 则只补 `approval_resolved: deny`，不再追加失败结果——否则日志出现两条结果，
+    /// 且渲染取首条成功结果会与「已拒绝」语义矛盾（与 `--approve` 的判定对称）。
     async fn abandon_old_pending(&self, watermark: &mut usize) -> anyhow::Result<()> {
         let records = yaa_store::load(&self.session)?;
         for (_, pending) in unresolved_pending(&records) {
-            let batch = [
-                Record::approval_resolved(&pending.call_id, ApprovalDecision::Deny),
-                Record::tool_result(
+            let already_executed = records.iter().any(
+                |record| matches!(record, Record::ToolResult(result) if result.call_id == pending.call_id),
+            );
+            let mut batch = vec![Record::approval_resolved(
+                &pending.call_id,
+                ApprovalDecision::Deny,
+            )];
+            if !already_executed {
+                batch.push(Record::tool_result(
                     &pending.call_id,
                     "",
                     ABANDONED_RESULT,
@@ -496,8 +506,8 @@ impl Runner<'_> {
                     false,
                     false,
                     None,
-                ),
-            ];
+                ));
+            }
             self.append_and_emit(&batch, watermark).await?;
         }
         Ok(())
@@ -1672,6 +1682,53 @@ mod tests {
         };
         assert_eq!(result.code, -1);
         assert!(result.stderr.contains("作废"), "作废说明：{result:?}");
+    }
+
+    /// D1：中断态（已有 `tool_result` 却缺 `approval_resolved`）下，普通 run 作废旧待批
+    /// 只补 `approval_resolved: deny`，不得再追加失败结果（与 `--approve` 判定对称）。
+    #[tokio::test]
+    async fn abandon_skips_extra_result_when_already_executed() {
+        let harness = Harness::new(approval_config("echo *", Action::Ask));
+        let sink = NullSink;
+
+        // 构造中断态：tool_call + pending + 已执行结果，缺 resolved。
+        yaa_store::append(
+            &harness.session,
+            &[
+                Record::tool_call(ToolOrigin::Ai, "call_1", "echo hi", None),
+                Record::approval_pending("call_1", "echo hi", "echo *"),
+                Record::tool_result("call_1", "REAL-OUTPUT\n", "", 0, false, false, None),
+            ],
+        )
+        .unwrap();
+
+        let model = FakeModel::new(vec![text_response("新答")]);
+        let exit = harness
+            .runner(&sink)
+            .run("新提示词", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success);
+
+        let records = harness.records();
+        let results: Vec<&Record> = records
+            .iter()
+            .filter(|record| matches!(record, Record::ToolResult(_)))
+            .collect();
+        assert_eq!(results.len(), 1, "不得重复追加失败结果：{records:?}");
+        let Record::ToolResult(result) = results[0] else {
+            unreachable!("过滤已限定为 tool_result")
+        };
+        assert_eq!(result.stdout, "REAL-OUTPUT\n", "既有成功结果应保留");
+
+        let resolved = records
+            .iter()
+            .find_map(|record| match record {
+                Record::ApprovalResolved(resolved) => Some(resolved),
+                _ => None,
+            })
+            .expect("应补 approval_resolved");
+        assert_eq!(resolved.decision, ApprovalDecision::Deny);
     }
 
     #[tokio::test]
