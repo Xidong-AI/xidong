@@ -114,9 +114,12 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     let config_root = yaa_core::paths::config_root(&env, &home);
     let data_root = yaa_core::paths::data_root(&env, &home);
 
-    // `--notify` 是短路写入路径：不加载配置、不进入 agent loop、不触发 init。
+    // `--notify` 是短路写入路径：不进入 agent loop、不触发 init；仅按需读取 `[shell]`
+    // 限额（读取失败只告警，绝不让 notify 失败）。
     if cli.notify.is_some() {
-        return notify(&cli, &env, &data_root).await.map_err(CliError::from);
+        return notify(&cli, &env, &home, &data_root)
+            .await
+            .map_err(CliError::from);
     }
 
     if cli.clear {
@@ -133,9 +136,13 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
 ///
 /// 目标解析顺序：`--session` → 环境变量 `YAA_SESSION`（非空才算） → 当前 cwd
 /// 默认会话（见 `docs/plan.md` D25 与规则 8）。
+///
+/// `--` 形态复用 `yaa-exec`：截断超长输出、完整输出落盘、退出码沿用、stderr 透传，
+/// 并把 `shell_quote` 转义后的命令记入 `command`（可重放）。
 async fn notify(
     cli: &Cli,
     env: &impl Fn(&str) -> Option<String>,
+    home: &Path,
     data_root: &Path,
 ) -> anyhow::Result<i32> {
     let session = notify_session(cli, env, data_root)?;
@@ -145,22 +152,156 @@ async fn notify(
         _ => "由用户执行",
     };
 
-    // 有命令则在 `--` 后直接执行；否则从 stdin 读到 EOF。
-    let (body, command, exit) = if cli.command.is_empty() {
-        (read_stdin().await?, None, 0)
-    } else {
-        let output = run_notify_command(&cli.command)?;
-        // stderr 已透传到本进程 stderr；这里只取 stdout 作正文。
-        let body = String::from_utf8_lossy(&output.stdout).into_owned();
-        // 信号致死时 `code()` 为 `None`，按通用错误码 1 处理。
-        let exit = output.status.code().unwrap_or(1);
-        (body, Some(cli.command.join(" ")), exit)
-    };
+    let limits = notify_limits(cli, env, home);
 
-    // 去掉正文结尾换行，使信封内不留多余空行（design.md 的示例形态）。
-    let content = format!("<{comment}>\n{}\n</{comment}>", body.trim_end_matches('\n'));
-    yaa_store::append(&session, &[Record::system("notify", content, command)])?;
+    if cli.command.is_empty() {
+        // stdin 形态：读取时施加上限，超出即视为截断（无完整输出文件）。
+        let (mut body, truncated) = read_stdin_limited(limits.max_stream_chars).await?;
+        if truncated {
+            if !body.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push_str(&format!(
+                "[truncated] 输入超过上限 {} 字符，仅保留前部分。",
+                limits.max_stream_chars
+            ));
+        }
+        let content = envelope(comment, &body);
+        yaa_store::append(&session, &[Record::system("notify", content, None, None)])?;
+        return Ok(0);
+    }
+
+    // `--` 形态：与 `shell` 工具同一条执行路径。
+    let command = shell_quote(&cli.command);
+    let outputs_dir = yaa_core::session::outputs_dir(&session);
+    let output = yaa_exec::run(
+        &yaa_exec::ShellCommand {
+            call_id: String::new(),
+            command: command.clone(),
+            env: Vec::new(),
+        },
+        &limits,
+        &outputs_dir,
+    )
+    .await?;
+
+    // stderr 原样透传到 yaa 的 stderr，保持「透传」语义。
+    if !output.stderr.is_empty() {
+        eprint!("{}", output.stderr);
+    }
+    // 被信号杀死（`code < 0`）按通用错误码 1；真正超时额外提示。
+    let exit = if output.code < 0 { 1 } else { output.code };
+    if output.timed_out {
+        eprintln!("--notify 命令超时，已终止。");
+    }
+
+    let output_files = notify_output_files(&output, data_root);
+    let content = envelope(comment, &output.stdout);
+    yaa_store::append(
+        &session,
+        &[Record::system(
+            "notify",
+            content,
+            Some(command),
+            output_files,
+        )],
+    )?;
     Ok(exit)
+}
+
+/// 把正文包进 `<注释>…</注释>` 信封，去掉结尾换行（design.md 的示例形态）。
+fn envelope(comment: &str, body: &str) -> String {
+    format!("<{comment}>\n{}\n</{comment}>", body.trim_end_matches('\n'))
+}
+
+/// 解析 `--notify` 的限额，优先级从高到低：`--notify-timeout`（仅超时）→ 环境变量
+/// `YAA_NOTIFY_*`（能解析为数字才生效）→ 配置文件 `[shell]` → 内置默认。
+///
+/// 配置读取或解析失败时只打警告到 stderr 并退回默认值——`--notify` 不得因此失败。
+fn notify_limits(
+    cli: &Cli,
+    env: &impl Fn(&str) -> Option<String>,
+    home: &Path,
+) -> yaa_exec::ShellLimits {
+    let mut shell = yaa_core::config::ShellConfig::default();
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| yaa_core::paths::config_file(env, home));
+    match yaa_core::config::Config::load(&config_path) {
+        Ok(config) => shell = config.shell,
+        Err(err) => eprintln!("警告：读取配置失败，--notify 使用默认限额：{err:#}"),
+    }
+
+    if let Some(value) = parse_env(env, "YAA_NOTIFY_TIMEOUT_SECS") {
+        shell.timeout_secs = value;
+    }
+    if let Some(value) = parse_env(env, "YAA_NOTIFY_MAX_STREAM_CHARS") {
+        shell.max_stream_chars = value;
+    }
+    if let Some(value) = parse_env(env, "YAA_NOTIFY_HEAD_CHARS") {
+        shell.head_chars = value;
+    }
+    if let Some(value) = parse_env(env, "YAA_NOTIFY_TAIL_CHARS") {
+        shell.tail_chars = value;
+    }
+    if let Some(value) = cli.notify_timeout {
+        shell.timeout_secs = value;
+    }
+
+    shell.to_limits()
+}
+
+/// 读取环境变量并解析为 `T`；缺失或无法解析都返回 `None`（静默不生效）。
+fn parse_env<T: std::str::FromStr>(env: &impl Fn(&str) -> Option<String>, key: &str) -> Option<T> {
+    env(key).and_then(|value| value.trim().parse::<T>().ok())
+}
+
+/// 由 `yaa-exec` 的完整输出路径构造 `output_files`，相对数据根；无文件则 `None`。
+fn notify_output_files(
+    output: &yaa_exec::ShellOutput,
+    data_root: &Path,
+) -> Option<yaa_msg::OutputFiles> {
+    if output.stdout_file.is_none() && output.stderr_file.is_none() {
+        return None;
+    }
+    let stdout = output
+        .stdout_file
+        .as_deref()
+        .map(|path| yaa_core::tools::shell::relativize(path, data_root));
+    let stderr = output
+        .stderr_file
+        .as_deref()
+        .map(|path| yaa_core::tools::shell::relativize(path, data_root));
+    Some(yaa_msg::OutputFiles { stdout, stderr })
+}
+
+/// 把 argv 逐个 POSIX 单引号转义后以空格连接成一条命令字符串。
+///
+/// 简单 token（仅含安全字符）不加引号；含空格、单引号或其他特殊字符时用单引号包裹，
+/// 内部单引号按 `'\''` 转义。结果可交给 `sh -c` 重放。
+fn shell_quote(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| quote_token(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 单个 token 的转义。
+fn quote_token(token: &str) -> String {
+    if is_simple_token(token) {
+        token.to_string()
+    } else {
+        format!("'{}'", token.replace('\'', "'\\''"))
+    }
+}
+
+/// token 是否只含无需转义的安全字符。
+fn is_simple_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,^".contains(c))
 }
 
 /// 解析 `--notify` 的目标会话；显式路径按当前 cwd 补全为绝对路径。
@@ -182,19 +323,6 @@ fn notify_session(
 /// 词法绝对化；相对路径相对当前工作目录补全。
 fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(std::path::absolute(path)?)
-}
-
-/// 直接执行 `--notify` 命令：不经 `sh -c`，stdin 置空，stdout 捕获，stderr 透传。
-fn run_notify_command(args: &[String]) -> anyhow::Result<std::process::Output> {
-    let (program, rest) = args
-        .split_first()
-        .ok_or_else(|| anyhow!("--notify 的命令为空"))?;
-    let output = std::process::Command::new(program)
-        .args(rest)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .output()?;
-    Ok(output)
 }
 
 /// 归档当前会话，打印目标路径。
@@ -351,6 +479,21 @@ async fn read_stdin() -> anyhow::Result<String> {
     Ok(buffer)
 }
 
+/// 读取 stdin 至多 `max_bytes + 1` 字节；超出即为截断，正文截到 `max_bytes`。
+///
+/// 返回正文与「是否截断」标记。按字节计数与 `--notify` 的「读取字节数」语义一致；
+/// 截断可能落在多字节字符中间，故用 lossy 解码。
+async fn read_stdin_limited(max_bytes: usize) -> anyhow::Result<(String, bool)> {
+    let mut handle = tokio::io::stdin().take(max_bytes as u64 + 1);
+    let mut bytes = Vec::new();
+    handle.read_to_end(&mut bytes).await?;
+    let truncated = bytes.len() > max_bytes;
+    if truncated {
+        bytes.truncate(max_bytes);
+    }
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
 /// 用户主目录，仅作为未设置 `YAA_*`/`XDG_*` 时的路径回退。
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
@@ -408,4 +551,58 @@ fn snippet(text: &str, max_chars: usize) -> String {
         out.push('…');
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_leaves_simple_tokens_unquoted() {
+        assert_eq!(shell_quote(&["echo".into(), "hi".into()]), "echo hi");
+        assert_eq!(
+            shell_quote(&["seq".into(), "1".into(), "200".into()]),
+            "seq 1 200"
+        );
+    }
+
+    #[test]
+    fn shell_quote_wraps_and_escapes_special_tokens() {
+        let quoted = shell_quote(&["echo".into(), "a b".into(), "it's".into()]);
+        assert_eq!(quoted, "echo 'a b' 'it'\\''s'");
+    }
+
+    #[test]
+    fn shell_quote_round_trips_through_sh() {
+        // 重放等价性：转义后交给 `sh -c` 应还原原 argv。
+        let args = vec![
+            "printf".to_string(),
+            "%s|".to_string(),
+            "a b'c \"d\" $e".to_string(),
+        ];
+        let command = shell_quote(&args);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("{command} z"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "a b'c \"d\" $e|z|",
+            "转义后的命令应能重放原 argv"
+        );
+    }
+
+    #[test]
+    fn parse_env_only_accepts_numbers() {
+        let env = |key: &str| match key {
+            "YAA_NOTIFY_TIMEOUT_SECS" => Some(" 7 ".to_string()),
+            "YAA_NOTIFY_HEAD_CHARS" => Some("abc".to_string()),
+            _ => None,
+        };
+        assert_eq!(parse_env::<u64>(&env, "YAA_NOTIFY_TIMEOUT_SECS"), Some(7));
+        assert_eq!(parse_env::<usize>(&env, "YAA_NOTIFY_HEAD_CHARS"), None);
+        assert_eq!(parse_env::<u64>(&env, "MISSING"), None);
+    }
 }

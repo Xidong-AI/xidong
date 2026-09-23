@@ -4,7 +4,7 @@
 //! `items` 是纯函数，不维护第二套执行事件流。`yaa-cli` 只决定样式与 stdout/stderr
 //! 分流（D18）。
 
-use yaa_msg::{Record, ToolOrigin};
+use yaa_msg::{OutputFiles, Record, System, ToolOrigin};
 
 /// 一条展示条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,13 +56,13 @@ pub fn items(records: &[Record]) -> Vec<DisplayItem> {
     for (index, record) in records.iter().enumerate() {
         match record {
             Record::System(system) => {
-                if system.source == "notify" && !system.content.is_empty() {
+                if system.source == "notify" && has_visible_text(system) {
                     items.push(DisplayItem::Injection {
                         comment: envelope_comment(&system.content)
                             .unwrap_or("通知")
                             .to_string(),
                         command: system.command.clone(),
-                        content: system.content.clone(),
+                        content: system_text(system),
                     });
                 }
                 // `init` 簿记与空 `system` 不产出条目。
@@ -95,6 +95,41 @@ pub fn items(records: &[Record]) -> Vec<DisplayItem> {
     items
 }
 
+/// 统一截断提示：正文被截断时说明仅保留头尾，并给出完整输出相对路径。
+///
+/// [`crate::render`] 的工具消息与 [`system_text`] 都调用本函数，避免两处文案漂移。
+/// `files` 两个流都缺路径时省略路径（超出上限却未落盘的情形）。
+pub fn truncation_note(files: &OutputFiles) -> String {
+    let mut note = String::from("[truncated] 仅保留头尾输出，完整内容见输出文件");
+    if let Some(path) = files.stdout.as_deref().or(files.stderr.as_deref()) {
+        note.push(' ');
+        note.push_str(path);
+    }
+    note.push('。');
+    note
+}
+
+/// `system` 投影进上下文的正文。
+///
+/// 即 `system.content`；若带 `output_files`（正文被截断），追加 [`truncation_note`]。
+/// 注意这里**不**拼 `[执行命令]` 前缀——命令前缀由 [`crate::render`] 在投影时按需
+/// 加在最前，展示层用独立的 `% 命令` 呈现。
+pub fn system_text(system: &System) -> String {
+    let mut text = system.content.clone();
+    if let Some(files) = &system.output_files {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&truncation_note(files));
+    }
+    text
+}
+
+/// `system` 是否有可展示、可投影的正文：非空 `content` 或落盘了完整输出。
+fn has_visible_text(system: &System) -> bool {
+    !system.content.is_empty() || system.output_files.is_some()
+}
+
 /// 从 `<注释>\n…\n</注释>` 信封提取注释；非信封返回 `None`。
 ///
 /// 首行必须是 `<注释>`，末行必须是 `</注释>`，两者注释一致才认作信封。
@@ -115,14 +150,26 @@ mod tests {
     use super::*;
 
     fn notify(content: &str, command: Option<&str>) -> Record {
-        Record::system("notify", content, command.map(str::to_string))
+        Record::system("notify", content, command.map(str::to_string), None)
+    }
+
+    fn notify_truncated(command: Option<&str>) -> Record {
+        Record::system(
+            "notify",
+            "<注释>\n头尾\n</注释>",
+            command.map(str::to_string),
+            Some(OutputFiles {
+                stdout: Some("sessions/sid/outputs/01J.stdout.out".to_string()),
+                stderr: None,
+            }),
+        )
     }
 
     #[test]
     fn init_and_empty_systems_produce_nothing() {
         let records = vec![
-            Record::system("init", "", None),
-            Record::system("notify", "", None),
+            Record::system("init", "", None, None),
+            Record::system("notify", "", None, None),
         ];
         assert!(items(&records).is_empty());
     }
@@ -218,6 +265,73 @@ mod tests {
     fn user_origin_call_produces_nothing() {
         let records = vec![Record::tool_call(ToolOrigin::User, "u1", "ls", None)];
         assert!(items(&records).is_empty());
+    }
+
+    #[test]
+    fn truncation_note_includes_relative_path_or_omits_it() {
+        let with_stdout = OutputFiles {
+            stdout: Some("sessions/sid/outputs/a.stdout.out".to_string()),
+            stderr: None,
+        };
+        assert_eq!(
+            truncation_note(&with_stdout),
+            "[truncated] 仅保留头尾输出，完整内容见输出文件 sessions/sid/outputs/a.stdout.out。"
+        );
+
+        let only_stderr = OutputFiles {
+            stdout: None,
+            stderr: Some("sessions/sid/outputs/a.stderr.out".to_string()),
+        };
+        assert!(truncation_note(&only_stderr).contains("a.stderr.out"));
+
+        let no_path = OutputFiles {
+            stdout: None,
+            stderr: None,
+        };
+        assert_eq!(
+            truncation_note(&no_path),
+            "[truncated] 仅保留头尾输出，完整内容见输出文件。"
+        );
+    }
+
+    #[test]
+    fn system_text_appends_truncation_note_only_when_output_files_present() {
+        let plain = System {
+            id: "s".into(),
+            ts: 1,
+            source: "notify".into(),
+            command: None,
+            output_files: None,
+            content: "正文".into(),
+        };
+        assert_eq!(system_text(&plain), "正文");
+
+        let truncated = System {
+            output_files: Some(OutputFiles {
+                stdout: Some("sessions/sid/outputs/a.stdout.out".into()),
+                stderr: None,
+            }),
+            ..plain
+        };
+        assert_eq!(
+            system_text(&truncated),
+            "正文\n[truncated] 仅保留头尾输出，完整内容见输出文件 sessions/sid/outputs/a.stdout.out。"
+        );
+    }
+
+    #[test]
+    fn truncated_notify_projects_injection_with_note_and_command_field() {
+        let items = items(&[notify_truncated(Some("seq 1 9"))]);
+        assert_eq!(
+            items,
+            vec![DisplayItem::Injection {
+                comment: "注释".to_string(),
+                command: Some("seq 1 9".to_string()),
+                content:
+                    "<注释>\n头尾\n</注释>\n[truncated] 仅保留头尾输出，完整内容见输出文件 sessions/sid/outputs/01J.stdout.out。"
+                        .to_string(),
+            }]
+        );
     }
 
     #[test]

@@ -47,6 +47,10 @@ pub struct Cli {
     #[arg(last = true, value_name = "CMD", num_args = 0..)]
     pub command: Vec<String>,
 
+    /// 覆盖 `--notify` 命令的超时秒数（仅 `--notify` 生效）。
+    #[arg(long, value_name = "SECS")]
+    pub notify_timeout: Option<u64>,
+
     /// 把钩子、工具等事件打到 stderr。
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,

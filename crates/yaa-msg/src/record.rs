@@ -102,17 +102,22 @@ impl Record {
         })
     }
 
-    /// 系统消息（通知、初始化簿记等）。`command` 可选，只用于展示，不进入上下文。
+    /// 系统消息（通知、初始化簿记等）。
+    ///
+    /// `command` 可选，只用于展示，不进入上下文；`output_files` 可选，承载被截断时
+    /// 落盘的完整输出（相对数据根），与 `tool_result` 同构。
     pub fn system(
         source: impl Into<String>,
         content: impl Into<String>,
         command: Option<String>,
+        output_files: Option<OutputFiles>,
     ) -> Self {
         Record::System(System {
             id: new_id(),
             ts: now_ms(),
             source: source.into(),
             command,
+            output_files,
             content: content.into(),
         })
     }
@@ -192,7 +197,10 @@ pub struct OutputFiles {
     pub stderr: Option<String>,
 }
 
-/// 系统记录。`command` 可选，只用于展示，不进入上下文。
+/// 系统记录。
+///
+/// `command` 只用于展示、不进入上下文；`output_files` 承载被截断时落盘的完整输出
+/// （相对数据根），旧记录缺该字段时为 `None`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct System {
     pub id: String,
@@ -200,6 +208,8 @@ pub struct System {
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_files: Option<OutputFiles>,
     pub content: String,
 }
 
@@ -398,6 +408,7 @@ mod tests {
             ts: 5,
             source: "notify".into(),
             command: Some("git status".into()),
+            output_files: None,
             content: "……".into(),
         });
         let line = serde_json::to_string(&r).expect("serialize");
@@ -415,6 +426,7 @@ mod tests {
             ts: 5,
             source: "init".into(),
             command: None,
+            output_files: None,
             content: String::new(),
         });
         let line = serde_json::to_string(&r).expect("serialize");
@@ -423,6 +435,39 @@ mod tests {
             r#"{"type":"system","id":"01JSYS","ts":5,"source":"init","content":""}"#
         );
         assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn system_golden_with_output_files() {
+        let r = Record::System(System {
+            id: "01JSYS".into(),
+            ts: 5,
+            source: "notify".into(),
+            command: Some("seq 1 9".into()),
+            output_files: Some(OutputFiles {
+                stdout: Some("sessions/sid/outputs/01JFILE.stdout.out".into()),
+                stderr: None,
+            }),
+            content: "<注释>\n头尾\n</注释>\n[truncated] …".into(),
+        });
+        let line = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            line,
+            r#"{"type":"system","id":"01JSYS","ts":5,"source":"notify","command":"seq 1 9","output_files":{"stdout":"sessions/sid/outputs/01JFILE.stdout.out"},"content":"<注释>\n头尾\n</注释>\n[truncated] …"}"#
+        );
+        assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn system_without_output_files_deserializes_to_none() {
+        // 兼容性：旧记录缺 `output_files` 字段必须解析为 `None`，不得解析失败。
+        let line = r#"{"type":"system","id":"01JSYS","ts":5,"source":"notify","command":"echo hi","content":"<注释>\n正文\n</注释>"}"#;
+        let record: Record = serde_json::from_str(line).expect("旧记录应可解析");
+        let Record::System(system) = record else {
+            panic!("应解析为 system");
+        };
+        assert_eq!(system.output_files, None);
+        assert_eq!(system.command.as_deref(), Some("echo hi"));
     }
 
     #[test]

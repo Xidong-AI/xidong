@@ -471,11 +471,12 @@ async fn layered_assembly_merges_prefix_and_adjacent_notify() {
     assert_eq!(requests.len(), 1);
     let systems = message_contents(&requests[0], "system");
     assert_eq!(systems.len(), 1, "三条 notify 应合并为一条 system 消息");
+    // `command` 现进入上下文：每条通知的最前拼 `[执行命令] <command>`（T1）。
     assert_eq!(
         systems[0],
-        "<系统提示词>\nSYS\n</系统提示词>\n\n\
-         <用户总提示词>\nUSR\n</用户总提示词>\n\n\
-         <当前环境>\nENV\n</当前环境>"
+        "[执行命令] printf SYS\n<系统提示词>\nSYS\n</系统提示词>\n\n\
+         [执行命令] printf USR\n<用户总提示词>\nUSR\n</用户总提示词>\n\n\
+         [执行命令] printf ENV\n<当前环境>\nENV\n</当前环境>"
     );
 
     // 首条 user 之后写入通知。
@@ -732,29 +733,40 @@ async fn displayed_injections_match_request_context() {
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
     let records = read_jsonl(&env.session_file());
-    let injections: Vec<String> = records
+    let notifies: Vec<(String, String)> = records
         .iter()
         .filter(|record| record["type"] == "system" && record["source"] == "notify")
-        .map(|record| record["content"].as_str().unwrap().to_string())
+        .map(|record| {
+            (
+                record["content"].as_str().unwrap().to_string(),
+                record["command"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
-    assert_eq!(injections.len(), 3);
+    assert_eq!(notifies.len(), 3);
 
     let requests = state.requests.lock().unwrap().clone();
     let messages = requests[0]["messages"].as_array().unwrap();
     let system = messages.iter().find(|m| m["role"] == "system").unwrap();
+    // 投影正文 = `[执行命令] <command>` 前缀 + 注入信封（T1）。
+    let expected_system = notifies
+        .iter()
+        .map(|(content, command)| format!("[执行命令] {command}\n{content}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
     assert_eq!(
         system["content"].as_str().unwrap(),
-        injections.join("\n\n"),
-        "请求体 system 只能由注入正文拼成"
+        expected_system,
+        "请求体 system 应由注入正文（含命令前缀）拼成"
     );
     let user = messages.iter().find(|m| m["role"] == "user").unwrap();
     assert_eq!(user["content"], "你好", "请求体 user 只能是用户输入");
 
     let stderr = stderr_of(&output);
-    for injection in &injections {
+    for (content, _) in &notifies {
         assert!(
-            stderr.contains(injection),
-            "verbose 展示应含注入正文：{injection}\n{stderr}"
+            stderr.contains(content),
+            "verbose 展示应含注入正文：{content}\n{stderr}"
         );
     }
     assert!(!stderr.contains("# 思考"), "无思考内容不应展示思考块");
@@ -831,6 +843,205 @@ fn notify_command_and_stdin_forms_write_envelopes() {
     );
     let records = read_jsonl(&env.session_file());
     assert_eq!(records[0]["content"], "<由用户执行>\nx\n</由用户执行>");
+}
+
+/// T1/T3：通知的 `command` 对模型可见——第二跳请求的注入正文含 `[执行命令]` 前缀。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_command_is_visible_to_model_on_next_request() {
+    let (addr, state) = start_server(vec![text_response("第一答"), text_response("第二答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let first = env.run(&["你好"]);
+    assert!(first.status.success(), "stderr：{}", stderr_of(&first));
+
+    let notify = env.run(&["--notify=外部", "--", "echo", "hi"]);
+    assert_eq!(
+        notify.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&notify)
+    );
+
+    let second = env.run(&["继续"]);
+    assert!(second.status.success(), "stderr：{}", stderr_of(&second));
+
+    let requests = state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    let messages = requests[1]["messages"].as_array().unwrap();
+    let joined = messages
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("[执行命令] echo hi"),
+        "第二跳请求应含命令前缀：{joined}"
+    );
+    assert!(
+        joined.contains("<外部>\nhi\n</外部>"),
+        "第二跳请求应含通知信封：{joined}"
+    );
+}
+
+/// T3：`--notify --` 超限时复用 `yaa-exec` 截断并落盘完整输出，`output_files` 为相对路径。
+#[test]
+fn notify_truncates_and_records_output_files() {
+    let env = TestEnv::new(0);
+    env.write_config(TRUNCATION_CONFIG);
+
+    let output = env.run(&["--notify=大输出", "--", "seq", "1", "200"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    let records = read_jsonl(&env.session_file());
+    assert_eq!(records.len(), 1, "notify 是短路路径，只写一条记录");
+    let record = &records[0];
+    assert_eq!(record["source"], "notify");
+    assert_eq!(
+        record["command"], "seq 1 200",
+        "command 应为转义后可重放命令"
+    );
+
+    let relative = record["output_files"]["stdout"]
+        .as_str()
+        .expect("截断应记录完整 stdout 文件")
+        .to_string();
+    assert!(
+        !relative.starts_with('/'),
+        "数据根内应为相对路径：{relative}"
+    );
+    assert!(
+        env.data_home.join(&relative).exists(),
+        "完整输出文件应存在：{}",
+        env.data_home.join(&relative).display()
+    );
+    assert!(
+        record["content"]
+            .as_str()
+            .unwrap()
+            .contains("... [truncated] ..."),
+        "正文应体现截断：{}",
+        record["content"]
+    );
+}
+
+/// T3：`--notify-timeout` 覆盖超时，命令被终止且按通用错误码退出。
+#[test]
+fn notify_timeout_flag_kills_long_command() {
+    let env = TestEnv::new(0);
+    let output = env.run(&["--notify-timeout", "1", "--notify=T", "--", "sleep", "30"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "超时命令应按 1 退出：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("超时"),
+        "应提示超时：{}",
+        stderr_of(&output)
+    );
+    let records = read_jsonl(&env.session_file());
+    assert_eq!(records[0]["command"], "sleep 30");
+}
+
+/// T3：stdin 形态按 `YAA_NOTIFY_MAX_STREAM_CHARS` 加上限，超出即视为截断。
+#[test]
+fn notify_stdin_truncates_at_env_limit() {
+    let env = TestEnv::new(0);
+    let mut command = env.command();
+    command
+        .env("YAA_NOTIFY_MAX_STREAM_CHARS", "8")
+        .arg("--notify=管道")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"0123456789ABC")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    let records = read_jsonl(&env.session_file());
+    assert!(
+        records[0].get("command").is_none(),
+        "stdin 形态不记 command"
+    );
+    assert!(
+        records[0].get("output_files").is_none(),
+        "stdin 形态不落盘完整输出"
+    );
+    let content = records[0]["content"].as_str().unwrap();
+    assert!(
+        content.contains("输入超过上限 8 字符"),
+        "正文应体现截断：{content}"
+    );
+}
+
+/// T3：`--notify` 的限额解析链——环境变量覆盖配置、`--notify-timeout` 覆盖环境变量。
+#[test]
+fn notify_timeout_flag_overrides_env_and_config() {
+    let env = TestEnv::new(0);
+    env.write_config(TRUNCATION_CONFIG);
+
+    // 只给环境变量：1 秒超时足以杀掉 sleep 30。
+    let mut command = env.command();
+    command
+        .env("YAA_NOTIFY_TIMEOUT_SECS", "1")
+        .args(["--notify=env", "--", "sleep", "30"]);
+    let output = command.output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(stderr_of(&output).contains("超时"));
+
+    // CLI 覆盖为一个足够长的超时：命令应正常结束。
+    let env2 = TestEnv::new(0);
+    let output = env2.run(&["--notify-timeout", "10", "--notify=flag", "--", "true"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+}
+
+/// T2：旧 `system` 记录缺 `output_files` 字段时 `--status` 仍能解析（兼容性）。
+#[test]
+fn status_accepts_system_without_output_files() {
+    let env = TestEnv::new(0);
+    let session = env.work.join("s.jsonl");
+    std::fs::write(
+        &session,
+        b"{\"type\":\"system\",\"id\":\"01J\",\"ts\":1,\"source\":\"notify\",\"command\":\"echo hi\",\"content\":\"<x>\\nhi\\n</x>\"}\n",
+    )
+    .unwrap();
+
+    let output = env.run(&["--status", "--session", session.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "缺 output_files 的旧 system 应可解析：{}",
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("记录："));
 }
 
 /// 验收 14：`deepseek` 端点回传 `reasoning_content`，`--verbose` 展示思考。

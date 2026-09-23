@@ -145,7 +145,7 @@ impl Runner<'_> {
         if !initialized {
             match self.run_init_hook().await {
                 Ok(()) => {
-                    yaa_store::append(&self.session, &[Record::system("init", "", None)])?;
+                    yaa_store::append(&self.session, &[Record::system("init", "", None, None)])?;
                 }
                 Err(exit) => {
                     yaa_store::append(&self.session, &[Record::user(prompt_text)])?;

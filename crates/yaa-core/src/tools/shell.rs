@@ -132,10 +132,30 @@ pub async fn execute(
         return failure(call_id, error);
     }
 
+    // 除调用方给的 `YAA_SESSION` 等变量外，把本次工具调用的限额以 `YAA_NOTIFY_*`
+    // 透传给子进程：工具内嵌的 `yaa --notify` 据此采用同一套截断/超时参数（T3）。
+    let mut env = extra_env.to_vec();
+    env.push((
+        "YAA_NOTIFY_TIMEOUT_SECS".to_string(),
+        limits.timeout_secs.to_string(),
+    ));
+    env.push((
+        "YAA_NOTIFY_MAX_STREAM_CHARS".to_string(),
+        limits.max_stream_chars.to_string(),
+    ));
+    env.push((
+        "YAA_NOTIFY_HEAD_CHARS".to_string(),
+        limits.head_chars.to_string(),
+    ));
+    env.push((
+        "YAA_NOTIFY_TAIL_CHARS".to_string(),
+        limits.tail_chars.to_string(),
+    ));
+
     let command = yaa_exec::ShellCommand {
         call_id: call_id.to_string(),
         command: parsed.command.clone(),
-        env: extra_env.to_vec(),
+        env,
     };
     match yaa_exec::run(&command, limits, output_dir).await {
         Ok(output) => output_to_record(&output, data_root),
@@ -351,6 +371,23 @@ mod tests {
             panic!("应生成 tool_result");
         };
         assert_eq!(result.stdout, "会话路径");
+    }
+
+    #[tokio::test]
+    async fn execute_injects_notify_limit_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let limits = test_limits();
+        let parsed = parse(
+            r#"{"command":"printf '%s,%s,%s,%s' \"$YAA_NOTIFY_TIMEOUT_SECS\" \"$YAA_NOTIFY_MAX_STREAM_CHARS\" \"$YAA_NOTIFY_HEAD_CHARS\" \"$YAA_NOTIFY_TAIL_CHARS\""}"#,
+        );
+        let record = execute(NAME, "c1", &parsed, &limits, dir.path(), dir.path(), &[]).await;
+        let yaa_msg::Record::ToolResult(result) = record else {
+            panic!("应生成 tool_result");
+        };
+        assert_eq!(
+            result.stdout, "10,1000,100,50",
+            "工具子进程应收到本次调用的限额"
+        );
     }
 
     #[test]

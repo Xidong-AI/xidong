@@ -18,6 +18,7 @@ use std::collections::HashMap;
 
 use yaa_msg::{Record, ToolOrigin};
 
+use crate::display;
 use crate::message::{AssistantToolCall, ChatMessage};
 use crate::tools::shell;
 
@@ -42,12 +43,10 @@ pub fn render(records: &[Record]) -> Vec<ChatMessage> {
         .iter()
         .position(|record| matches!(record, Record::User(_)));
     let prefix_end = first_user.unwrap_or(records.len());
-    let prefix: Vec<&str> = records[..prefix_end]
+    let prefix: Vec<String> = records[..prefix_end]
         .iter()
         .filter_map(|record| match record {
-            Record::System(system) if is_projectable_system(system) => {
-                Some(system.content.as_str())
-            }
+            Record::System(system) if is_projectable_system(system) => Some(project_system(system)),
             _ => None,
         })
         .collect();
@@ -75,7 +74,7 @@ pub fn render(records: &[Record]) -> Vec<ChatMessage> {
                         index += 1;
                     }
                     Record::System(system) if is_projectable_system(system) => {
-                        parts.push(system.content.clone());
+                        parts.push(project_system(system));
                         index += 1;
                     }
                     _ => break,
@@ -111,9 +110,25 @@ fn is_user_run_item(record: &Record) -> bool {
     }
 }
 
-/// 非空的普通 `system`；`init` 是初始化簿记，空内容不产生消息。
+/// 非空的普通 `system`；`init` 是初始化簿记。
+///
+/// 非空判定同时看 `content` 与 `output_files`：正文被截断、`content` 为空但有完整
+/// 输出文件时同样要投影。
 fn is_projectable_system(system: &yaa_msg::System) -> bool {
-    !system.content.is_empty() && system.source != "init"
+    (!system.content.is_empty() || system.output_files.is_some()) && system.source != "init"
+}
+
+/// 把一个 `system` 投影为进入上下文的文本。
+///
+/// 正文取 [`display::system_text`]（含截断提示）；若记录带 `command`，在最前拼
+/// `[执行命令] <command>`，让模型知道通知由哪条命令产生（T1）。
+fn project_system(system: &yaa_msg::System) -> String {
+    let mut text = String::new();
+    if let Some(command) = &system.command {
+        text.push_str(&format!("[执行命令] {command}\n"));
+    }
+    text.push_str(&display::system_text(system));
+    text
 }
 
 /// 渲染一个 `ai` 步骤，返回下一条待处理记录的下标。
@@ -210,16 +225,14 @@ fn tool_content(result: &yaa_msg::ToolResult) -> String {
         content.push_str("\n[timeout] 命令超时，已被终止。");
     }
     if result.truncated {
-        content.push_str("\n[truncated] 仅保留头尾输出，完整内容见输出文件");
-        if let Some(path) = result
-            .output_files
-            .as_ref()
-            .and_then(|files| files.stdout.as_deref())
-        {
-            content.push(' ');
-            content.push_str(path);
-        }
-        content.push('。');
+        content.push('\n');
+        let empty = yaa_msg::OutputFiles {
+            stdout: None,
+            stderr: None,
+        };
+        content.push_str(&display::truncation_note(
+            result.output_files.as_ref().unwrap_or(&empty),
+        ));
     }
     content
 }
@@ -230,15 +243,15 @@ mod tests {
     use yaa_msg::{OutputFiles, ToolResult};
 
     fn notify(content: &str) -> Record {
-        Record::system("notify", content, None)
+        Record::system("notify", content, None, None)
     }
 
     fn notify_with_command(content: &str, command: &str) -> Record {
-        Record::system("notify", content, Some(command.to_string()))
+        Record::system("notify", content, Some(command.to_string()), None)
     }
 
     fn init() -> Record {
-        Record::system("init", "", None)
+        Record::system("init", "", None, None)
     }
 
     fn result(call_id: &str, stdout: &str) -> Record {
@@ -299,7 +312,76 @@ mod tests {
         assert_eq!(roles(&messages), ["user"]);
         assert_eq!(
             messages[0].content.as_deref(),
-            Some("问题\n\n<环境>\n工作目录：/tmp\n</环境>")
+            Some("问题\n\n[执行命令] pwd\n<环境>\n工作目录：/tmp\n</环境>")
+        );
+    }
+
+    #[test]
+    fn command_prefix_is_prepended_in_stable_prefix_and_user_run() {
+        let records = vec![
+            notify_with_command("<系统提示词>\n正文\n</系统提示词>", "git status"),
+            Record::user("问题"),
+            notify_with_command("<补充>\n更多\n</补充>", "echo hi"),
+        ];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["system", "user"]);
+        assert_eq!(
+            messages[0].content.as_deref(),
+            Some("[执行命令] git status\n<系统提示词>\n正文\n</系统提示词>")
+        );
+        assert_eq!(
+            messages[1].content.as_deref(),
+            Some("问题\n\n[执行命令] echo hi\n<补充>\n更多\n</补充>")
+        );
+    }
+
+    #[test]
+    fn projection_body_equals_display_system_text_for_commandless_notify() {
+        // 无 `command` 时，展示侧 `Injection.content` 与渲染正文必须逐字一致（D29）。
+        let record = Record::system(
+            "notify",
+            "<通知>\n正文\n</通知>",
+            None,
+            Some(OutputFiles {
+                stdout: Some("sessions/sid/outputs/01J.stdout.out".into()),
+                stderr: None,
+            }),
+        );
+        let Record::System(system) = &record else {
+            panic!("应为 system");
+        };
+        let projected = &display::system_text(system);
+
+        let messages = render(std::slice::from_ref(&record));
+        assert_eq!(messages[0].content.as_deref(), Some(projected.as_str()));
+
+        let items = display::items(std::slice::from_ref(&record));
+        let display::DisplayItem::Injection { content, .. } = &items[0] else {
+            panic!("应投影为 Injection");
+        };
+        assert_eq!(content, projected, "展示正文应与渲染正文一致");
+    }
+
+    #[test]
+    fn truncation_note_with_relative_path_is_projected() {
+        let records = vec![Record::system(
+            "notify",
+            "<通知>\n头尾\n</通知>",
+            Some("seq 1 9".into()),
+            Some(OutputFiles {
+                stdout: Some("sessions/sid/outputs/01J.stdout.out".into()),
+                stderr: None,
+            }),
+        )];
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["system"]);
+        let content = messages[0].content.as_deref().unwrap();
+        assert!(content.starts_with("[执行命令] seq 1 9\n"));
+        assert!(
+            content.contains(
+                "[truncated] 仅保留头尾输出，完整内容见输出文件 sessions/sid/outputs/01J.stdout.out。"
+            ),
+            "截断提示应含相对路径：{content}"
         );
     }
 
