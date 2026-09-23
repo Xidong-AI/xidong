@@ -2033,6 +2033,7 @@ fn approve_and_auto_combination_usage_errors() {
         vec!["--approve", "--notify=注释"],
         vec!["--approve", "--clear"],
         vec!["--approve", "--status"],
+        vec!["--approve", "某提示"],
         vec!["--auto", "--notify=注释"],
     ] {
         let output = env.run(&args);
