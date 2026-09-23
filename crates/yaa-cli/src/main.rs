@@ -317,19 +317,39 @@ fn notify_session(
     env: &impl Fn(&str) -> Option<String>,
     data_root: &Path,
 ) -> anyhow::Result<yaa_store::Session> {
-    if let Some(path) = &cli.session {
-        return Ok(yaa_store::Session::new(absolute_path(path)?));
-    }
-    if let Some(path) = env("YAA_SESSION").filter(|value| !value.is_empty()) {
-        return Ok(yaa_store::Session::new(absolute_path(Path::new(&path))?));
-    }
-    let cwd = std::env::current_dir()?;
-    Ok(yaa_core::session::resolve(&cwd, None, data_root)?.session)
+    Ok(resolve_session_target(cli, env, data_root)?.session)
 }
 
-/// 词法绝对化；相对路径相对当前工作目录补全。
-fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
-    Ok(std::path::absolute(path)?)
+/// 解析会话目标：`--session` → `YAA_SESSION`（非空才算）→ 当前 cwd 默认会话。
+///
+/// 供 `--notify` 与 `--approve` 共用，保证两者的目标解析链完全一致（规则 8）。
+fn resolve_session_target(
+    cli: &Cli,
+    env: &impl Fn(&str) -> Option<String>,
+    data_root: &Path,
+) -> anyhow::Result<yaa_core::session::Resolved> {
+    let cwd = std::env::current_dir()?;
+    let env_session = env("YAA_SESSION");
+    yaa_core::session::resolve_target(
+        &cwd,
+        cli.session.as_deref(),
+        env_session.as_deref(),
+        data_root,
+    )
+}
+
+/// 一次 agent 回合的会话解析：`--approve` 走扩展链（同 `--notify`）；普通 run 保持
+/// 阶段 1 语义（仅 `--session`，忽略 `YAA_SESSION`，嵌套会话语义留待阶段 5）。
+fn resolve_run_session(
+    cli: &Cli,
+    env: &impl Fn(&str) -> Option<String>,
+    data_root: &Path,
+) -> anyhow::Result<yaa_core::session::Resolved> {
+    if cli.approve {
+        return resolve_session_target(cli, env, data_root);
+    }
+    let cwd = std::env::current_dir()?;
+    yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)
 }
 
 /// 归档当前会话，打印目标路径。
@@ -375,13 +395,14 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
 
     println!("会话文件：{}", resolved.session.file.display());
     println!(
-        "记录：{} 条（user {} / ai {} / tool_call {} / tool_result {} / system {}）",
+        "记录：{} 条（user {} / ai {} / tool_call {} / tool_result {} / system {} / approval {}）",
         records.len(),
         counts.user,
         counts.ai,
         counts.tool_call,
         counts.tool_result,
         counts.system,
+        counts.approval,
     );
     if let Some(text) = last_ai {
         println!("最近 ai：{}", snippet(text, 80));
@@ -413,8 +434,7 @@ async fn run_agent(
     // 配置读取/解析失败是配置错误（退出码 3），不是通用错误。
     let config = yaa_core::config::Config::load(&config_path).map_err(CliError::config)?;
 
-    let cwd = std::env::current_dir()?;
-    let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
+    let resolved = resolve_run_session(&cli, env, data_root)?;
 
     let prompt = if cli.approve {
         // `--approve` 不读提示词、不写 stdin 提示。
@@ -540,6 +560,8 @@ struct Counts {
     tool_call: usize,
     tool_result: usize,
     system: usize,
+    /// `approval_pending` 与 `approval_resolved` 合并口径，使分类之和等于总数。
+    approval: usize,
 }
 
 impl Counts {
@@ -550,8 +572,7 @@ impl Counts {
             Record::ToolCall(_) => self.tool_call += 1,
             Record::ToolResult(_) => self.tool_result += 1,
             Record::System(_) => self.system += 1,
-            // 审批记录不计入阶段 1 的统计口径。
-            Record::ApprovalPending(_) | Record::ApprovalResolved(_) => {}
+            Record::ApprovalPending(_) | Record::ApprovalResolved(_) => self.approval += 1,
         }
     }
 }
@@ -637,5 +658,68 @@ mod tests {
         assert_eq!(parse_env::<u64>(&env, "YAA_NOTIFY_TIMEOUT_SECS"), Some(7));
         assert_eq!(parse_env::<usize>(&env, "YAA_NOTIFY_HEAD_CHARS"), None);
         assert_eq!(parse_env::<u64>(&env, "MISSING"), None);
+    }
+
+    #[test]
+    fn run_session_uses_env_only_for_approve() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_root = dir.path().join("data");
+        let env_path = dir.path().join("from-env.jsonl");
+        let env =
+            |key: &str| (key == "YAA_SESSION").then(|| env_path.to_string_lossy().into_owned());
+
+        // C1：`--approve` 认 YAA_SESSION，与 `--notify` 解析链一致。
+        let approve = Cli::parse_from(["yaa", "--approve"]);
+        let resolved = resolve_run_session(&approve, &env, &data_root).unwrap();
+        assert_eq!(
+            resolved.session.file,
+            env_path,
+            "--approve 应认 YAA_SESSION：{}",
+            resolved.session.file.display()
+        );
+
+        // `--session` 优先于 YAA_SESSION。
+        let explicit = dir.path().join("explicit.jsonl");
+        let approve =
+            Cli::parse_from(["yaa", "--approve", "--session", explicit.to_str().unwrap()]);
+        let resolved = resolve_run_session(&approve, &env, &data_root).unwrap();
+        assert_eq!(resolved.session.file, explicit, "--session 应最优先");
+
+        // 普通 run 的会话解析保持不变：忽略 YAA_SESSION，仍走 cwd 默认。
+        let normal = Cli::parse_from(["yaa", "你好"]);
+        let resolved = resolve_run_session(&normal, &env, &data_root).unwrap();
+        assert!(
+            resolved.session.root.starts_with(&data_root),
+            "普通 run 不得因 YAA_SESSION 改变目标：{}",
+            resolved.session.file.display()
+        );
+    }
+
+    #[test]
+    fn status_counts_include_approval_and_sum_to_total() {
+        let records = vec![
+            Record::user("你好"),
+            Record::ai("model", "hash", "答", None),
+            Record::tool_call(yaa_msg::ToolOrigin::Ai, "c1", "echo hi", None),
+            Record::tool_result("c1", "hi\n", "", 0, false, false, None),
+            Record::system("notify", "x", None, None),
+            Record::approval_pending("c1", "echo hi", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Approve),
+        ];
+        let mut counts = Counts::default();
+        for record in &records {
+            counts.add(record);
+        }
+        assert_eq!(counts.approval, 2, "待批与决策都应计入审批项");
+        assert_eq!(
+            counts.user
+                + counts.ai
+                + counts.tool_call
+                + counts.tool_result
+                + counts.system
+                + counts.approval,
+            records.len(),
+            "分类计数之和必须等于记录总数",
+        );
     }
 }
