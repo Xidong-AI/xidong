@@ -5,7 +5,9 @@
 
 mod record;
 
-pub use record::{Ai, OutputFiles, Record, System, ToolCall, ToolOrigin, ToolResult, User};
+pub use record::{
+    Ai, ApprovalDecision, OutputFiles, Record, System, ToolCall, ToolOrigin, ToolResult, User,
+};
 
 /// 当前 Unix 毫秒时间戳。
 pub fn now_ms() -> i64 {

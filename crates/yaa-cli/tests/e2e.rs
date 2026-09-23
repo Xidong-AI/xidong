@@ -64,6 +64,33 @@ init = "true"
 max_steps = 10
 "#;
 
+/// 命中 `echo *` 即询问的审批配置：用于 ask 拦截与 `--approve` 恢复。
+const APPROVAL_ASK_CONFIG: &str = r#"
+[hooks]
+init = "true"
+
+[approval]
+rules = [{ pattern = "echo *", action = "ask" }]
+
+[agent]
+max_steps = 10
+"#;
+
+/// 命中 `rm *` 即拒绝、其余（含 `echo *`）询问的审批配置：用于 `--auto` 与 deny 用例。
+const APPROVAL_AUTO_DENY_CONFIG: &str = r#"
+[hooks]
+init = "true"
+
+[approval]
+rules = [
+  { pattern = "echo *", action = "ask" },
+  { pattern = "rm *", action = "deny" },
+]
+
+[agent]
+max_steps = 10
+"#;
+
 /// 假服务端共享状态：按序返回脚本化响应，并记录每个请求体与 `Authorization` 头。
 #[derive(Clone)]
 struct ServerState {
@@ -1731,5 +1758,329 @@ async fn ctrl_c_kills_tool_process_group_and_exits_130() {
     assert!(
         wait_for_process_gone(tool_pid, std::time::Duration::from_secs(5)),
         "工具进程 {tool_pid} 应已被清理"
+    );
+}
+
+/// 阶段 2 验收 2：`ask` 拦截写 `approval_pending`、stderr 打印待批清单、以 6 退出、
+/// **不写** `tool_result`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ask_interception_writes_pending_and_exits_six() {
+    let (addr, _state) =
+        start_server(vec![tool_call_response("call_1", "echo hi", None, None)]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_ASK_CONFIG);
+
+    let output = env.run(&["你好"]);
+    assert_eq!(
+        output.status.code(),
+        Some(6),
+        "ask 应以退出码 6 结束：{}",
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).is_empty(), "待批回合 stdout 必须干净");
+
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("# 待批准"), "应打印待批清单：{stderr}");
+    assert!(stderr.contains("call_1"), "清单应含 call_id：{stderr}");
+    assert!(stderr.contains("echo *"), "清单应含命中规则：{stderr}");
+    assert!(stderr.contains("% echo hi"), "清单应含可重放命令：{stderr}");
+
+    let records = read_jsonl(&env.session_file());
+    let pending = records
+        .iter()
+        .find(|record| record["type"] == "approval_pending")
+        .expect("应落盘 approval_pending");
+    assert_eq!(pending["call_id"], "call_1");
+    assert_eq!(pending["command"], "echo hi");
+    assert_eq!(pending["matched_rule"], "echo *");
+    assert!(
+        !records.iter().any(|record| record["type"] == "tool_result"),
+        "ask 拦截不得写 tool_result：{records:?}"
+    );
+}
+
+/// 阶段 2 验收 3：`--approve` 执行最旧未决 pending，写 `approval_resolved: approve`
+/// 与 `tool_result`，随后继续 loop 至最终回复；不写 `user`、不重跑 `init`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_executes_oldest_pending_and_continues() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_1", "echo hi", None, None),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_ASK_CONFIG);
+
+    let first = env.run(&["你好"]);
+    assert_eq!(
+        first.status.code(),
+        Some(6),
+        "首次运行应待批退出：{}",
+        stderr_of(&first)
+    );
+
+    let second = env.run(&["--approve"]);
+    assert!(second.status.success(), "stderr：{}", stderr_of(&second));
+    assert!(
+        stdout_of(&second).contains("完成"),
+        "--approve 后应继续 loop 并打印最终回复：{}",
+        stdout_of(&second)
+    );
+    let stderr = stderr_of(&second);
+    assert!(stderr.contains("# 待批准"), "应展示待批条目：{stderr}");
+    assert!(stderr.contains("# 已批准"), "应展示批准条目：{stderr}");
+
+    let records = read_jsonl(&env.session_file());
+    let labels: Vec<&str> = records
+        .iter()
+        .map(|record| record["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "system",
+            "user",
+            "ai",
+            "tool_call",
+            "approval_pending",
+            "tool_result",
+            "approval_resolved",
+            "ai"
+        ],
+        "记录顺序不符：{records:?}"
+    );
+    assert_eq!(records[5]["call_id"], "call_1");
+    assert_eq!(records[5]["stdout"], "hi\n");
+    assert_eq!(records[6]["call_id"], "call_1");
+    assert_eq!(records[6]["decision"], "approve");
+    assert_eq!(records[7]["content"], "完成");
+    assert_eq!(count_source(&records, "init"), 1, "不得重跑 init");
+    assert_eq!(
+        records.iter().filter(|r| r["type"] == "user").count(),
+        1,
+        "不得写 user"
+    );
+}
+
+/// 阶段 2 验收 3：无未决 pending 时 `--approve` 提示并不报错。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_without_pending_is_success_with_notice() {
+    let (addr, _state) = start_server(vec![]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_ASK_CONFIG);
+
+    let output = env.run(&["--approve"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).contains("没有待批准"),
+        "应提示没有待批：{}",
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).is_empty());
+}
+
+/// 阶段 2 验收 4：`--auto` 自动放行命中 `ask` 的调用；显式 `deny` 仍强制。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_allows_ask_calls_and_completes_loop() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_1", "echo hi", None, None),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_AUTO_DENY_CONFIG);
+
+    let output = env.run(&["--auto", "你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    assert!(stdout_of(&output).contains("完成"));
+
+    let records = read_jsonl(&env.session_file());
+    let labels: Vec<&str> = records
+        .iter()
+        .map(|record| record["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        [
+            "system",
+            "user",
+            "ai",
+            "tool_call",
+            "approval_pending",
+            "approval_resolved",
+            "tool_result",
+            "ai"
+        ],
+        "--auto 应写 pending + resolved(approve) 后执行：{records:?}"
+    );
+    assert_eq!(records[5]["decision"], "approve");
+    assert_eq!(records[6]["stdout"], "hi\n");
+}
+
+/// 阶段 2 验收 4/5：`--auto` 下显式 `deny` 仍强制拒绝，进程不退出，模型下一跳可见。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn auto_still_enforces_explicit_deny() {
+    let (addr, state) = start_server(vec![
+        tool_call_response("call_1", "rm -rf /tmp/yaa-nope", None, None),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_AUTO_DENY_CONFIG);
+
+    let output = env.run(&["--auto", "你好"]);
+    assert!(
+        output.status.success(),
+        "deny 不应导致退出：{}",
+        stderr_of(&output)
+    );
+
+    let records = read_jsonl(&env.session_file());
+    let resolved = records
+        .iter()
+        .find(|record| record["type"] == "approval_resolved")
+        .expect("应写 approval_resolved");
+    assert_eq!(resolved["decision"], "deny");
+    let result = records
+        .iter()
+        .find(|record| record["type"] == "tool_result")
+        .expect("应写失败 tool_result");
+    assert_eq!(result["code"], -1);
+
+    let requests = state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "deny 后应继续 loop 到下一跳");
+    let tool_message = requests[1]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("第二跳应见 tool 消息");
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("拒绝"),
+        "被拒结果应对模型可见：{tool_message:?}"
+    );
+}
+
+/// 阶段 2 验收 6：普通 run 启动时先把旧未决 pending 作废（补 resolved deny + 失败 result）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_prompt_abandons_old_pending() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_1", "echo hi", None, None),
+        text_response("新答"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_ASK_CONFIG);
+
+    let first = env.run(&["第一次"]);
+    assert_eq!(
+        first.status.code(),
+        Some(6),
+        "首次运行应待批退出：{}",
+        stderr_of(&first)
+    );
+
+    let second = env.run(&["新提示词"]);
+    assert!(second.status.success(), "stderr：{}", stderr_of(&second));
+    assert!(stdout_of(&second).contains("新答"));
+
+    let records = read_jsonl(&env.session_file());
+    let deny_index = records
+        .iter()
+        .position(|record| record["type"] == "approval_resolved" && record["decision"] == "deny")
+        .expect("应补 approval_resolved(deny)");
+    let result = &records[deny_index + 1];
+    assert_eq!(result["type"], "tool_result");
+    assert_eq!(result["call_id"], "call_1");
+    assert_eq!(result["code"], -1);
+    let user_index = records
+        .iter()
+        .position(|record| record["type"] == "user" && record["content"] == "新提示词")
+        .expect("应有新 user 记录");
+    assert!(
+        deny_index < user_index,
+        "旧待批作废应发生在新 user 落盘之前：{records:?}"
+    );
+}
+
+/// 阶段 2 验收 11：`--approve` / `--auto` 与短路路径组合是用法错误（退出码 2）。
+#[test]
+fn approve_and_auto_combination_usage_errors() {
+    let env = TestEnv::new(0);
+    for args in [
+        vec!["--approve", "--notify=注释"],
+        vec!["--approve", "--clear"],
+        vec!["--approve", "--status"],
+        vec!["--auto", "--notify=注释"],
+    ] {
+        let output = env.run(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "应为用法错误（{args:?}）：{}",
+            stderr_of(&output)
+        );
+        assert!(
+            stdout_of(&output).is_empty(),
+            "用法错误不应污染 stdout（{args:?}）"
+        );
+    }
+}
+
+/// 阶段 2 验收 10（A6）：`--config` 指定的 `[shell]` 限额沿 `init` 钩子内的
+/// `yaa --notify` 一致生效（否则截断不会发生）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_shell_limits_flow_into_init_notify() {
+    let (addr, _state) = start_server(vec![text_response("完成")]).await;
+    let env = TestEnv::new(addr.port());
+
+    // 配置写到非默认路径，只有 `--config` 才可见；若限额未沿钩子链传递，
+    // 钩子内的 notify 会退回默认的大上限而不截断。
+    let custom_config = env.config_home.join("custom.toml");
+    std::fs::write(
+        &custom_config,
+        r#"
+[hooks]
+init = '"$YAA_BIN" --notify="截断" -- seq 1 200'
+
+[shell]
+timeout_secs = 30
+max_stream_chars = 64
+head_chars = 32
+tail_chars = 16
+
+[agent]
+max_steps = 10
+"#,
+    )
+    .unwrap();
+
+    let output = env
+        .command()
+        .arg("--config")
+        .arg(&custom_config)
+        .arg("你好")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = read_jsonl(&env.session_file());
+    let notify = records
+        .iter()
+        .find(|record| record["type"] == "system" && record["source"] == "notify")
+        .expect("init 应写入 notify 记录");
+    assert!(
+        notify["output_files"]["stdout"].as_str().is_some(),
+        "自定义限额应让 notify 截断并落盘：{notify:?}"
+    );
+    assert!(
+        notify["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[truncated]"),
+        "正文应含截断标记：{notify:?}"
     );
 }

@@ -1,7 +1,7 @@
 //! 命令行参数定义。
 //!
-//! 阶段 1 的表面见 `docs/plan.md` 的「CLI（阶段 1）」；`--json`、`--no-store`、
-//! `--approve`、`--notify` 的 `--to` 等后移到阶段 2 及以后。
+//! 阶段 1 的表面见 `docs/plan.md` 的「CLI（阶段 1）」；阶段 2 新增 `--approve`/
+//! `--auto`；`--json`、`--no-store`、`--notify` 的 `--to` 等后移到阶段 3 及以后。
 
 use std::path::PathBuf;
 
@@ -51,6 +51,14 @@ pub struct Cli {
     #[arg(long, value_name = "SECS")]
     pub notify_timeout: Option<u64>,
 
+    /// 放行最旧一条待批命令并继续 agent loop。
+    #[arg(long, conflicts_with_all = ["notify", "clear", "status"])]
+    pub approve: bool,
+
+    /// 自动放行命中 `ask` 的命令（显式 `deny` 仍强制）。
+    #[arg(long, conflicts_with = "notify")]
+    pub auto: bool,
+
     /// 把钩子、工具等事件打到 stderr。
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,
@@ -91,5 +99,17 @@ mod tests {
     fn empty_notify_value_is_preserved_for_runtime_fallback() {
         let cli = Cli::parse_from(["yaa", "--notify="]);
         assert_eq!(cli.notify.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn approve_and_auto_flags_parse_and_may_combine() {
+        let approve = Cli::parse_from(["yaa", "--approve"]);
+        assert!(approve.approve && !approve.auto);
+        let auto = Cli::parse_from(["yaa", "--auto", "你好"]);
+        assert!(auto.auto && !auto.approve);
+        assert_eq!(auto.prompt, vec!["你好".to_string()]);
+        // `--approve` 与 `--auto` 可同时给出（先放行最旧，后续 ask 自动放行）。
+        let both = Cli::parse_from(["yaa", "--approve", "--auto"]);
+        assert!(both.approve && both.auto);
     }
 }

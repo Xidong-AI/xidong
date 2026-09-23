@@ -127,6 +127,28 @@ impl Sink for StderrSink {
                 Self::write_block_text(&stdout);
                 Self::write_block_text(&stderr);
             }
+            DisplayItem::ApprovalPending {
+                call_id,
+                command,
+                matched_rule,
+            } => {
+                self.start_block();
+                let title = if matched_rule.is_empty() {
+                    format!("# 待批准（调用 {call_id}）")
+                } else {
+                    format!("# 待批准（规则 {matched_rule}，调用 {call_id}）")
+                };
+                Self::write_block_text(&title);
+                Self::write_block_text(&format!("% {command}"));
+            }
+            DisplayItem::ApprovalResolved { approved, .. } => {
+                self.start_block();
+                Self::write_block_text(if approved {
+                    "# 已批准"
+                } else {
+                    "# 已拒绝"
+                });
+            }
         }
     }
 }

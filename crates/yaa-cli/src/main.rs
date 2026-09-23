@@ -409,7 +409,10 @@ async fn run_agent(
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
 
-    let prompt = if cli.prompt.is_empty() {
+    let prompt = if cli.approve {
+        // `--approve` 不读提示词、不写 stdin 提示。
+        String::new()
+    } else if cli.prompt.is_empty() {
         read_stdin().await?
     } else {
         cli.prompt.join(" ")
@@ -422,6 +425,7 @@ async fn run_agent(
         cwd: &resolved.cwd_absolute,
         session: resolved.session.clone(),
         cwd_warned: resolved.warned,
+        auto: cli.auto,
         sink: &sink,
     };
     // Ctrl-C：向当前工具进程组转发 SIGINT，宽限内仍存活则 SIGKILL 兜底，再以 130 退出。
@@ -438,12 +442,21 @@ async fn run_agent(
         .map_err(anyhow::Error::from)?
         .len();
     let request_timeout = std::time::Duration::from_secs(config.agent.request_timeout_secs);
-    let exit = runner
-        .run(&prompt, |cfg| yaa_core::agent::OpenAiModel {
-            cfg,
-            timeout: request_timeout,
-        })
-        .await?;
+    let exit = if cli.approve {
+        runner
+            .approve_pending(|cfg| yaa_core::agent::OpenAiModel {
+                cfg,
+                timeout: request_timeout,
+            })
+            .await?
+    } else {
+        runner
+            .run(&prompt, |cfg| yaa_core::agent::OpenAiModel {
+                cfg,
+                timeout: request_timeout,
+            })
+            .await?
+    };
 
     // stdout 只承载「成功的最终助手文本」：失败回合（模型/配置/用法错误）的原因已由
     // stderr 报告，若再打印上一条历史回复会把过期答案伪装成本次结果。

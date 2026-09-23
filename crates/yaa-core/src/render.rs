@@ -94,6 +94,8 @@ pub fn render(records: &[Record]) -> Vec<ChatMessage> {
             }
             // `system(source=init)`、空 `system`、游离调用与孤儿结果：不投影。
             // 已配对的 `tool_result` 已在对应助手步骤内发出，这里一律跳过。
+            // 审批记录（阶段 2）不参与模型消息投影，也不改变 `assistant`/`tool` 配对。
+            Record::ApprovalPending(_) | Record::ApprovalResolved(_) => index += 1,
             _ => index += 1,
         }
     }
@@ -551,6 +553,30 @@ mod tests {
         assert!(
             content.contains("sessions/sid/out.stdout.out"),
             "截断提示应带上完整输出相对路径：{content}"
+        );
+    }
+
+    #[test]
+    fn approval_records_are_not_projected_and_do_not_break_pairing() {
+        let records = vec![
+            Record::user("你好"),
+            Record::ai("m", "h", "", None),
+            Record::tool_call(ToolOrigin::Ai, "c1", "echo", None),
+            Record::approval_pending("c1", "echo", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Approve),
+            result("c1", "OUT"),
+        ];
+        let messages = render(&records);
+        assert_eq!(
+            roles(&messages),
+            ["user", "assistant", "tool"],
+            "审批记录不得产出消息：{messages:?}"
+        );
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(
+            messages[2].content.as_deref(),
+            Some("OUT"),
+            "审批记录不得改变 assistant/tool 配对"
         );
     }
 

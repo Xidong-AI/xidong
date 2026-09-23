@@ -35,6 +35,14 @@ pub enum DisplayItem {
     },
     /// 工具输出。
     ToolOutput { stdout: String, stderr: String },
+    /// 待批工具调用（阶段 2）：命令与命中的规则。
+    ApprovalPending {
+        call_id: String,
+        command: String,
+        matched_rule: String,
+    },
+    /// 审批决策（阶段 2）：`approved` 为真表示已批准。
+    ApprovalResolved { call_id: String, approved: bool },
 }
 
 /// 展示条目的接收端。
@@ -87,6 +95,16 @@ pub fn items(records: &[Record]) -> Vec<DisplayItem> {
             Record::ToolResult(result) => items.push(DisplayItem::ToolOutput {
                 stdout: result.stdout.clone(),
                 stderr: result.stderr.clone(),
+            }),
+            // 审批记录不参与模型消息投影，但要在 stderr 展示待批与决策（阶段 2）。
+            Record::ApprovalPending(pending) => items.push(DisplayItem::ApprovalPending {
+                call_id: pending.call_id.clone(),
+                command: pending.command.clone(),
+                matched_rule: pending.matched_rule.clone(),
+            }),
+            Record::ApprovalResolved(resolved) => items.push(DisplayItem::ApprovalResolved {
+                call_id: resolved.call_id.clone(),
+                approved: resolved.decision == yaa_msg::ApprovalDecision::Approve,
             }),
             // `tool_call(origin=user)` 不产出条目。
             _ => {}
@@ -331,6 +349,28 @@ mod tests {
                     "<注释>\n头尾\n</注释>\n[truncated] 仅保留头尾输出，完整内容见输出文件 sessions/sid/outputs/01J.stdout.out。"
                         .to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn approval_records_project_display_items() {
+        let records = vec![
+            Record::approval_pending("c1", "echo hi", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Deny),
+        ];
+        assert_eq!(
+            items(&records),
+            vec![
+                DisplayItem::ApprovalPending {
+                    call_id: "c1".to_string(),
+                    command: "echo hi".to_string(),
+                    matched_rule: "echo *".to_string(),
+                },
+                DisplayItem::ApprovalResolved {
+                    call_id: "c1".to_string(),
+                    approved: false,
+                },
+            ]
         );
     }
 
