@@ -172,17 +172,22 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse> {
         .or_else(|| message.get("reasoning").and_then(|value| value.as_str()))
         .map(str::to_string);
 
-    let tool_calls = message
-        .get("tool_calls")
-        .and_then(|value| value.as_array())
-        .map(|calls| {
+    // `tool_calls` 缺失或为 `null` 视为空列表；一旦是数组，则其中任一元素都必须
+    // 成功反序列化，否则报错并指明元素索引——不静默丢弃非法工具调用。
+    let tool_calls = match message.get("tool_calls") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(value) => {
+            let calls = value.as_array().context("模型响应的 tool_calls 不是数组")?;
             calls
                 .iter()
-                .cloned()
-                .filter_map(|call| serde_json::from_value::<AssistantToolCall>(call).ok())
-                .collect()
-        })
-        .unwrap_or_default();
+                .enumerate()
+                .map(|(index, call)| {
+                    serde_json::from_value::<AssistantToolCall>(call.clone())
+                        .with_context(|| format!("模型返回的第 {} 个 tool_call 非法", index + 1))
+                })
+                .collect::<Result<Vec<_>>>()?
+        }
+    };
 
     let finish_reason = choice
         .get("finish_reason")
@@ -545,6 +550,99 @@ model = "m"
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "shell");
         assert_eq!(response.tool_calls[0].arguments, "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn parse_tool_call_with_object_arguments_fails() {
+        // 模型偶尔把 `arguments` 返回为 JSON 对象而非字符串：不得静默丢弃。
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": {"command": "ls"}}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let err = parse_response(&body).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains('1'), "错误信息应指明元素索引：{text}");
+    }
+
+    #[test]
+    fn parse_tool_call_missing_id_or_function_fails() {
+        let missing_id = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"command\":\"ls\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert!(parse_response(&missing_id).is_err());
+
+        let missing_function = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{"id": "call_1", "type": "function"}]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert!(parse_response(&missing_function).is_err());
+    }
+
+    #[test]
+    fn parse_tool_calls_valid_still_parses() {
+        let body = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": "{\"command\":\"ls\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = parse_response(&body).unwrap();
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].id, "call_1");
+        assert_eq!(response.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_tool_calls_missing_or_null_is_empty() {
+        let missing = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "你好"},
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(parse_response(&missing).unwrap().tool_calls.is_empty());
+
+        let null = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "你好", "tool_calls": null},
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(parse_response(&null).unwrap().tool_calls.is_empty());
     }
 
     #[test]
