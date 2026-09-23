@@ -179,9 +179,25 @@ pub fn archive(session: &Session, history_root: &Path, ts: i64) -> Result<PathBu
 
     let target_dir = history_root.join(&sid);
     fs::create_dir_all(&target_dir)?;
-    let target = target_dir.join(format!("sessions-{ts}.jsonl"));
+    let target = unique_archive_path(&target_dir, ts);
     fs::rename(&session.file, &target)?;
     Ok(target)
+}
+
+/// 归档目标路径：`sessions-<ts>.jsonl` 已存在时追加 `-<n>`（n 从 1 递增），
+/// 不再静默覆盖同一毫秒内的既有归档。
+fn unique_archive_path(target_dir: &Path, ts: i64) -> PathBuf {
+    let target = target_dir.join(format!("sessions-{ts}.jsonl"));
+    if !target.exists() {
+        return target;
+    }
+    for n in 1u32.. {
+        let candidate = target_dir.join(format!("sessions-{ts}-{n}.jsonl"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    unreachable!("u32 序号耗尽不应发生")
 }
 
 /// 裸文件名会话的 sid 兜底：绝对路径的 sha256 前 32 位十六进制。
@@ -362,6 +378,35 @@ mod tests {
         assert!(target.exists());
         assert_eq!(target, history.join("abc").join("sessions-1234.jsonl"));
         assert_eq!(load(&Session::new(target)).unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn archive_twice_same_ts_does_not_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let sid_dir = dir.path().join("sessions").join("abc");
+        fs::create_dir_all(&sid_dir).unwrap();
+        let history = dir.path().join("history");
+
+        let first_session = Session::new(sid_dir.join("default.jsonl"));
+        let first_record = Record::user("第一次");
+        append(&first_session, std::slice::from_ref(&first_record)).unwrap();
+        let first = archive(&first_session, &history, 1234).unwrap();
+        assert_eq!(first, history.join("abc").join("sessions-1234.jsonl"));
+
+        let second_session = Session::new(sid_dir.join("default.jsonl"));
+        let second_record = Record::user("第二次");
+        append(&second_session, std::slice::from_ref(&second_record)).unwrap();
+        let second = archive(&second_session, &history, 1234).unwrap();
+        assert_eq!(second, history.join("abc").join("sessions-1234-1.jsonl"));
+
+        assert!(first.exists(), "首次归档不应被覆盖");
+        assert!(second.exists(), "同 ts 的第二次归档应追加序号");
+        let first_loaded = load(&Session::new(first)).unwrap();
+        let second_loaded = load(&Session::new(second)).unwrap();
+        assert_eq!(first_loaded.len(), 1);
+        assert_eq!(second_loaded.len(), 1);
+        assert_eq!(first_loaded[0], first_record, "首次归档内容应保持独立");
+        assert_eq!(second_loaded[0], second_record, "第二次归档内容应保持独立");
     }
 
     #[test]
