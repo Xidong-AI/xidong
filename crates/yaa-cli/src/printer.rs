@@ -6,7 +6,8 @@
 //!   最终助手文本只走 stdout；
 //! - `--verbose`：在默认之上追加模型思考、命令输出与注入内容全文；
 //! - `--quiet`：抑制全部过程输出，但**致命错误与运维警告仍打印到 stderr**
-//!   （否则用户看不到失败或配置回退的原因）。
+//!   （否则用户看不到失败或配置回退的原因）；待批清单亦豁免——退出码 6 是本次运行的
+//!   唯一结论，用户必须知道发生了什么。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,6 +48,17 @@ impl StderrSink {
         }
     }
 
+    /// 该条目是否不受 `--quiet` 抑制。
+    ///
+    /// `Error`/`Notice` 是诊断信息；`ApprovalPending` 是本次运行的唯一结论（退出码 6），
+    /// 三者即便在 `--quiet` 下也必须可见。其余过程输出一律抑制。
+    fn visible_in_quiet(item: &DisplayItem) -> bool {
+        matches!(
+            item,
+            DisplayItem::Error(_) | DisplayItem::Notice(_) | DisplayItem::ApprovalPending { .. }
+        )
+    }
+
     /// 在块内打印一段文本：空串不打印，非空内容保证以换行结尾。
     fn write_block_text(text: &str) {
         if text.is_empty() {
@@ -61,14 +73,16 @@ impl StderrSink {
 
 impl Sink for StderrSink {
     fn emit(&self, item: DisplayItem) {
+        // `--quiet` 抑制过程输出，但 Error/Notice 与待批清单豁免（见 `visible_in_quiet`）。
+        if self.quiet && !Self::visible_in_quiet(&item) {
+            return;
+        }
         match item {
             // 致命错误优先于 `--quiet`：失败原因必须对用户可见。
             DisplayItem::Error(text) => eprintln!("{text}"),
             // 运维警告（配置缺失、工作目录回退、钩子 stderr 等）同样不受 `--quiet`
             // 抑制：它们是诊断信息而非过程记录。不参与块分隔，避免卷入过程记录。
             DisplayItem::Notice(text) => eprintln!("{text}"),
-            // `--quiet` 抑制其余全部过程输出。
-            _ if self.quiet => {}
             // 注入与工具调用同构：默认摘要显示注释与命令，`--verbose` 追加内容全文。
             DisplayItem::Injection {
                 comment,
@@ -167,6 +181,39 @@ fn approval_resolved_title(call_id: &str, approved: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending() -> DisplayItem {
+        DisplayItem::ApprovalPending {
+            call_id: "call_1".to_string(),
+            command: "echo hi".to_string(),
+            matched_rule: "echo *".to_string(),
+        }
+    }
+
+    #[test]
+    fn quiet_exempts_errors_notices_and_pending_only() {
+        assert!(StderrSink::visible_in_quiet(&DisplayItem::Error(
+            "失败".to_string()
+        )));
+        assert!(StderrSink::visible_in_quiet(&DisplayItem::Notice(
+            "警告".to_string()
+        )));
+        assert!(
+            StderrSink::visible_in_quiet(&pending()),
+            "待批清单是退出码 6 的唯一结论，必须可见"
+        );
+        assert!(!StderrSink::visible_in_quiet(
+            &DisplayItem::ApprovalResolved {
+                call_id: "call_1".to_string(),
+                command: "echo hi".to_string(),
+                approved: true,
+            }
+        ));
+        assert!(!StderrSink::visible_in_quiet(&DisplayItem::ToolCall {
+            description: None,
+            command: "echo hi".to_string(),
+        }));
+    }
 
     #[test]
     fn approval_resolved_title_includes_call_id() {
