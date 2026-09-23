@@ -216,31 +216,76 @@ fn push_segment(segments: &mut Vec<String>, current: &mut String) {
 }
 
 /// 循环剥离段首的 `VAR=val` 环境赋值，返回剩余命令（已 trim）。
+///
+/// 赋值取值可能是带引号的串（`FOO="a b"`），其中空白不构成 token 边界，故不能简单
+/// 取「首个空白前的 token」；解析见 [`env_assignment_end`]。
 fn strip_env_prefix(segment: &str) -> &str {
     let mut rest = segment.trim();
-    loop {
-        let end = rest
-            .char_indices()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(index, _)| index)
-            .unwrap_or(rest.len());
-        let token = &rest[..end];
-        match token.split_once('=') {
-            Some((name, _)) if is_env_name(name) => rest = rest[end..].trim_start(),
-            _ => break,
-        }
+    while let Some(end) = env_assignment_end(rest) {
+        rest = rest[end..].trim_start();
     }
     rest
 }
 
-/// 环境变量名：`[A-Za-z_][A-Za-z0-9_]*`。
-fn is_env_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
+/// 若 `text` 以 `NAME=value` 赋值开头，返回该赋值消耗的字节数，否则 `None`。
+///
+/// `NAME` 为 `[A-Za-z_][A-Za-z0-9_]*`；`value` 允许单/双引号包裹（引号内空白不算
+/// 边界），未加引号时以引号外的空白为界。引号不配平返回 `None`（交由整体 ask）。
+fn env_assignment_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !matches!(bytes.first(), Some(b) if b.is_ascii_alphabetic() || *b == b'_') {
+        return None;
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let mut i = 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'=') {
+        return None;
+    }
+    skip_env_value(bytes, i + 1)
+}
+
+/// 从 `i` 起跳过一个 shell 取值，返回其结束的字节下标；引号不配平返回 `None`。
+fn skip_env_value(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let (mut in_single, mut in_double) = (false, false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            i += 1;
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'\\' {
+                i += 2;
+            } else {
+                i += 1;
+                if b == b'"' {
+                    in_double = false;
+                }
+            }
+        } else {
+            match b {
+                b'\'' => {
+                    in_single = true;
+                    i += 1;
+                }
+                b'"' => {
+                    in_double = true;
+                    i += 1;
+                }
+                b'\\' => i += 2,
+                c if c.is_ascii_whitespace() => break,
+                _ => i += 1,
+            }
+        }
+    }
+    if in_single || in_double {
+        None
+    } else {
+        Some(i.min(bytes.len()))
+    }
 }
 
 #[cfg(test)]
@@ -429,5 +474,23 @@ mod tests {
         let rules = [rule("echo *", Action::Ask)];
         assert_eq!(action_of(&rules, "echo hi 2>&1"), Action::Ask);
         assert_eq!(action_of(&rules, "echo hi"), Action::Ask);
+    }
+
+    #[test]
+    fn quoted_env_prefix_is_stripped() {
+        // P2：`FOO="a b"` 的取值含空白，不能只取到首个空白。
+        let rules = [rule("echo *", Action::Ask)];
+        assert_eq!(action_of(&rules, r#"FOO="a b" echo bypass"#), Action::Ask);
+        assert_eq!(action_of(&rules, r#"FOO='a b' echo bypass"#), Action::Ask);
+        let rules_git = [rule("git *", Action::Ask)];
+        assert_eq!(
+            action_of(&rules_git, r#"GIT_SSH_COMMAND="ssh -i key" git push"#),
+            Action::Ask
+        );
+        // D42 既有回归：无空白的引号取值同样成立。
+        assert_eq!(
+            action_of(&[rule("make", Action::Ask)], r#"LC_ALL="C.UTF-8" make"#),
+            Action::Ask
+        );
     }
 }
