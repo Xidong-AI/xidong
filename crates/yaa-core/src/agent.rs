@@ -191,19 +191,21 @@ impl Runner<'_> {
     {
         self.warn_cwd();
 
-        // 1. `llm` 钩子每次运行一次（不写记录）。
-        let llm_config = match self.resolve_llm_hook().await {
-            Ok(config) => config,
-            Err(exit) => return Ok(exit),
-        };
-
-        // 2. 取最旧未决 pending；没有则提示并成功返回。
+        // 1. 先取最旧未决 pending；没有则提示并成功返回。此路径**不解析 llm 钩子**，
+        //    否则钩子损坏时用户连「没有待批准」都看不到。
         let records = yaa_store::load(&self.session)?;
         let unresolved = unresolved_pending(&records);
         let Some((pending_index, pending)) = unresolved.into_iter().next() else {
             self.sink
                 .emit(DisplayItem::Notice("没有待批准的命令。".to_string()));
             return Ok(ExitCode::Success);
+        };
+
+        // 2. 有 pending 才解析 `llm` 钩子（每次运行一次，不写记录）；失败以配置错误
+        //    退出，且尚未执行任何命令。
+        let llm_config = match self.resolve_llm_hook().await {
+            Ok(config) => config,
+            Err(exit) => return Ok(exit),
         };
         let model = make_model(llm_config);
 
@@ -1786,6 +1788,73 @@ mod tests {
                         && resolved.decision == ApprovalDecision::Approve
             )),
             "应补 approval_resolved: approve：{records:?}"
+        );
+    }
+
+    /// R4：无未决 pending 时不得解析 `llm` 钩子（钩子损坏也应成功提示）。
+    #[tokio::test]
+    async fn approve_without_pending_skips_llm_hook() {
+        let mut config = approval_config("echo *", Action::Ask);
+        config.hooks.llm = "exit 3".to_string();
+        let harness = Harness::new(config);
+        let sink = RecordingSink::default();
+        let model = FakeModel::new(vec![]);
+
+        let exit = harness
+            .runner(&sink)
+            .approve_pending(|_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            exit,
+            ExitCode::Success,
+            "没有待批时不应因 llm 钩子损坏而退出配置错误"
+        );
+        assert!(
+            sink.items().iter().any(|item| matches!(
+                item,
+                DisplayItem::Notice(text) if text.contains("没有待批准")
+            )),
+            "应提示没有待批准：{:?}",
+            sink.items()
+        );
+    }
+
+    /// R4：有 pending 但 `llm` 钩子损坏时以配置错误退出，且不执行任何命令。
+    #[tokio::test]
+    async fn approve_with_pending_and_broken_llm_hook_does_not_execute() {
+        let mut config = approval_config("echo *", Action::Ask);
+        config.hooks.llm = "exit 3".to_string();
+        let harness = Harness::new(config);
+        let sink = NullSink;
+        yaa_store::append(
+            &harness.session,
+            &[
+                Record::tool_call(ToolOrigin::Ai, "call_1", "echo hi", None),
+                Record::approval_pending("call_1", "echo hi", "echo *"),
+            ],
+        )
+        .unwrap();
+        let before = harness.records().len();
+
+        let model = FakeModel::new(vec![]);
+        let exit = harness
+            .runner(&sink)
+            .approve_pending(|_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Config);
+        assert_eq!(
+            harness.records().len(),
+            before,
+            "llm 钩子失败时不得执行命令或写记录"
+        );
+        assert!(
+            !harness
+                .records()
+                .iter()
+                .any(|r| matches!(r, Record::ToolResult(_) | Record::ApprovalResolved(_))),
+            "不得补 tool_result / approval_resolved"
         );
     }
 }
