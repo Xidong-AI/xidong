@@ -2,6 +2,11 @@
 //!
 //! 读取线程通过 channel 交付结果，主线程只用带截止期的 `recv_timeout` 等待，因此
 //! 无论后台进程是否攥住管道，`run_blocking` 都保证在硬上限内返回。
+//!
+//! `timed_out` 只在**真正超出时限**（`start.elapsed() >= deadline`）时置真；逃逸出
+//! 本进程组、仍持有管道的后台进程会导致输出在读取宽限期后被放弃（回填占位提示），
+//! 但这不等于超时，不置 `timed_out`。长任务应自行 `nohup <cmd> >/dev/null 2>&1 &`
+//! 脱离工具管道，而不是依赖读取宽限。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -17,6 +22,8 @@ use crate::{ShellCommand, ShellError, ShellLimits, ShellOutput};
 /// 直接子进程退出后，等待两个读取线程交付结果的宽限期。
 // PJ568 方案：这是读取线程等待的硬上限。代价是「逃逸出本进程组、仍持有
 // stdout/stderr 管道」的进程输出会被放弃（丢失），换取向调用方保证永不挂起。
+// 放弃**不**等价于超时：`timed_out` 只表示命令真的超出时限（见 `run_blocking`），
+// 被放弃的流以占位文本自解释，调用方据此区分「超时击杀」与「后台进程攥管道」。
 // 升级路径：若需回收这类输出，可给读取端保留一份可主动 close 的管道副本以强制
 // 解除阻塞，或用 pidfd + 超时轮询逐个回收逃逸进程，再读尽管道。
 const READER_GRACE: Duration = Duration::from_secs(2);
@@ -114,11 +121,10 @@ pub(crate) fn run_blocking(
         }
     }
 
-    let (stdout, stdout_abandoned) = resolve_stream(out_result, "stdout")?;
-    let (stderr, stderr_abandoned) = resolve_stream(err_result, "stderr")?;
-    if stdout_abandoned || stderr_abandoned {
-        timed_out = true;
-    }
+    // 被放弃的流只回填占位文本，**不**把 `timed_out` 置真：逃逸进程组攥住管道并非
+    // 超时，误报会让调用方以为命令被超时击杀（T5）。
+    let (stdout, _stdout_abandoned) = resolve_stream(out_result, "stdout")?;
+    let (stderr, _stderr_abandoned) = resolve_stream(err_result, "stderr")?;
 
     let truncated = stdout.truncated || stderr.truncated;
     let canonical = |path: Option<PathBuf>| path.map(|p| std::fs::canonicalize(&p).unwrap_or(p));

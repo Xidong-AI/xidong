@@ -188,6 +188,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn escaped_process_group_output_is_abandoned_without_timeout_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut limits = limits();
+        // 远大于读取宽限（2s + 1s），确保返回不是超时分支。
+        limits.timeout_secs = 30;
+
+        // `setsid` 让后台进程脱离本进程组并新建会话，仍继承 stdout/stderr 管道：
+        // 直接子进程 sh 立即退出，但管道被攥住，读取在宽限期后被放弃。
+        let start = Instant::now();
+        let out = run(&cmd("setsid sleep 30 &"), &limits, dir.path())
+            .await
+            .unwrap();
+
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(6),
+            "应在读取宽限内返回，实际耗时 {:?}",
+            start.elapsed()
+        );
+        assert_eq!(out.code, 0, "直接子进程 sh 正常退出");
+        assert!(!out.timed_out, "逃逸进程攥管道只放弃输出，不表示真的超时");
+        assert!(
+            out.stdout.contains("读取超时") || out.stderr.contains("读取超时"),
+            "被放弃的流仍须以占位文本自解释：stdout={:?} stderr={:?}",
+            out.stdout,
+            out.stderr
+        );
+    }
+
+    #[tokio::test]
     async fn stdin_is_null_so_cat_exits() {
         let dir = tempfile::tempdir().unwrap();
         let start = Instant::now();
