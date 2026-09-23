@@ -77,7 +77,7 @@ Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook 
 2. The **`llm` hook** runs once per invocation; its stdout is parsed into the model provider configuration. It is never persisted and never enters the context.
 3. **Layered rendering**: injections before the first `user` merge into one `system` message as a stable prefix; later out-of-band notifications merge into the adjacent `user`, keeping the prefix untouched.
 4. **Main loop**: re-read history → render to model messages → call the model → run the shell tool → record the result, until the model stops calling tools or `max_steps` is reached.
-5. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded. A `--notify` command reuses the same truncation and dump path, while the stdin form truncates at the limit. Limit precedence: `--notify-timeout` → `YAA_NOTIFY_*` env vars → `[shell]` → defaults.
+5. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded. Both `--notify` forms (command and stdin) reuse the same truncation and dump path. Limit precedence: `--notify-timeout` → `YAA_NOTIFY_*` env vars → `[shell]` → defaults.
 6. **Command visibility**: a notification's replayable command enters the model context with an `[执行命令]` prefix, telling the model which command produced it.
 
 ## Layout

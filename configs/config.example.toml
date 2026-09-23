@@ -22,7 +22,7 @@ llm = "cat $YAA_CONFIG_HOME/llm.toml"
 timeout_secs = 30
 
 [shell]
-# 工具命令与 `yaa --notify` 命令共用本节限额：`--notify` 的解析优先级为
+# 工具命令与 `yaa --notify`（命令与 stdin 两形态）共用本节限额：`--notify` 的解析优先级为
 # `--notify-timeout` → `YAA_NOTIFY_*` 环境变量 → 本节 → 默认。
 # 单条命令超时（秒）。
 timeout_secs = 120

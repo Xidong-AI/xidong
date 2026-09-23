@@ -37,10 +37,11 @@
 | D29 | 「展示与模型消息同源」（D15）显式承认豁免：`reasoning` 与展示专用的块标记/标题不计入一致性不变量 | `reasoning` 落盘且展示，但是否投影由 `endpoint_format` 决定；块标记（`# `、`% `、`---`、`# 思考`）只服务终端排版。通知的 `command` 与工具调用的 `description` 现已同时出现在两侧（D31），不再豁免 |
 | D30 | 默认 `init` 钩子中「用户总提示词」改为「文件存在才 `--notify`」，且脚本首行加 `set -e` | 原草案无条件 notify，`AGENTS.md` 缺失时会注入空信封，浪费 token；`set -e` 避免「前两条 notify 失败、末条成功 ⇒ 整钩子退出 0 却被当成功」 |
 | D31 | 通知的 `command` 进入模型上下文：投影 `system` 时在最前拼 `[执行命令] <command>` | 命令是通知的因果来源，模型需要知道它从何而来；展示层仍以 `% 命令` 呈现，同一字段因此同时服务展示与上下文 |
-| D32 | `system` 记录新增可选 `output_files`（与 `tool_result` 同构，字段顺序 `command?` 之后、`content` 之前） | `--notify` 复用 `yaa-exec` 后会截断并落盘完整输出，需要一个与 `tool_result` 一致的路径载体；旧记录缺该字段解析为 `None`，不得报错 |
+| D32 | `system` 记录新增可选 `output_files`（与 `tool_result` 同构，字段顺序 `command?` 之后、`content` 之前） | `--notify` 的命令与 stdin 两种形态复用 `yaa-exec` 的截断/落盘后都需要一个与 `tool_result` 一致的路径载体；旧记录缺该字段解析为 `None`，不得报错 |
 | D33 | `--notify` 的 `--` 形态复用 `yaa-exec`：截断 + 完整输出落盘 + 退出码沿用 + stderr 透传；`command` 改为 **shell 转义后的可重放命令** | 原实现 `Command::new(program).args` 绕过 shell、不截断也不落盘，`command` 只是展示摘要；统一执行路径后通知与工具行为一致，且命令可重放，`output_files` 得以成立 |
 | D34 | `archive` 的 `sessions-<ts>.jsonl` 已存在时改为 `sessions-<ts>-<n>.jsonl`（n 从 1 递增） | 同毫秒连续归档会静默覆盖，破坏「归档即不可变历史」 |
 | D35 | `timed_out` 只表示真正超出时限；读取宽限内放弃流只回填占位提示，不再 promote 为超时 | 逃逸进程组攥住管道与命令超时是两回事，误报会让调用方以为命令被超时击杀 |
+| D36 | `--notify` 的 stdin 形态复用 `yaa-exec::capture_reader`（同一 `Sink`/`FullOutput`） | 与 `--` 形态保持同一截断标记与落盘语义，避免两套实现漂移；超限时同样产生 `output_files.stdout`，内存仍有界 |
 
 > D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。
 
@@ -62,7 +63,7 @@
 12. **`ai` 记录含 `reasoning`，思考内容按端点格式回传**（`design.md:38,42` 的示例未列）。`design.md:63` 把压缩参考 DSH，而 DSH 的思考模型适配证明该字段必须可回传。更正为：`ai` 新增可选 `reasoning`，落盘、可展示；`[llm] endpoint_format` 决定它是否作为 assistant 消息顶层 `reasoning_content` 回传——`deepseek`/`kimi`/`qwen`/`glm` 在请求带 `tools` 时即使思考为空也必须发 `""`，`openai` 不回传。
 13. **注入分组的方向**。`design.md:57` 只说「与相邻 `user` 事件合并」，未定义方向。更正为**双向最大连续段**：首条 `user` 起，`user` 与 `system(notify)` 的最大连续段合并为一条 `user`（`\n\n` 分隔，物理顺序）。
 14. **通知的 `command` 进入上下文**（`design.md:48` 称「只用于展示，不进入上下文」）。更正为：投影 `system` 时把 `command` 以 `[执行命令] <command>` 前缀置于正文最前（D31）；`command` 现为 shell 转义后的**可重放命令**，不再是「仅展示摘要」。展示层仍以 `% 命令` 呈现，且不重复拼该前缀。
-15. **`--notify` 与 `shell` 工具同一条执行路径**（`design.md` 只把截断/落盘描述给工具结果）。更正为：`--notify --` 形态同样经 `yaa-exec` 截断、把完整输出落盘为 `output_files`，通知因此可携带丢失的完整内容；限额解析链见「配置与钩子协议」规则 8。`timed_out` 语义见 D35。
+15. **`--notify` 与 `shell` 工具同一条执行路径**（`design.md` 只把截断/落盘描述给工具结果）。更正为：`--notify` 的 `--` 与 stdin 两种形态都经 `yaa-exec` 的截断/落盘策略（`run` 与 `capture_reader`），把完整输出落盘为 `output_files`，通知因此可携带丢失的完整内容；限额解析链见「配置与钩子协议」规则 8。`timed_out` 语义见 D35。
 
 ## 目标架构（阶段 1）
 
@@ -153,7 +154,7 @@ max_tokens  = 4096
 5. **`yaa --get-prompt system` 必须在加载 config、解析会话、执行任何钩子之前短路**，只打印内置模板。否则 `init` 钩子内部调用它会形成递归环。补一条递归防护测试。
 6. 钩子输出有**独立上限**（不复用 Shell 的截断）：超限直接报错退出，绝不静默裁掉提示词。
 7. 钩子执行有**硬超时**，并以进程组方式整组击杀（与 Shell 同一套方案），避免配置钩子挂死拖住 `yaa`。
-8. **`yaa --notify` 写入协议**：`yaa --notify="注释" -- cmd` 把 argv 逐个作 POSIX 单引号转义（简单 token 不加引号，含特殊字符/空格/单引号者用单引号并转义内部单引号）后经 `yaa-exec` 执行，**复用 Shell 的截断与完整输出落盘**：正文 `body` 取被截断的 stdout，stderr 原样透传到 yaa 的 stderr，退出码沿用 cmd 的退出码（被信号杀死或超时按 1）；超限时 `output_files` 记录相对数据根的完整输出路径。`command` 记为上述**转义后可重放**的命令串；`cmd | yaa --notify="注释"` 从 stdin 读到 `max_stream_chars` 上限（超出即截断、附说明、无 `output_files`），无 `command`；注释缺省「由用户执行」。写入一条 `system { source: "notify", command?, output_files?, content: "<注释>\n<内容>\n</注释>" }`，原子追加到目标会话。
+8. **`yaa --notify` 写入协议**：`yaa --notify="注释" -- cmd` 把 argv 逐个作 POSIX 单引号转义（简单 token 不加引号，含特殊字符/空格/单引号者用单引号并转义内部单引号）后经 `yaa-exec` 执行，**复用 Shell 的截断与完整输出落盘**：正文 `body` 取被截断的 stdout，stderr 原样透传到 yaa 的 stderr，退出码沿用 cmd 的退出码（被信号杀死或超时按 1）；超限时 `output_files` 记录相对数据根的完整输出路径。`command` 记为上述**转义后可重放**的命令串；`cmd | yaa --notify="注释"` 从 stdin 读取并**复用同一套截断/落盘策略**（`yaa-exec::capture_reader`）：未超限为全量正文，超限时正文为头尾拼接并带 `... [truncated] ...` 标记、完整输入落盘并记入 `output_files.stdout`，无 `command`；注释缺省「由用户执行」。写入一条 `system { source: "notify", command?, output_files?, content: "<注释>\n<内容>\n</注释>" }`，原子追加到目标会话。
    - **限额解析优先级**（高→低）：`--notify-timeout`（仅超时）→ 环境变量 `YAA_NOTIFY_TIMEOUT_SECS` / `YAA_NOTIFY_MAX_STREAM_CHARS` / `YAA_NOTIFY_HEAD_CHARS` / `YAA_NOTIFY_TAIL_CHARS`（能解析为数字才生效）→ 配置文件 `[shell]`（路径同 `--config`/默认；读取或解析失败只打警告到 stderr 并用默认值，**绝不让 notify 失败**）→ 内置默认。
    - `shell` 工具执行时把本次调用的限额以这 4 个 `YAA_NOTIFY_*` 变量注入子进程，使工具内嵌的 `yaa --notify` 采用同一套参数（调用者透传）。
    - 目标解析顺序 `--session` → `YAA_SESSION` → 当前 cwd 默认会话（跨会话显式 `--to` 见阶段 5）。
@@ -177,7 +178,7 @@ system      { type, id, ts, source, command?, output_files?, content }
 - `ai` 与其后紧跟的 `tool_call(origin=ai)` 记录构成一个助手步骤，**两者以单次缓冲原子追加**（见下）。
 - `system.source` 目前有 `notify`（`yaa --notify` 写入的通知，正文内联 `<注释>` 信封）与 `init`（初始化簿记，空内容不渲染）。
 - 可选 `command` 是产生该通知的 **shell 转义后可重放命令**（`sh -c` 重放等价原 argv；简单 token 不加引号，含特殊字符者用单引号并转义内部单引号）。展示层以 `% 命令` 呈现，投影时以 `[执行命令] <command>` 前缀进入上下文（D31）；stdin 形态与簿记无此字段。
-- 可选 `output_files` 与 `tool_result` 同构（相对数据根），承载 `--notify` 命令超限截断后落盘的完整输出；正文自身只含 `yaa-exec` 的头尾截断标记，截断提示与相对路径由投影层 `display::system_text` 追加（D32）。旧记录缺该字段解析为 `None`。
+- 可选 `output_files` 与 `tool_result` 同构（相对数据根），承载 `--notify`（命令或 stdin）超限截断后落盘的完整输出；正文自身只含 `yaa-exec` 的头尾截断标记，截断提示与相对路径由投影层 `display::system_text` 追加（D32）。旧记录缺该字段解析为 `None`。
 - `ai.reasoning` 为可选思考内容，落盘、可由 `--verbose` 展示，并按 `endpoint_format` 决定是否回传（D23/D24）。
 - 相对旧 schema 的移除项见 D21。
 - `approval_pending`/`approval_resolved` 阶段 2 引入。
@@ -340,7 +341,7 @@ yaa --quiet                  # 只打印最终回复
 10. 初始化只展示一次：首次运行 stderr 出现三个注入块（默认 `# 注释` + `% 命令` 摘要，`--verbose` 追加内容全文）；第二次运行不再出现。
 11. `llm` 钩子不写任何记录、不出现在 stderr（默认与 `--verbose` 均不展示）。
 12. `--get-prompt user` 为用法错误（退出码 2）；`--get-prompt system` 输出的工具 section 与 `tools::shell` 的 schema 名称/参数一致（防漂移）。
-13. `--notify` 两形态与限额：`yaa --notify="注释" -- cmd` 写入 `system(source=notify)`，`command` 为 shell 转义后的可重放命令，超限时经 `yaa-exec` 截断、正文含头尾标记且 `output_files.stdout` 为相对数据根的路径；`cmd | yaa --notify="注释"` 写入同名记录但不含 `command`、按 `YAA_NOTIFY_MAX_STREAM_CHARS` 截断且无 `output_files`；两者正文均为 `<注释>…</注释>`。再断言：`--notify-timeout` 生效（超时按 1 退出并提示）、环境变量与 `[shell]` 的限额解析链生效、命令对模型可见（第二跳请求含 `[执行命令]` 前缀）、旧 `system` 记录缺 `output_files` 仍可解析。
+13. `--notify` 两形态与限额：`yaa --notify="注释" -- cmd` 写入 `system(source=notify)`，`command` 为 shell 转义后的可重放命令，超限时经 `yaa-exec` 截断、正文含头尾标记且 `output_files.stdout` 为相对数据根的路径；`cmd | yaa --notify="注释"` 写入同名记录但不含 `command`、复用同一截断/落盘策略（超限时正文含头尾标记且完整输入落盘为 `output_files.stdout`，短输入无 `output_files`）；两者正文均为 `<注释>…</注释>`。再断言：`--notify-timeout` 生效（超时按 1 退出并提示）、环境变量与 `[shell]` 的限额解析链生效、命令对模型可见（第二跳请求含 `[执行命令]` 前缀）、旧 `system` 记录缺 `output_files` 仍可解析。
 14. 思考回传：`--verbose` 展示 `ai.reasoning`；`endpoint_format="deepseek"` 时第二跳请求体中带 `tool_calls` 的 assistant 消息含 `reasoning_content`（思考为空时值为 `""`），`endpoint_format="openai"` 时不含该字段。
 15. 会话目标：`yaa --session <path>` 在空会话触发 `init`，三条 notify 经 `YAA_SESSION` 写入该 `<path>`；旧 schema 会话由 `yaa --status` 报明确错误并提示 `--clear`（D26）。
 
@@ -368,7 +369,7 @@ pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前
 
 - 单元测试：记录序列化往返与 golden JSONL（含 `system.output_files` 与旧记录缺字段的兼容）；渲染分层（稳定前缀合并、双向最大连续段并入 `user`、失配兜底、`origin=user`、`system` 的 `[执行命令]` 前缀与截断提示）；`ai.reasoning` 与 `endpoint_format` 的出站序列化；store 追加/加载/归档（含同 ts 序号）/撕裂尾行/无法解析行报错；Shell 进程组、超时、流式截断、逃逸进程组放弃输出但不误报超时。
 - 思考回传测试：`endpoint_format` 为 `deepseek` 等时 assistant 消息含 `reasoning_content`（带 `tool_calls` 且思考为空时为 `""`），为 `openai` 时不含。
-- 通知测试：`--notify` 两种形态写入 `system(source=notify)` 与信封正文；`--` 形态记**转义后可重放**的 `command`、stdin 形态不记；注释缺省「由用户执行」；stderr 透传与退出码沿用；超限截断与 `output_files` 落盘；`--notify-timeout` 与环境变量/`[shell]` 限额解析链；`shell_quote` 重放等价；`tools::shell` 注入 `YAA_NOTIFY_*`。
+- 通知测试：`--notify` 两种形态写入 `system(source=notify)` 与信封正文；`--` 形态记**转义后可重放**的 `command`、stdin 形态不记；注释缺省「由用户执行」；stderr 透传与退出码沿用；两种形态超限截断与 `output_files` 落盘（命令流与 stdin 同一 `Sink`）；`--notify-timeout` 与环境变量/`[shell]` 限额解析链；`shell_quote` 重放等价；`tools::shell` 注入 `YAA_NOTIFY_*`。
 - 会话目标测试：hook 环境注入 `YAA_SESSION`；`--notify` 解析顺序 `--session` → `YAA_SESSION` → cwd 默认。
 - 初始化测试：无 `system(source=init)` 簿记时执行 `init` 并写簿记（含已有 `notify` 记录的会话）；已写簿记的会话不重跑；`init` 失败仍写 `user`、不写簿记且退出码为配置错误，改好后下次运行能重试成功。
 - 展示测试：展示条目 golden；首轮注入展示一次；默认摘要与 `--verbose` 全文两种形态；`--quiet` 抑制；`llm` 不产生记录。
