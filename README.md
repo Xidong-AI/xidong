@@ -58,6 +58,7 @@ yaa --status                      # 打印会话摘要
 yaa --get-prompt system           # 打印内置系统提示词模板
 yaa --notify="注释" -- cmd         # 执行 cmd，把 stdout 作为通知写入当前会话
 cmd | yaa --notify="注释"          # 从 stdin 读内容并写入通知
+yaa --notify-timeout 30 --notify="注释" -- cmd  # 覆盖该通知命令的超时（秒）
 yaa --cwd /path/to/project 你好    # 指定工作目录
 yaa --session /path/to/default.jsonl 你好
 yaa --config /path/to/config.toml 你好
@@ -76,7 +77,8 @@ yaa --quiet                       # 只打印最终回复
 2. **`llm` 钩子**每次运行执行一次，stdout 解析为模型供应配置；该内容不落盘、不进入上下文。
 3. **渲染分层**：首条 `user` 之前的注入合并为一条 `system` 消息作为稳定前缀；之后的离群通知并入相邻 `user`，不污染前缀。
 4. **主循环**：重读历史 → 渲染为模型消息 → 调用模型 → 执行 Shell 工具 → 记录结果，直到模型不再调用工具或达到 `max_steps`。
-5. **截断**：工具单流输出超过上限时中间截去，完整输出写入 `sessions/<sid>/outputs/`，记录中给出路径。
+5. **截断**：工具单流输出超过上限时中间截去，完整输出写入 `sessions/<sid>/outputs/`，记录中给出路径；`--notify` 命令复用同一套截断与落盘，stdin 形态按上限截断。限额解析优先级为 `--notify-timeout` → `YAA_NOTIFY_*` 环境变量 → `[shell]` → 默认。
+6. **命令可见**：通知记录的可重放命令会以 `[执行命令]` 前缀进入模型上下文，让模型知道通知由哪条命令产生。
 
 ## 目录结构
 
