@@ -349,8 +349,18 @@ impl Runner<'_> {
         extra_env: &[(String, String)],
         watermark: &mut usize,
     ) -> anyhow::Result<Option<ExitCode>> {
+        // R1：参数非法、工具名不符或命令为空者根本不可执行，绝不进入审批分支
+        // （否则 `--approve` 会把非法 pending 当合法命令执行，语义与 `--auto` 相反）。
+        // 落一条失败 `tool_result` 让模型下一跳可见，并继续循环、不退出。
+        if let Some(reason) = inexecutable_reason(call, parsed) {
+            let result = Record::tool_result(&call.id, "", &reason, -1, false, false, None);
+            self.append_and_emit(std::slice::from_ref(&result), watermark)
+                .await?;
+            return Ok(None);
+        }
+
         let verdict = self.evaluate_call(parsed);
-        // `matched_rule` 为 `None`（解析失败按 ask）时以空串落盘，展示层按无规则呈现。
+        // `matched_rule` 为 `None`（无规则命中）时以空串落盘，展示层按无规则呈现。
         let matched = verdict.matched_rule.clone().unwrap_or_default();
 
         match verdict.action {
@@ -410,17 +420,12 @@ impl Runner<'_> {
         Ok(None)
     }
 
-    /// 计算一次工具调用的审批裁决。
+    /// 计算一次**可执行**工具调用的审批裁决。
     ///
-    /// 工具参数解析失败（`parsed.error`）或解析后的命令为空时无法确定命令资源，
-    /// **绝不静默放行**，按 `ask` 处理（plan「审批」）。此时 `matched_rule` 为 `None`。
+    /// 不可执行调用（工具名不符、参数非法、命令为空）已在 [`Runner::gate_tool_call`]
+    /// 中直接落失败结果，不会到达此处；命令资源拆分失败（如引号不配平）由
+    /// [`approval::evaluate`] 内部按 `ask` 处理。
     fn evaluate_call(&self, parsed: &tools::shell::ParsedCall) -> approval::Verdict {
-        if parsed.error.is_some() || parsed.command.trim().is_empty() {
-            return approval::Verdict {
-                action: Action::Ask,
-                matched_rule: None,
-            };
-        }
         approval::evaluate(&self.config.approval.rules, &parsed.command)
     }
 
@@ -654,7 +659,31 @@ fn unresolved_pending(records: &[Record]) -> Vec<(usize, Pending)> {
         .collect()
 }
 
-/// 被拒工具结果的文案；无命中规则（解析失败按 ask 后人工拒绝）时不写规则。
+/// 判定一次 `origin=ai` 工具调用是否可执行；不可执行时返回失败原因。
+///
+/// 与「命令资源拆分失败按 ask 处理」区分：这里只拦工具名不符、参数 JSON 非法或
+/// `command` 字段缺失/为空，均为**结构上无法执行**的调用；引号不配平等拆分问题
+/// `parsed.error` 为 `None`，仍交由审批按 `ask` 处理。
+fn inexecutable_reason(
+    call: &crate::message::AssistantToolCall,
+    parsed: &tools::shell::ParsedCall,
+) -> Option<String> {
+    if call.name != tools::shell::NAME {
+        return Some(format!(
+            "不支持的工具：{}（阶段 1 仅有 shell）。",
+            call.name
+        ));
+    }
+    if let Some(error) = &parsed.error {
+        return Some(error.clone());
+    }
+    if parsed.command.trim().is_empty() {
+        return Some("命令为空，未执行。".to_string());
+    }
+    None
+}
+
+/// 被拒工具结果的文案；无命中规则（拆分失败按 ask 后人工拒绝）时不写规则。
 fn denied_result(rule: &str) -> String {
     if rule.is_empty() {
         "命令被审批规则拒绝。".to_string()
@@ -729,14 +758,19 @@ mod tests {
     }
 
     fn call_response(call_id: &str, arguments: &str) -> ChatResponse {
+        calls_response(vec![crate::message::AssistantToolCall {
+            id: call_id.to_string(),
+            name: tools::shell::NAME.to_string(),
+            arguments: arguments.to_string(),
+        }])
+    }
+
+    /// 一次回复携带多个工具调用（用于同批多 ask / 混合裁决测试）。
+    fn calls_response(calls: Vec<crate::message::AssistantToolCall>) -> ChatResponse {
         ChatResponse {
             content: None,
             reasoning: None,
-            tool_calls: vec![crate::message::AssistantToolCall {
-                id: call_id.to_string(),
-                name: tools::shell::NAME.to_string(),
-                arguments: arguments.to_string(),
-            }],
+            tool_calls: calls,
             finish_reason: Some("tool_calls".to_string()),
         }
     }
@@ -1326,43 +1360,144 @@ mod tests {
         );
     }
 
+    /// R1：未知工具名不是可执行调用，不得产生 pending，应落失败结果并继续循环。
     #[tokio::test]
-    async fn malformed_arguments_are_ask_not_silently_allowed() {
-        // 参数非法时 `parsed.command` 为空且带 error，必须按 ask 处理。
-        let harness = Harness::new(test_config("true"));
+    async fn unknown_tool_fails_without_pending() {
+        let harness = Harness::new(approval_config("touch *", Action::Ask));
         let sink = RecordingSink::default();
-        let model = FakeModel::new(vec![call_response("call_1", "not json")]);
+        let model = FakeModel::new(vec![
+            calls_response(vec![crate::message::AssistantToolCall {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                arguments: r#"{"path":"/etc/passwd"}"#.to_string(),
+            }]),
+            text_response("完成"),
+        ]);
 
         let exit = harness
             .runner(&sink)
             .run("你好", |_config| model.clone())
             .await
             .unwrap();
-        assert_eq!(exit, ExitCode::Pending, "解析失败不得静默放行");
+        assert_eq!(exit, ExitCode::Success, "不可执行调用不应以 6 退出");
+
+        let records = harness.records();
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r, Record::ApprovalPending(_))),
+            "未知工具不得产生 approval_pending"
+        );
+        let result = records
+            .iter()
+            .find_map(|r| match r {
+                Record::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("应落一条失败 tool_result");
+        assert_eq!(result.code, -1);
+        assert!(
+            result.stderr.contains("read_file"),
+            "失败文案应说明未知工具：{result:?}"
+        );
+    }
+
+    /// R1：`command` 缺失或非字符串导致解析失败时，同样不得产生 pending。
+    #[tokio::test]
+    async fn invalid_arguments_fail_without_pending() {
+        let harness = Harness::new(approval_config("touch *", Action::Ask));
+        let sink = RecordingSink::default();
+        let model = FakeModel::new(vec![
+            call_response("call_1", "not json"),
+            text_response("完成"),
+        ]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success, "非法参数不应以 6 退出");
+
+        let records = harness.records();
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r, Record::ApprovalPending(_))),
+            "非法参数不得产生 approval_pending"
+        );
+        let result = records
+            .iter()
+            .find_map(|r| match r {
+                Record::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("应落一条失败 tool_result");
+        assert_eq!(result.code, -1);
+        assert!(
+            result.stderr.contains("JSON") || result.stderr.contains("command"),
+            "失败文案应说明参数非法：{result:?}"
+        );
+    }
+
+    /// R1：命令为空白时不得产生 pending，也不得执行。
+    #[tokio::test]
+    async fn empty_command_fails_without_pending() {
+        let harness = Harness::new(approval_config("touch *", Action::Ask));
+        let sink = NullSink;
+        let model = FakeModel::new(vec![
+            call_response("call_1", r#"{"command":"   "}"#),
+            text_response("完成"),
+        ]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success);
+
+        let records = harness.records();
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r, Record::ApprovalPending(_))),
+            "空命令不得产生 approval_pending"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| matches!(r, Record::ToolResult(result) if result.code == -1)),
+            "空命令应落失败 tool_result"
+        );
+    }
+
+    /// R1(b)：引号不配平属「命令资源拆分失败」，`parsed.error` 为 `None`，仍须按 ask 处理。
+    #[tokio::test]
+    async fn unbalanced_quotes_in_command_still_ask() {
+        let harness = Harness::new(test_config("true"));
+        let sink = RecordingSink::default();
+        let model = FakeModel::new(vec![call_response(
+            "call_1",
+            r#"{"command":"echo \"oops"}"#,
+        )]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Pending, "拆分失败不得静默放行");
 
         let records = harness.records();
         let Record::ApprovalPending(pending) = records.last().unwrap() else {
             panic!("末条应为 approval_pending");
         };
-        assert_eq!(pending.matched_rule, "", "解析失败无命中规则");
+        assert_eq!(pending.matched_rule, "", "拆分失败无命中规则");
         assert!(
             !records.iter().any(|r| matches!(r, Record::ToolResult(_))),
-            "不得写 tool_result"
+            "ask 拦截不得写 tool_result"
         );
-    }
-
-    #[tokio::test]
-    async fn empty_command_is_ask() {
-        let harness = Harness::new(test_config("true"));
-        let sink = NullSink;
-        let model = FakeModel::new(vec![call_response("call_1", r#"{"command":""}"#)]);
-
-        let exit = harness
-            .runner(&sink)
-            .run("你好", |_config| model.clone())
-            .await
-            .unwrap();
-        assert_eq!(exit, ExitCode::Pending);
     }
 
     #[tokio::test]
