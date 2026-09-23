@@ -584,6 +584,24 @@ impl Runner<'_> {
         );
         // `init` 钩子内的 `yaa --notify` 子进程默认写回本会话（D25）。
         env.insert("YAA_SESSION".to_string(), session_path(&self.session));
+        // 把 `[shell]` 限额以 `YAA_NOTIFY_*` 注入钩子：钩子内的 `yaa --notify` 据此
+        // 采用与主进程相同的截断/超时参数，避免 `--config` 在外层生效、内层却回退默认（A6）。
+        env.insert(
+            "YAA_NOTIFY_TIMEOUT_SECS".to_string(),
+            self.config.shell.timeout_secs.to_string(),
+        );
+        env.insert(
+            "YAA_NOTIFY_MAX_STREAM_CHARS".to_string(),
+            self.config.shell.max_stream_chars.to_string(),
+        );
+        env.insert(
+            "YAA_NOTIFY_HEAD_CHARS".to_string(),
+            self.config.shell.head_chars.to_string(),
+        );
+        env.insert(
+            "YAA_NOTIFY_TAIL_CHARS".to_string(),
+            self.config.shell.tail_chars.to_string(),
+        );
         // 当前可执行文件路径，供默认钩子不依赖 PATH 地调用自身；取不到则省略。
         if let Ok(exe) = std::env::current_exe() {
             env.insert("YAA_BIN".to_string(), exe.to_string_lossy().into_owned());

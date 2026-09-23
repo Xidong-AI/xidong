@@ -222,6 +222,25 @@ fn tool_call_response_named(
     })
 }
 
+/// 带中间正文的工具调用响应：`content` 非空且同时带 `tool_calls`（用于 A5）。
+fn tool_call_with_content_response(call_id: &str, content: &str, command: &str) -> Value {
+    let arguments = json!({ "command": command }).to_string();
+    json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": { "name": "shell", "arguments": arguments }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+}
+
 /// `llm.toml` 内容：假 base_url、假密钥与指定端点方言。
 fn llm_toml_with(port: u16, endpoint_format: &str) -> String {
     format!(
@@ -2028,6 +2047,26 @@ fn approve_and_auto_combination_usage_errors() {
             "用法错误不应污染 stdout（{args:?}）"
         );
     }
+}
+
+/// 阶段 2 验收 9（A5）：末步为空回复时 stdout 不打印本轮非末步正文。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn intermediate_text_not_printed_when_final_reply_is_empty() {
+    let (addr, _state) = start_server(vec![
+        tool_call_with_content_response("call_1", "中间正文", "echo hi"),
+        text_response(""),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let output = env.run(&["你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    assert!(
+        !stdout_of(&output).contains("中间正文"),
+        "空回复不得把中间正文当结果：{:?}",
+        stdout_of(&output)
+    );
 }
 
 /// 阶段 2 验收 10（A6）：`--config` 指定的 `[shell]` 限额沿 `init` 钩子内的

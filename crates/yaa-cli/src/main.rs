@@ -480,19 +480,20 @@ async fn run_agent(
     Ok(exit.code())
 }
 
-/// 打印 `records[watermark..]` 中最后一条非空 `ai` 内容；没有则什么都不打印。
+/// 打印 `records[watermark..]` 中**最后一条** `ai` 记录的内容；为空则不打印。
+///
+/// 只看最后一条 `ai`（而非最后一条非空 `ai`），否则末步为空回复时会把本轮中间
+/// 步骤的正文当成本次结果打到 stdout（A5）。
 fn print_final_ai(session: &yaa_store::Session, watermark: usize) -> anyhow::Result<()> {
     let records = yaa_store::load(session)?;
     let start = watermark.min(records.len());
-    if let Some(content) = records[start..]
+    if let Some(Record::Ai(ai)) = records[start..]
         .iter()
         .rev()
-        .find_map(|record| match record {
-            Record::Ai(ai) if !ai.content.is_empty() => Some(ai.content.as_str()),
-            _ => None,
-        })
+        .find(|record| matches!(record, Record::Ai(_)))
+        && !ai.content.is_empty()
     {
-        println!("{content}");
+        println!("{}", ai.content);
     }
     Ok(())
 }
