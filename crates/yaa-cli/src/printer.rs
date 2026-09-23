@@ -5,7 +5,8 @@
 //! - 默认：把过程记录成「块」，块与块之间用单独一行 `---` 分隔（第一个块前不打印），
 //!   最终助手文本只走 stdout；
 //! - `--verbose`：在默认之上追加模型思考、命令输出与注入内容全文；
-//! - `--quiet`：抑制全部过程输出，但**致命错误仍打印到 stderr**（否则用户看不到失败原因）。
+//! - `--quiet`：抑制全部过程输出，但**致命错误与运维警告仍打印到 stderr**
+//!   （否则用户看不到失败或配置回退的原因）。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -63,10 +64,11 @@ impl Sink for StderrSink {
         match item {
             // 致命错误优先于 `--quiet`：失败原因必须对用户可见。
             DisplayItem::Error(text) => eprintln!("{text}"),
+            // 运维警告（配置缺失、工作目录回退、钩子 stderr 等）同样不受 `--quiet`
+            // 抑制：它们是诊断信息而非过程记录。不参与块分隔，避免卷入过程记录。
+            DisplayItem::Notice(text) => eprintln!("{text}"),
             // `--quiet` 抑制其余全部过程输出。
             _ if self.quiet => {}
-            // 通知不参与块分隔：原样打印，避免把警告卷进过程记录。
-            DisplayItem::Notice(text) => eprintln!("{text}"),
             // 注入与工具调用同构：默认摘要显示注释与命令，`--verbose` 追加内容全文。
             DisplayItem::Injection {
                 comment,

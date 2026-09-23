@@ -210,7 +210,14 @@ async fn notify(
 }
 
 /// 把正文包进 `<注释>…</注释>` 信封，去掉结尾换行（design.md 的示例形态）。
+///
+/// 注释中的换行（`\r`/`\n`）先压成空格：`display::envelope_comment` 要求首行即
+/// `<注释>`，多行注释会让信封解析失败、展示标题退化为「通知」。
 fn envelope(comment: &str, body: &str) -> String {
+    let comment: String = comment
+        .chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect();
     format!("<{comment}>\n{}\n</{comment}>", body.trim_end_matches('\n'))
 }
 
@@ -499,10 +506,13 @@ fn print_final_ai(session: &yaa_store::Session, watermark: usize) -> anyhow::Res
 }
 
 /// 读取 stdin 到 EOF。
+///
+/// 先读为字节再 lossy 解码：非 UTF-8 输入（如二进制管道）仍能作为提示词继续，
+/// 非法字节以替换字符呈现，而不是让整个回合以 IO 错误结束、丢弃已读内容。
 async fn read_stdin() -> anyhow::Result<String> {
-    let mut buffer = String::new();
-    tokio::io::stdin().read_to_string(&mut buffer).await?;
-    Ok(buffer)
+    let mut buffer = Vec::new();
+    tokio::io::stdin().read_to_end(&mut buffer).await?;
+    Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
 /// 用户主目录，仅作为未设置 `YAA_*`/`XDG_*` 时的路径回退。
@@ -607,6 +617,13 @@ mod tests {
             "a b'c \"d\" $e|z|",
             "转义后的命令应能重放原 argv"
         );
+    }
+
+    #[test]
+    fn envelope_flattens_comment_newlines() {
+        // C7：注释含换行时信封首行仍须是完整 `<注释>`，供 `display::envelope_comment` 解析。
+        assert_eq!(envelope("a\nb", "hi\n"), "<a b>\nhi\n</a b>");
+        assert_eq!(envelope("a\r\nb", "hi"), "<a  b>\nhi\n</a  b>");
     }
 
     #[test]

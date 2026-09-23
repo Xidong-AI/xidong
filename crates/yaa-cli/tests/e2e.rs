@@ -315,6 +315,11 @@ impl TestEnv {
 
     /// 带 stdin 的运行（`--notify` 的 stdin 形式）。
     fn run_with_stdin(&self, args: &[&str], input: &str) -> Output {
+        self.run_with_stdin_bytes(args, input.as_bytes())
+    }
+
+    /// 带任意字节 stdin 的运行：用于覆盖非 UTF-8 输入。
+    fn run_with_stdin_bytes(&self, args: &[&str], input: &[u8]) -> Output {
         let mut child = self
             .command()
             .args(args)
@@ -323,12 +328,7 @@ impl TestEnv {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(input.as_bytes())
-            .unwrap();
+        child.stdin.take().unwrap().write_all(input).unwrap();
         child.wait_with_output().unwrap()
     }
 
@@ -2122,4 +2122,90 @@ max_steps = 10
             .contains("[truncated]"),
         "正文应含截断标记：{notify:?}"
     );
+}
+
+/// C5：`--notify 注释 -- cmd`（未用 `=`）仍把注释写入信封，不得静默丢弃。
+#[test]
+fn notify_space_separated_comment_is_written() {
+    let env = TestEnv::new(0);
+    let output = env.run(&["--notify", "空格注释", "--", "echo", "hi"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let records = read_jsonl(&env.session_file());
+    assert_eq!(records.len(), 1, "notify 短路路径只写一条记录");
+    assert_eq!(records[0]["command"], "echo hi");
+    assert_eq!(records[0]["content"], "<空格注释>\nhi\n</空格注释>");
+}
+
+/// C4：stdin 含非 UTF-8 字节时不得丢弃输入或失败，非法字节以替换字符呈现。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_utf8_stdin_is_lossy_not_fatal() {
+    let (addr, _state) = start_server(vec![text_response("完成")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let output = env.run_with_stdin_bytes(&[], b"\xff\xfe Hello");
+    assert!(
+        output.status.success(),
+        "非 UTF-8 stdin 不得失败：{}",
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).contains("完成"));
+
+    let records = read_jsonl(&env.session_file());
+    let user = records
+        .iter()
+        .find(|record| record["type"] == "user")
+        .expect("应写 user 记录");
+    let content = user["content"].as_str().unwrap();
+    assert!(content.contains("Hello"), "已读内容不得丢失：{content}");
+    assert!(
+        content.contains('\u{FFFD}'),
+        "非法字节应呈现为替换字符：{content}"
+    );
+}
+
+/// C7：注释含换行时信封首行被压成单行，展示标题不退化。
+#[test]
+fn notify_comment_newlines_are_flattened() {
+    let env = TestEnv::new(0);
+    let output = env.run(&["--notify=a\nb", "--", "echo", "hi"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let records = read_jsonl(&env.session_file());
+    assert_eq!(records[0]["content"], "<a b>\nhi\n</a b>");
+}
+
+/// C6：`--quiet` 仍须保留运维警告（配置不存在）；只抑制过程输出。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quiet_keeps_config_missing_warning() {
+    let (addr, _state) = start_server(vec![text_response("完成")]).await;
+    let env = TestEnv::new(addr.port());
+    let missing = env.config_home.join("does-not-exist.toml");
+
+    let output = env
+        .command()
+        .arg("--quiet")
+        .arg("--config")
+        .arg(&missing)
+        .arg("你好")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    assert!(stdout_of(&output).contains("完成"));
+
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("配置不存在"),
+        "quiet 下配置警告仍须可见：{stderr}"
+    );
+    assert!(!stderr.contains("---"), "过程块分隔仍应被抑制：{stderr}");
 }

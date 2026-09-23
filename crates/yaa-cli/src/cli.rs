@@ -40,7 +40,11 @@ pub struct Cli {
     pub cwd: Option<PathBuf>,
 
     /// 把命令的输出作为通知写入会话；缺注释时用「由用户执行」。
-    #[arg(long, value_name = "注释", num_args = 0..=1, require_equals = true, default_missing_value = "由用户执行")]
+    ///
+    /// 值为可选：`--notify 注释 `、`--notify=注释` 都取注释；裸 `--notify`（无值，
+    /// 如 `cmd | yaa --notify`）或 `--notify=` 走缺省/空值语义。**不设**
+    /// `require_equals`，否则 `--notify 注释` 会走 `default_missing_value` 而静默丢弃注释。
+    #[arg(long, value_name = "注释", num_args = 0..=1, default_missing_value = "由用户执行")]
     pub notify: Option<String>,
 
     /// `--notify` 要执行的命令（写在 `--` 之后）。
@@ -81,10 +85,28 @@ mod tests {
     }
 
     #[test]
+    fn notify_with_space_separated_comment_and_trailing_command() {
+        // C5：`--notify 注释 -- cmd`（未用 `=`）必须把「注释」作为值，而非当成位置参数。
+        let cli = Cli::parse_from(["yaa", "--notify", "注释", "--", "echo", "hi"]);
+        assert_eq!(cli.notify.as_deref(), Some("注释"));
+        assert_eq!(cli.command, vec!["echo".to_string(), "hi".to_string()]);
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
     fn notify_without_value_defaults_comment() {
         let cli = Cli::parse_from(["yaa", "--notify", "--", "echo", "hi"]);
         assert_eq!(cli.notify.as_deref(), Some("由用户执行"));
         assert_eq!(cli.command, vec!["echo".to_string(), "hi".to_string()]);
+    }
+
+    #[test]
+    fn bare_notify_falls_back_to_default_comment() {
+        // 无值且无后继 token（如 `cmd | yaa --notify`）仍用缺省注释。
+        let cli = Cli::parse_from(["yaa", "--notify"]);
+        assert_eq!(cli.notify.as_deref(), Some("由用户执行"));
+        assert!(cli.command.is_empty());
+        assert!(cli.prompt.is_empty());
     }
 
     #[test]
