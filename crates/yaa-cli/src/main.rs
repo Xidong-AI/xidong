@@ -424,13 +424,25 @@ async fn run_agent(
         cwd_warned: resolved.warned,
         sink: &sink,
     };
+    // Ctrl-C：向当前工具进程组转发 SIGINT，宽限内仍存活则 SIGKILL 兜底，再以 130 退出。
+    // 无工具在运行时（模型请求中）直接退出；`--notify` 短路路径不启动该任务。
+    tokio::spawn(async {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            yaa_exec::interrupt_current_group(std::time::Duration::from_secs(2)).await;
+            std::process::exit(130);
+        }
+    });
     // 运行前的水位：只允许打印本次运行新产生、且非空的最末 `ai` 正文，避免在空回复
     // 或不完整回合里把上一条历史回复误当成本次结果。
     let watermark = yaa_store::load(&resolved.session)
         .map_err(anyhow::Error::from)?
         .len();
+    let request_timeout = std::time::Duration::from_secs(config.agent.request_timeout_secs);
     let exit = runner
-        .run(&prompt, |cfg| yaa_core::agent::OpenAiModel { cfg })
+        .run(&prompt, |cfg| yaa_core::agent::OpenAiModel {
+            cfg,
+            timeout: request_timeout,
+        })
         .await?;
 
     // stdout 只承载「成功的最终助手文本」：失败回合（模型/配置/用法错误）的原因已由

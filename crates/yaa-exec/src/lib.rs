@@ -10,6 +10,61 @@ mod exec;
 mod sink;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
+
+/// 当前正在执行的工具进程组 id；0 表示没有工具在运行（如模型请求期间）。
+///
+/// 进程级单例：同一时刻 agent loop 只执行一个工具，故无需额外同步结构。
+static CURRENT_PGID: AtomicI32 = AtomicI32::new(0);
+
+/// 发布当前工具进程组 id，供信号处理路径转发中断。
+pub(crate) fn publish_group(pgid: i32) {
+    CURRENT_PGID.store(pgid, Ordering::SeqCst);
+}
+
+/// 清除当前工具进程组 id（执行结束或发起前）。
+pub(crate) fn clear_group() {
+    CURRENT_PGID.store(0, Ordering::SeqCst);
+}
+
+/// 读取当前工具进程组 id；0 表示没有工具在运行。
+pub fn current_group() -> i32 {
+    CURRENT_PGID.load(Ordering::SeqCst)
+}
+
+/// 向当前工具进程组先发 SIGINT，宽限内仍存活则 SIGKILL 整组。
+///
+/// 返回是否存在需要中断的进程组（无工具运行时返回 `false`）。全程不阻塞事件循环，
+/// 以约 20ms 间隔探测组是否消失。
+pub async fn interrupt_current_group(grace: std::time::Duration) -> bool {
+    let pgid = current_group();
+    if pgid == 0 {
+        return false;
+    }
+
+    // SAFETY: `pgid` 由 `exec` 在 spawn 后以 `process_group(0)` 的子进程 pid 发布，
+    // 是有效的进程组 id；`killpg` 只向其发送信号，无内存影响。
+    unsafe {
+        libc::killpg(pgid, libc::SIGINT);
+    }
+
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        // SAFETY: 同上；信号 0 只做存在性探测，不投递任何信号。
+        let gone = unsafe { libc::killpg(pgid, 0) } != 0;
+        if gone {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // 宽限后仍存活：整组 SIGKILL 兜底，避免留下无人监管的孤儿。
+    // SAFETY: 同上；对已不存在的进程组发 SIGKILL 是安全的 no-op（返回 ESRCH）。
+    unsafe {
+        libc::killpg(pgid, libc::SIGKILL);
+    }
+    true
+}
 
 /// 截断与超时限制。
 #[derive(Debug, Clone)]

@@ -80,6 +80,8 @@ pub trait Model: Send + Sync {
 pub struct OpenAiModel {
     /// 供应配置。
     pub cfg: LlmConfig,
+    /// 单次请求硬超时；由 `[agent] request_timeout_secs` 构造。
+    pub timeout: std::time::Duration,
 }
 
 impl Model for OpenAiModel {
@@ -89,7 +91,7 @@ impl Model for OpenAiModel {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<ChatResponse>> + Send + 'a>> {
         Box::pin(async move {
             let tools = tools::shell::tools();
-            llm::chat(&self.cfg, messages, &tools).await
+            llm::chat(&self.cfg, messages, &tools, self.timeout).await
         })
     }
 
@@ -213,8 +215,11 @@ impl Runner<'_> {
                 ));
             }
             yaa_store::append(&self.session, &batch)?;
-            // 工具调用块先于结果出现。
-            self.emit_items(&batch);
+            // append 后重新 load 再按水位增量展示：不能简单 `watermark += batch.len()`，
+            // 否则会跳过模型请求期间外部 `yaa --notify` 追加在水位与批次之间的记录，
+            // 使其永久不被展示。重新 load 覆盖「批次之前有外部写入」的边界。
+            let after = yaa_store::load(&self.session)?;
+            self.emit_new(&after, &mut watermark);
 
             if tool_calls.is_empty() {
                 // 既无文本也无工具调用：不算错误（退出码仍为 0），但要明确告知用户，
@@ -239,7 +244,9 @@ impl Runner<'_> {
                 )
                 .await;
                 yaa_store::append(&self.session, std::slice::from_ref(&result))?;
-                self.emit_items(std::slice::from_ref(&result));
+                // 同样以「重新 load + 增量水位」展示，保证每条结果恰好一次。
+                let after = yaa_store::load(&self.session)?;
+                self.emit_new(&after, &mut watermark);
             }
         }
 

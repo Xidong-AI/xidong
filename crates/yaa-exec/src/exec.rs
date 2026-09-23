@@ -37,6 +37,19 @@ const REAP_GRACE: Duration = Duration::from_secs(2);
 /// 进程无法在宽限期内回收时的最终等待。
 const REAP_FINAL_GRACE: Duration = Duration::from_secs(1);
 
+/// 工具执行期间持有已发布的进程组 id，任何返回路径（含 `?` 早退）都清除发布。
+// PJ568 方案：用 RAII 兜住 `run_blocking` 的多条返回路径，避免遗漏 `clear_group`
+// 导致信号处理误向已结束的进程组发信号。
+#[cfg(unix)]
+struct GroupGuard;
+
+#[cfg(unix)]
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        crate::clear_group();
+    }
+}
+
 #[cfg(unix)]
 pub(crate) fn run_blocking(
     cmd: &ShellCommand,
@@ -61,6 +74,9 @@ pub(crate) fn run_blocking(
 
     let mut child = command.spawn()?;
     let pgid = child.id() as i32;
+    // 发布进程组 id 供 SIGINT 转发；`_group` 在函数任意返回路径上清除。
+    crate::publish_group(pgid);
+    let _group = GroupGuard;
 
     let stdout = child
         .stdout

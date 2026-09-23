@@ -201,14 +201,21 @@ pub fn parse_response(body: &serde_json::Value) -> Result<ChatResponse> {
 ///
 /// 对 HTTP 429/5xx 与网络错误最多重试到 3 次总尝试，指数退避 200ms、600ms；
 /// 其他 HTTP 状态立即失败，错误信息含状态码与有界响应片段，绝不含 `api_key`。
+///
+/// `timeout` 覆盖连接与响应体读取；请求超时**不重试**，立即返回错误，避免把
+/// 「端点无响应」拖成多轮退避。
 pub async fn chat(
     cfg: &LlmConfig,
     messages: &[ChatMessage],
     tools: &serde_json::Value,
+    timeout: Duration,
 ) -> Result<ChatResponse> {
     let url = endpoint(&cfg.base_url);
     let body = build_request(cfg, messages, tools);
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(timeout)
+        .build()
+        .context("构造 HTTP 客户端失败")?;
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 0..MAX_ATTEMPTS {
@@ -235,6 +242,10 @@ pub async fn chat(
                     return Err(anyhow::anyhow!("模型服务返回 {status}：{snippet}"));
                 }
                 last_error = Some(anyhow::anyhow!("模型服务返回 {status}"));
+            }
+            // 超时不进入指数退避：端点接受连接却不响应时，重试只会白等更久。
+            Err(err) if err.is_timeout() => {
+                return Err(anyhow::anyhow!("模型请求超时：{err}"));
             }
             Err(err) => {
                 last_error = Some(anyhow::anyhow!("模型请求网络错误：{err}"));
@@ -542,6 +553,45 @@ model = "m"
         assert!(parse_response(&serde_json::json!({"choices": []})).is_err());
         assert!(
             parse_response(&serde_json::json!({"choices": [{"finish_reason": "stop"}]})).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_returns_within_bounds() {
+        use std::io::Read;
+
+        // 接受连接后既不读也不写，保持打开，模拟「端点接受连接但不响应」。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                // 连接保持打开直到超时后测试结束；期间不产生任何响应。
+                let mut buffer = [0u8; 1024];
+                let _ = socket.read(&mut buffer);
+                std::thread::sleep(Duration::from_secs(30));
+            }
+        });
+
+        let mut cfg = sample();
+        cfg.base_url = format!("http://{addr}");
+        let start = std::time::Instant::now();
+        let result = chat(
+            &cfg,
+            &[ChatMessage::user("hi")],
+            &serde_json::json!([]),
+            Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "无响应端点应在超时后返回错误：{result:?}");
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "应真的等待到超时：{elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "不应无限挂起：{elapsed:?}"
         );
     }
 }

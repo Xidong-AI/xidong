@@ -30,6 +30,7 @@ const DEFAULT_MAX_STREAM_CHARS: usize = 32768;
 const DEFAULT_HEAD_CHARS: usize = 8192;
 const DEFAULT_TAIL_CHARS: usize = 2048;
 const DEFAULT_MAX_STEPS: u32 = 30;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
 
 /// 顶层配置。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -64,6 +65,8 @@ pub struct ShellConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentConfig {
     pub max_steps: u32,
+    /// 单次模型请求硬超时（秒），覆盖连接与响应体读取；超时不重试。
+    pub request_timeout_secs: u64,
 }
 
 impl Default for Hooks {
@@ -91,6 +94,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_steps: DEFAULT_MAX_STEPS,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 }
@@ -132,6 +136,7 @@ struct RawShell {
 #[derive(Debug, Deserialize)]
 struct RawAgent {
     max_steps: Option<u32>,
+    request_timeout_secs: Option<u64>,
 }
 
 impl Config {
@@ -194,10 +199,13 @@ fn merge(raw: RawConfig) -> Config {
             config.shell.tail_chars = value;
         }
     }
-    if let Some(agent) = raw.agent
-        && let Some(value) = agent.max_steps
-    {
-        config.agent.max_steps = value;
+    if let Some(agent) = raw.agent {
+        if let Some(value) = agent.max_steps {
+            config.agent.max_steps = value;
+        }
+        if let Some(value) = agent.request_timeout_secs {
+            config.agent.request_timeout_secs = value;
+        }
     }
     config
 }
@@ -214,6 +222,12 @@ fn validate(config: &Config) -> anyhow::Result<()> {
         anyhow::bail!(
             "配置非法：shell.timeout_secs 必须 >= 1，当前为 {}。",
             config.shell.timeout_secs
+        );
+    }
+    if config.agent.request_timeout_secs < 1 {
+        anyhow::bail!(
+            "配置非法：agent.request_timeout_secs 必须 >= 1，当前为 {}。",
+            config.agent.request_timeout_secs
         );
     }
     let kept = config
@@ -370,6 +384,34 @@ timeout_secs = 9
             err.to_string().contains("hooks.timeout_secs"),
             "错误应指明字段：{err}"
         );
+    }
+
+    #[test]
+    fn zero_request_timeout_is_rejected() {
+        let file = write_config("[agent]\nrequest_timeout_secs = 0\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("agent.request_timeout_secs"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn request_timeout_defaults_to_300() {
+        let file = write_config("[agent]\nmax_steps = 3\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(DEFAULT_REQUEST_TIMEOUT_SECS, 300);
+        assert_eq!(
+            config.agent.request_timeout_secs,
+            DEFAULT_REQUEST_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn request_timeout_is_parsed() {
+        let file = write_config("[agent]\nrequest_timeout_secs = 5\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.agent.request_timeout_secs, 5);
     }
 
     #[test]

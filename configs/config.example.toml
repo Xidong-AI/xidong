@@ -35,3 +35,5 @@ tail_chars = 2048
 [agent]
 # 单个回合内最多模型步数。
 max_steps = 30
+# 单次模型请求超时（秒），覆盖连接与响应体读取；超时不重试，按模型错误（退出码 4）失败。
+request_timeout_secs = 300

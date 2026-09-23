@@ -70,6 +70,9 @@ struct ServerState {
     requests: Arc<Mutex<Vec<Value>>>,
     auth: Arc<Mutex<Vec<Option<String>>>>,
     responses: Arc<Mutex<VecDeque<Value>>>,
+    /// 首个请求返回前执行一次的外部副作用（如外部 `yaa --notify`），用于覆盖
+    /// 「模型请求期间有并发写入」的边界。
+    before_response: Arc<Mutex<Option<Command>>>,
 }
 
 /// 处理一次 Chat Completions 请求。
@@ -85,6 +88,10 @@ async fn chat(
             .and_then(|value| value.to_str().ok())
             .map(str::to_string),
     );
+    // 在返回响应之前执行一次外部写入，模拟模型请求期间落盘的并发记录。
+    if let Some(mut command) = state.before_response.lock().unwrap().take() {
+        command.status().unwrap();
+    }
     let response = state
         .responses
         .lock()
@@ -96,10 +103,26 @@ async fn chat(
 
 /// 启动假服务端，返回地址与共享状态。
 async fn start_server(responses: Vec<Value>) -> (SocketAddr, ServerState) {
+    start_server_with(responses, None).await
+}
+
+/// 启动假服务端，并在首个请求返回前执行一次 `side_effect`（阻塞至其结束）。
+async fn start_server_with_side_effect(
+    responses: Vec<Value>,
+    side_effect: Command,
+) -> (SocketAddr, ServerState) {
+    start_server_with(responses, Some(side_effect)).await
+}
+
+async fn start_server_with(
+    responses: Vec<Value>,
+    side_effect: Option<Command>,
+) -> (SocketAddr, ServerState) {
     let state = ServerState {
         requests: Arc::new(Mutex::new(Vec::new())),
         auth: Arc::new(Mutex::new(Vec::new())),
         responses: Arc::new(Mutex::new(responses.into())),
+        before_response: Arc::new(Mutex::new(side_effect)),
     };
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
@@ -1522,4 +1545,191 @@ fn clear_bare_filename_session_archives() {
     assert!(!env.work.join("s.jsonl").exists(), "原文件应已归档");
     let printed = stdout_of(&output);
     assert!(printed.contains("history"), "应打印归档路径：{printed}");
+}
+
+/// A1 回归：单次运行内，工具调用的描述、命令与中间正文各自只展示一次。
+///
+/// 旧实现每轮 `emit_new` 会把上一轮已 `emit_items` 过的批次重新投影，导致重复。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_step_is_displayed_exactly_once() {
+    let (addr, _state) = start_server(vec![
+        json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "我先调用工具",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": json!({
+                                "command": "echo hello-tool",
+                                "description": "打招呼"
+                            })
+                            .to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        }),
+        text_response("最终回复"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let output = env.run(&["你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr.matches("# 打招呼").count(),
+        1,
+        "工具描述应恰好展示一次：\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("% echo hello-tool").count(),
+        1,
+        "工具命令应恰好展示一次：\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("我先调用工具").count(),
+        1,
+        "中间正文应恰好展示一次：\n{stderr}"
+    );
+
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("最终回复"), "stdout：{stdout}");
+    assert!(
+        !stdout.contains("我先调用工具"),
+        "stdout 只含最终回复：{stdout}"
+    );
+}
+
+/// A1 回归：模型请求期间的外部 `yaa --notify` 既不丢失也不重复展示。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn external_notify_during_model_request_is_displayed_exactly_once() {
+    let env = TestEnv::new(0);
+    let mut side_effect = env.command();
+    side_effect
+        .arg("--session")
+        .arg(env.session_file())
+        .arg("--notify=外部")
+        .arg("--")
+        .arg("printf")
+        .arg("NOTIFY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let (addr, _state) = start_server_with_side_effect(
+        vec![
+            tool_call_response("call_1", "echo hello-tool", Some("打招呼"), None),
+            text_response("最终回复"),
+        ],
+        side_effect,
+    )
+    .await;
+    env.write_config(PLAIN_CONFIG);
+    env.write_llm(&llm_toml_with(addr.port(), "openai"));
+
+    let output = env.run(&["你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let stderr = stderr_of(&output);
+    assert_eq!(
+        stderr.matches("# 外部").count(),
+        1,
+        "外部通知应恰好展示一次：\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("% echo hello-tool").count(),
+        1,
+        "工具命令应恰好展示一次：\n{stderr}"
+    );
+
+    let records = read_jsonl(&env.session_file());
+    assert_eq!(
+        count_source(&records, "notify"),
+        1,
+        "外部通知应恰好落盘一次：{records:?}"
+    );
+}
+
+/// 轮询等待 pid 文件出现并返回其中的 pid。
+fn wait_for_pid(path: &Path, timeout: std::time::Duration) -> Option<u32> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if let Ok(text) = std::fs::read_to_string(path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+        {
+            return Some(pid);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    None
+}
+
+/// 轮询等待进程消失（`kill -0` 返回非零）。
+fn wait_for_process_gone(pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+/// A3 回归：向 yaa 发 SIGINT 时，应先转发给当前工具进程组并清理，再以 130 退出。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ctrl_c_kills_tool_process_group_and_exits_130() {
+    let env = TestEnv::new(0);
+    env.write_config(PLAIN_CONFIG);
+    let pidfile = env._root.path().join("tool.pid");
+    let command = format!("echo $$ > '{}'; sleep 30", pidfile.display());
+
+    let (addr, _state) =
+        start_server(vec![tool_call_response("call_1", &command, None, None)]).await;
+    env.write_llm(&llm_toml_with(addr.port(), "openai"));
+
+    let child = env
+        .command()
+        .arg("你好")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let yaa_pid = child.id();
+
+    let tool_pid = wait_for_pid(&pidfile, std::time::Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("工具进程未写出 pid 文件：{}", pidfile.display()));
+
+    let sent = Command::new("kill")
+        .args(["-INT", &yaa_pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "发送 SIGINT 失败");
+
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "yaa 应以 130 退出：{:?}\nstderr：{}",
+        output.status,
+        stderr_of(&output)
+    );
+    assert!(
+        wait_for_process_gone(tool_pid, std::time::Duration::from_secs(5)),
+        "工具进程 {tool_pid} 应已被清理"
+    );
 }
