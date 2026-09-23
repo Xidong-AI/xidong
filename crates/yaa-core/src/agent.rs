@@ -213,7 +213,9 @@ impl Runner<'_> {
         //    `approval_resolved`，不重放历史（多个 pending 时不会牵连展示其余待批）。
         //    被放行的 pending 单独补显一次，让用户知道这次放行的是哪条。
         let watermark = records.len();
-        self.emit_items(std::slice::from_ref(&records[pending_index]));
+        // 前缀 + 起点 = 只投影该条 pending；命令表仍基于全量前缀（对本条非必需，
+        // 但与 `emit_new` 的全量记录约定保持一致）。
+        self.emit_items(&records[..=pending_index], pending_index);
 
         let resolved = Record::approval_resolved(&pending.call_id, ApprovalDecision::Approve);
         // 4. 若该 `call_id` 已有 `tool_result`（上次已执行、但在写 resolved 前中断），
@@ -584,15 +586,18 @@ impl Runner<'_> {
     }
 
     /// 展示历史中水位之后的记录，并推进水位到当前长度。
+    ///
+    /// 传入的是**全量** `records` 与展示起点；`display::items_from` 需要全量记录才能
+    /// 从更早批次的 `tool_call` 为审批决策块回填命令。
     fn emit_new(&self, records: &[Record], watermark: &mut usize) {
         let start = (*watermark).min(records.len());
-        self.emit_items(&records[start..]);
+        self.emit_items(records, start);
         *watermark = records.len();
     }
 
-    /// 把记录投影为展示条目并逐条上报。
-    fn emit_items(&self, records: &[Record]) {
-        for item in display::items(records) {
+    /// 从 `start` 起投影记录为展示条目并逐条上报；`records` 须为全量记录。
+    fn emit_items(&self, records: &[Record], start: usize) {
+        for item in display::items_from(records, start) {
             self.sink.emit(item);
         }
     }

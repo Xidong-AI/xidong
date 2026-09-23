@@ -66,6 +66,15 @@ impl Sink for NullSink {
 
 /// 把一段记录投影为展示条目（纯函数）。
 pub fn items(records: &[Record]) -> Vec<DisplayItem> {
+    items_from(records, 0)
+}
+
+/// 从 `start` 起投影展示条目，但 `records` 仍须传**全量**记录。
+///
+/// 增量展示只把「水位之后」的记录切片交给本函数（见 `agent::Runner::emit_new`），
+/// 而产生命令的 `tool_call` 记录在更早批次里；若命令表只从展示切片构建，审批决策块
+/// 的 `command` 将恒为空。故把「命令表来源（全量）」与「展示起点」分离。
+pub fn items_from(records: &[Record], start: usize) -> Vec<DisplayItem> {
     // `call_id` → 命令：审批决策块需回带被决策的命令（R5）；同 id 以后者为准。
     let commands: BTreeMap<&str, &str> = records
         .iter()
@@ -75,8 +84,11 @@ pub fn items(records: &[Record]) -> Vec<DisplayItem> {
         })
         .collect();
 
+    let start = start.min(records.len());
     let mut items = Vec::new();
-    for (index, record) in records.iter().enumerate() {
+    for (offset, record) in records[start..].iter().enumerate() {
+        // `index` 为全量记录中的绝对下标，供 `final_step` 判断下一条记录。
+        let index = start + offset;
         match record {
             Record::System(system) => {
                 if system.source == "notify" && has_visible_text(system) {
@@ -396,8 +408,9 @@ mod tests {
         );
     }
 
+    /// `tool_call` 与 `resolved` 同在传入切片内时命令可回填（纯函数属性）。
     #[test]
-    fn approval_resolved_carries_command_from_tool_call() {
+    fn approval_resolved_carries_command_when_tool_call_in_slice() {
         let records = vec![
             Record::tool_call(ToolOrigin::Ai, "c1", "echo hi", Some("打招呼".into())),
             Record::approval_pending("c1", "echo hi", "echo *"),
@@ -415,6 +428,42 @@ mod tests {
             })
             .expect("应有审批决策条目");
         assert_eq!(resolved, ("c1".to_string(), "echo hi".to_string(), true));
+    }
+
+    /// R5b 真实形态：增量展示只传入水位之后的切片，`tool_call` 在更早批次里；
+    /// 命令表须基于全量记录构建，否则「已批准/已拒绝」块恒无命令。
+    #[test]
+    fn approval_resolved_fills_command_from_earlier_batch() {
+        let records = vec![
+            Record::tool_call(ToolOrigin::Ai, "c1", "echo hi", None),
+            Record::ai("m", "h", "", None),
+            Record::approval_pending("c1", "echo hi", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Approve),
+        ];
+        // 展示起点取 2：切片内只有 pending 与 resolved，没有 tool_call。
+        let items = items_from(&records, 2);
+        assert!(
+            !items
+                .iter()
+                .any(|item| matches!(item, DisplayItem::ToolCall { .. })),
+            "展示切片内不应含 tool_call：{items:?}"
+        );
+        let resolved = items
+            .into_iter()
+            .find_map(|item| match item {
+                DisplayItem::ApprovalResolved {
+                    call_id,
+                    command,
+                    approved,
+                } => Some((call_id, command, approved)),
+                _ => None,
+            })
+            .expect("应有审批决策条目");
+        assert_eq!(
+            resolved,
+            ("c1".to_string(), "echo hi".to_string(), true),
+            "命令应来自更早批次的 tool_call"
+        );
     }
 
     #[test]
