@@ -108,8 +108,9 @@ impl Record {
 
     /// 系统消息（通知、初始化簿记等）。
     ///
-    /// `command` 可选，只用于展示，不进入上下文；`output_files` 可选，承载被截断时
-    /// 落盘的完整输出（相对数据根），与 `tool_result` 同构。
+    /// `command` 可选：展示层以 `% 命令` 呈现，上下文投影时以 `[执行命令] <command>`
+    /// 前缀加入；`output_files` 可选，承载被截断时落盘的完整输出（相对数据根），与
+    /// `tool_result` 同构。
     pub fn system(
         source: impl Into<String>,
         content: impl Into<String>,
@@ -228,8 +229,8 @@ pub struct OutputFiles {
 
 /// 系统记录。
 ///
-/// `command` 只用于展示、不进入上下文；`output_files` 承载被截断时落盘的完整输出
-/// （相对数据根），旧记录缺该字段时为 `None`。
+/// `command` 展示层以 `% 命令` 呈现，上下文投影时以 `[执行命令] <command>` 前缀加入；
+/// `output_files` 承载被截断时落盘的完整输出（相对数据根），旧记录缺该字段时为 `None`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct System {
     pub id: String,

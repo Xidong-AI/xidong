@@ -9,7 +9,7 @@ use yaa_msg::{OutputFiles, Record, System, ToolOrigin};
 /// 一条展示条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DisplayItem {
-    /// 进程级提示（非记录投影），`--quiet` 下可被抑制。
+    /// 诊断提示（非记录投影：配置缺失、cwd 回退、钩子 stderr 等）；`--quiet` 下仍可见。
     Notice(String),
     /// 致命错误（模型调用失败、钩子执行/解析失败等）；`--quiet` 下仍须可见。
     Error(String),

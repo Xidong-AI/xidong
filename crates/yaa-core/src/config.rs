@@ -282,6 +282,12 @@ fn validate(config: &Config) -> anyhow::Result<()> {
             config.agent.request_timeout_secs
         );
     }
+    if config.agent.max_steps < 1 {
+        anyhow::bail!(
+            "配置非法：agent.max_steps 必须 >= 1，当前为 {}。",
+            config.agent.max_steps
+        );
+    }
     let kept = config
         .shell
         .head_chars
@@ -424,6 +430,16 @@ timeout_secs = 9
         let err = Config::load(file.path()).unwrap_err();
         assert!(
             err.to_string().contains("timeout_secs"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn zero_max_steps_is_rejected() {
+        let file = write_config("[agent]\nmax_steps = 0\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("agent.max_steps"),
             "错误应指明字段：{err}"
         );
     }

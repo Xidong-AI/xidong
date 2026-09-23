@@ -39,6 +39,10 @@ pub fn render(records: &[Record]) -> Vec<ChatMessage> {
     }
 
     // 稳定前缀：首条 `user` 之前的非空 `system`（`init` 簿记与空内容除外）拼成一条。
+    //
+    // 注意：本前缀只收集 `System`，首条 `user` 之前若出现 `tool_call(origin=user)`，
+    // 主循环从 `first_user` 起会将其丢弃。阶段 1/2 无该记录的生产者；若将来引入，
+    // 需在此一并处理。
     let first_user = records
         .iter()
         .position(|record| matches!(record, Record::User(_)));

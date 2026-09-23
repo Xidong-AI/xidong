@@ -3,7 +3,6 @@
 //! 所有函数都是纯函数：环境查询由调用方注入，测试因此无需改动真实进程环境。
 //! 按 `docs/plan.md` 的 D10 拆分配置根与数据根，`GLB_CFG` 指向配置根。
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 读取环境变量并忽略空值（空字符串按未设置处理，与 shell 语义一致）。
@@ -36,25 +35,6 @@ pub fn data_root(env: &impl Fn(&str) -> Option<String>, home: &Path) -> PathBuf 
 /// `config.toml` 路径：`<配置根>/config.toml`。
 pub fn config_file(env: &impl Fn(&str) -> Option<String>, home: &Path) -> PathBuf {
     config_root(env, home).join("config.toml")
-}
-
-/// 钩子进程的环境变量映射。
-///
-/// `GLB_CFG` 兼容 `docs/design.md` 的旧写法，与 `YAA_CONFIG_HOME` 同值。
-pub fn hook_env(env: &impl Fn(&str) -> Option<String>, home: &Path) -> BTreeMap<String, String> {
-    let config = config_root(env, home);
-    let data = data_root(env, home);
-    let mut map = BTreeMap::new();
-    map.insert("GLB_CFG".to_string(), config.to_string_lossy().into_owned());
-    map.insert(
-        "YAA_CONFIG_HOME".to_string(),
-        config.to_string_lossy().into_owned(),
-    );
-    map.insert(
-        "YAA_DATA_HOME".to_string(),
-        data.to_string_lossy().into_owned(),
-    );
-    map
 }
 
 #[cfg(test)]
@@ -117,19 +97,5 @@ mod tests {
             config_file(&env, &home()),
             home().join(".config/yaa/config.toml")
         );
-    }
-
-    #[test]
-    fn hook_env_exposes_both_roots() {
-        let env = lookup(&[]);
-        let map = hook_env(&env, &home());
-        let config = home().join(".config/yaa");
-        let data = home().join(".local/share/yaa");
-        assert_eq!(map.get("GLB_CFG").unwrap(), &config.to_string_lossy());
-        assert_eq!(
-            map.get("YAA_CONFIG_HOME").unwrap(),
-            &config.to_string_lossy()
-        );
-        assert_eq!(map.get("YAA_DATA_HOME").unwrap(), &data.to_string_lossy());
     }
 }

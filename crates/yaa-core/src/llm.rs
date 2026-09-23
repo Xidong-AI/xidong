@@ -243,8 +243,8 @@ pub async fn chat(
             Ok(response) => {
                 let status = response.status();
                 if !is_retryable(status) {
-                    let snippet = bounded_snippet(response.text().await.unwrap_or_default());
-                    return Err(anyhow::anyhow!("模型服务返回 {status}：{snippet}"));
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(http_error(status, &body, &cfg.api_key));
                 }
                 last_error = Some(anyhow::anyhow!("模型服务返回 {status}"));
             }
@@ -272,6 +272,23 @@ fn is_retryable(status: reqwest::StatusCode) -> bool {
 
 fn bounded_snippet(text: String) -> String {
     text.chars().take(ERROR_SNIPPET_CHARS).collect()
+}
+
+/// 构造非重试 HTTP 错误信息：状态码 + 已遮蔽密钥、且有界的响应片段。
+///
+/// 上游网关可能在错误体里回显 `Authorization`/`api_key`，故拼接前先用
+/// [`redact_secret`] 遮蔽，避免密钥经错误信息或 stderr 外泄。
+fn http_error(status: reqwest::StatusCode, body: &str, api_key: &str) -> anyhow::Error {
+    let snippet = bounded_snippet(redact_secret(body, api_key));
+    anyhow::anyhow!("模型服务返回 {status}：{snippet}")
+}
+
+/// 若密钥非空，用固定占位替换其所有出现；空密钥原样返回，避免误伤空串。
+fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return text.to_string();
+    }
+    text.replace(secret, "[redacted]")
 }
 
 #[cfg(test)]
@@ -458,6 +475,27 @@ model = "m"
         let messages = vec![ChatMessage::assistant(None, Some(vec![shell_call()]), None)];
         let value = build_request(&sample(), &messages, &serde_json::json!([]));
         assert!(value["messages"][0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn http_error_redacts_api_key_in_body() {
+        let err = http_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"bad key sk-secret","api_key":"sk-secret"}"#,
+            "sk-secret",
+        );
+        let text = format!("{err:#}");
+        assert!(!text.contains("sk-secret"), "错误信息不得含密钥：{text}");
+        assert!(text.contains("[redacted]"), "应含占位：{text}");
+        assert!(text.contains("400"), "应含状态码：{text}");
+    }
+
+    #[test]
+    fn http_error_keeps_body_when_api_key_empty() {
+        let err = http_error(reqwest::StatusCode::BAD_REQUEST, "boom", "");
+        let text = format!("{err:#}");
+        assert!(text.contains("boom"), "空密钥不得误伤响应体：{text}");
+        assert!(!text.contains("[redacted]"), "空密钥不应出现占位：{text}");
     }
 
     #[test]

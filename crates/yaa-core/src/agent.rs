@@ -547,6 +547,8 @@ impl Runner<'_> {
             return Err(ExitCode::Config);
         }
         match LlmConfig::from_toml(&outcome.stdout) {
+            // 成功时按设计丢弃 stderr：`llm` 钩子的加载过程不展示（README/plan），
+            // 且 stderr 可能含敏感诊断；只有失败路径才上报 stderr。
             Ok(config) => Ok(config),
             Err(err) => {
                 self.emit_hook_stderr(&outcome.stderr);
