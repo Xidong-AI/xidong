@@ -1,0 +1,5 @@
+# BEGIN oh-my-opencode-slim worktrees
+!.worktrees.json
+!.worktrees/
+!.worktrees/**
+# END oh-my-opencode-slim worktrees

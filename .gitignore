@@ -1,1 +1,6 @@
 /target
+
+# BEGIN oh-my-opencode-slim worktrees
+.worktrees/
+.worktrees.json
+# END oh-my-opencode-slim worktrees
