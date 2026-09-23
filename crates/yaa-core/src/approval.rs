@@ -135,7 +135,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// 按 shell 分隔符朴素拆段，识别引号以免在引号内误切。
 ///
-/// 引号不配平时返回 `None`（交调用方按 ask 处理）。单个 `&` 不是分隔符。
+/// 引号不配平时返回 `None`（交调用方按 ask 处理）。`&` 与 `;`/`&&`/`|` 同级作为
+/// 分隔符（后台执行 `cmd &` 会把前后命令拆开），但重定向里的 `&` 不是分隔符：
+/// `2>&1`、`1>&2`、`>&` 的 `&` 前是 `>`，`&>file` 的 `&` 后是 `>`，两者均原样保留。
 fn split_segments(command: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -184,10 +186,15 @@ fn split_segments(command: &str) -> Option<Vec<String>> {
             }
             '&' => {
                 if chars.peek() == Some(&'&') {
+                    // `&&` 拆两次等价于拆一次。
                     chars.next();
                     push_segment(&mut segments, &mut current);
-                } else {
+                } else if chars.peek() == Some(&'>') || current.ends_with('>') {
+                    // 重定向：`&>file`（后随 `>`）与 `2>&1`/`1>&2`/`>&`（前为 `>`）。
                     current.push(c);
+                } else {
+                    // 单个 `&`：后台执行，与 `;` 同级拆段。
+                    push_segment(&mut segments, &mut current);
                 }
             }
             _ => current.push(c),
@@ -209,31 +216,76 @@ fn push_segment(segments: &mut Vec<String>, current: &mut String) {
 }
 
 /// 循环剥离段首的 `VAR=val` 环境赋值，返回剩余命令（已 trim）。
+///
+/// 赋值取值可能是带引号的串（`FOO="a b"`），其中空白不构成 token 边界，故不能简单
+/// 取「首个空白前的 token」；解析见 [`env_assignment_end`]。
 fn strip_env_prefix(segment: &str) -> &str {
     let mut rest = segment.trim();
-    loop {
-        let end = rest
-            .char_indices()
-            .find(|(_, c)| c.is_whitespace())
-            .map(|(index, _)| index)
-            .unwrap_or(rest.len());
-        let token = &rest[..end];
-        match token.split_once('=') {
-            Some((name, _)) if is_env_name(name) => rest = rest[end..].trim_start(),
-            _ => break,
-        }
+    while let Some(end) = env_assignment_end(rest) {
+        rest = rest[end..].trim_start();
     }
     rest
 }
 
-/// 环境变量名：`[A-Za-z_][A-Za-z0-9_]*`。
-fn is_env_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
-        _ => return false,
+/// 若 `text` 以 `NAME=value` 赋值开头，返回该赋值消耗的字节数，否则 `None`。
+///
+/// `NAME` 为 `[A-Za-z_][A-Za-z0-9_]*`；`value` 允许单/双引号包裹（引号内空白不算
+/// 边界），未加引号时以引号外的空白为界。引号不配平返回 `None`（交由整体 ask）。
+fn env_assignment_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !matches!(bytes.first(), Some(b) if b.is_ascii_alphabetic() || *b == b'_') {
+        return None;
     }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let mut i = 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'=') {
+        return None;
+    }
+    skip_env_value(bytes, i + 1)
+}
+
+/// 从 `i` 起跳过一个 shell 取值，返回其结束的字节下标；引号不配平返回 `None`。
+fn skip_env_value(bytes: &[u8], mut i: usize) -> Option<usize> {
+    let (mut in_single, mut in_double) = (false, false);
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_single {
+            i += 1;
+            if b == b'\'' {
+                in_single = false;
+            }
+        } else if in_double {
+            if b == b'\\' {
+                i += 2;
+            } else {
+                i += 1;
+                if b == b'"' {
+                    in_double = false;
+                }
+            }
+        } else {
+            match b {
+                b'\'' => {
+                    in_single = true;
+                    i += 1;
+                }
+                b'"' => {
+                    in_double = true;
+                    i += 1;
+                }
+                b'\\' => i += 2,
+                c if c.is_ascii_whitespace() => break,
+                _ => i += 1,
+            }
+        }
+    }
+    if in_single || in_double {
+        None
+    } else {
+        Some(i.min(bytes.len()))
+    }
 }
 
 #[cfg(test)]
@@ -381,5 +433,64 @@ mod tests {
         assert_eq!(action_of(&rules, ""), Action::Allow);
         assert_eq!(action_of(&rules, "   \n  "), Action::Allow);
         assert_eq!(action_of(&rules, ";;"), Action::Allow);
+    }
+
+    #[test]
+    fn single_ampersand_splits_and_deny_is_not_bypassed() {
+        // P1：`&` 与 `;`/`&&` 同级；不拆会让 `rm *` 的 deny 被整段前缀绕过。
+        let rules = [rule("rm *", Action::Deny)];
+        assert_eq!(action_of(&rules, "true & rm -rf victim"), Action::Deny);
+    }
+
+    #[test]
+    fn single_ampersand_produces_second_segment() {
+        // 若单个 `&` 不拆，整段 `sleep 1 & echo done` 不会命中精确规则 `echo done`。
+        let rules = [rule("echo done", Action::Deny)];
+        assert_eq!(action_of(&rules, "sleep 1 & echo done"), Action::Deny);
+    }
+
+    #[test]
+    fn trailing_single_ampersand_is_a_separator() {
+        let rules = [rule("echo done", Action::Deny)];
+        assert_eq!(action_of(&rules, "sleep 1&echo done"), Action::Deny);
+    }
+
+    #[test]
+    fn redirect_ampersands_are_not_separators() {
+        // P1 约束：`2>&1`/`1>&2`/`&>` 里的 `&` 不得拆段，否则会产生 `1`、`2`、`> out` 等伪段。
+        assert_eq!(
+            action_of(&[rule("1", Action::Deny)], "echo hi 2>&1"),
+            Action::Allow
+        );
+        assert_eq!(
+            action_of(&[rule("2", Action::Deny)], "echo hi 1>&2"),
+            Action::Allow
+        );
+        assert_eq!(
+            action_of(&[rule("> *", Action::Deny)], "echo hi &> out"),
+            Action::Allow
+        );
+        // 与无重定向版本同裁决（不产生额外段）。
+        let rules = [rule("echo *", Action::Ask)];
+        assert_eq!(action_of(&rules, "echo hi 2>&1"), Action::Ask);
+        assert_eq!(action_of(&rules, "echo hi"), Action::Ask);
+    }
+
+    #[test]
+    fn quoted_env_prefix_is_stripped() {
+        // P2：`FOO="a b"` 的取值含空白，不能只取到首个空白。
+        let rules = [rule("echo *", Action::Ask)];
+        assert_eq!(action_of(&rules, r#"FOO="a b" echo bypass"#), Action::Ask);
+        assert_eq!(action_of(&rules, r#"FOO='a b' echo bypass"#), Action::Ask);
+        let rules_git = [rule("git *", Action::Ask)];
+        assert_eq!(
+            action_of(&rules_git, r#"GIT_SSH_COMMAND="ssh -i key" git push"#),
+            Action::Ask
+        );
+        // D42 既有回归：无空白的引号取值同样成立。
+        assert_eq!(
+            action_of(&[rule("make", Action::Ask)], r#"LC_ALL="C.UTF-8" make"#),
+            Action::Ask
+        );
     }
 }
