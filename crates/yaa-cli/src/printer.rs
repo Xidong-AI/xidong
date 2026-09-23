@@ -143,14 +143,40 @@ impl Sink for StderrSink {
                 Self::write_block_text(&title);
                 Self::write_block_text(&format!("% {command}"));
             }
-            DisplayItem::ApprovalResolved { approved, .. } => {
+            DisplayItem::ApprovalResolved {
+                call_id,
+                command,
+                approved,
+            } => {
                 self.start_block();
-                Self::write_block_text(if approved {
-                    "# 已批准"
-                } else {
-                    "# 已拒绝"
-                });
+                Self::write_block_text(&approval_resolved_title(&call_id, approved));
+                if !command.is_empty() {
+                    Self::write_block_text(&format!("% {command}"));
+                }
             }
         }
+    }
+}
+
+/// 审批决策块的标题行：带 `call_id` 以便多 pending 时逐条区分。
+fn approval_resolved_title(call_id: &str, approved: bool) -> String {
+    let verb = if approved { "已批准" } else { "已拒绝" };
+    format!("# {verb}（调用 {call_id}）")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_resolved_title_includes_call_id() {
+        assert_eq!(
+            approval_resolved_title("call_1", true),
+            "# 已批准（调用 call_1）"
+        );
+        assert_eq!(
+            approval_resolved_title("call_2", false),
+            "# 已拒绝（调用 call_2）"
+        );
     }
 }

@@ -209,8 +209,14 @@ impl Runner<'_> {
         };
         let model = make_model(llm_config);
 
+        // 3. 水位取「执行前的记录总数」：本轮只展示新追加的 `tool_result` 与
+        //    `approval_resolved`，不重放历史（多个 pending 时不会牵连展示其余待批）。
+        //    被放行的 pending 单独补显一次，让用户知道这次放行的是哪条。
+        let watermark = records.len();
+        self.emit_items(std::slice::from_ref(&records[pending_index]));
+
         let resolved = Record::approval_resolved(&pending.call_id, ApprovalDecision::Approve);
-        // 3. 若该 `call_id` 已有 `tool_result`（上次已执行、但在写 resolved 前中断），
+        // 4. 若该 `call_id` 已有 `tool_result`（上次已执行、但在写 resolved 前中断），
         //    只补 `approval_resolved: approve`，绝不重复执行、不新增结果。
         let already_executed = records.iter().any(
             |record| matches!(record, Record::ToolResult(result) if result.call_id == pending.call_id),
@@ -218,7 +224,7 @@ impl Runner<'_> {
         if already_executed {
             yaa_store::append(&self.session, &[resolved])?;
         } else {
-            // 4. 执行该 pending 的命令，追加 `tool_result`，再追加 `approval_resolved: approve`。
+            // 5. 执行该 pending 的命令，追加 `tool_result`，再追加 `approval_resolved: approve`。
             //    先执行后落 resolved 的顺序与 `design.md` 一致（结果先于决策可见）。
             let limits = self.config.shell.to_limits();
             let outputs_dir = session::outputs_dir(&self.session);
@@ -242,8 +248,7 @@ impl Runner<'_> {
             yaa_store::append(&self.session, &[resolved])?;
         }
 
-        // 4. 水位取 pending 记录下标：让它与本次的 result/resolved 恰好展示一次。
-        self.run_loop(&model, pending_index).await
+        self.run_loop(&model, watermark).await
     }
 
     /// agent loop 主体，供 [`Runner::run`] 与 [`Runner::approve_pending`] 共用。
@@ -1729,6 +1734,46 @@ mod tests {
                 .filter(|item| matches!(item, DisplayItem::ApprovalResolved { approved: true, .. }))
                 .count(),
             1
+        );
+    }
+
+    /// R5(a)：`--approve` 只展示被放行的那条待批，不重放其余历史待批。
+    #[tokio::test]
+    async fn approve_display_does_not_replay_other_pendings() {
+        let harness = Harness::new(approval_config("echo *", Action::Ask));
+        let sink = NullSink;
+        let model = FakeModel::new(vec![calls_response(vec![
+            shell_call("call_1", r#"{"command":"echo a"}"#),
+            shell_call("call_2", r#"{"command":"echo b"}"#),
+        ])]);
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Pending);
+
+        let approve_sink = RecordingSink::default();
+        let model = FakeModel::new(vec![text_response("完成")]);
+        let exit = harness
+            .runner(&approve_sink)
+            .approve_pending(|_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success);
+
+        let pendings: Vec<String> = approve_sink
+            .items()
+            .into_iter()
+            .filter_map(|item| match item {
+                DisplayItem::ApprovalPending { call_id, .. } => Some(call_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            pendings,
+            vec!["call_1".to_string()],
+            "只应展示被放行的那条待批，不重放 call_2"
         );
     }
 
