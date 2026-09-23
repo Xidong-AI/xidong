@@ -42,6 +42,17 @@
 | D34 | `archive` 的 `sessions-<ts>.jsonl` 已存在时改为 `sessions-<ts>-<n>.jsonl`（n 从 1 递增） | 同毫秒连续归档会静默覆盖，破坏「归档即不可变历史」 |
 | D35 | `timed_out` 只表示真正超出时限；读取宽限内放弃流只回填占位提示，不再 promote 为超时 | 逃逸进程组攥住管道与命令超时是两回事，误报会让调用方以为命令被超时击杀 |
 | D36 | `--notify` 的 stdin 形态复用 `yaa-exec::capture_reader`（同一 `Sink`/`FullOutput`） | 与 `--` 形态保持同一截断标记与落盘语义，避免两套实现漂移；超限时同样产生 `output_files.stdout`，内存仍有界 |
+| D37 | 模型请求超时 `[agent] request_timeout_secs`（默认 300 秒，0 值非法）；请求超时**不重试** | 端点接受连接却不响应时，无超时会无限挂起；重试只应覆盖「已收到响应」的可重试错误，超时重试会把等待拖成多轮 |
+| D38 | SIGINT 处理：向当前工具进程组转发 SIGINT，2 秒宽限后 SIGKILL 整组，yaa 以 `130` 退出 | 工具在独立进程组，终端 SIGINT 打不到它；yaa 死亡后其超时监控消失，命令成为无人监管孤儿。仅覆盖 `shell` 工具进程组，钩子未覆盖 |
+| D39 | 展示按水位增量去重：append 后重新 `load` 再 `emit_new` | 循环内 append 后直接展示却不推进水位，会使同一批记录在下一轮被二次展示；重新 load 同时覆盖「模型请求期间外部 `yaa --notify` 写入」的不丢不重边界 |
+| D40 | 审批配置为 `[approval]` 规则数组（每项 `pattern` + `action`，动作取值 `allow`/`ask`/`deny`），无匹配默认 `allow`；单工具 `shell`，规则不按工具分键 | 保持阶段 1「默认 allow」行为；`[approval]` 与 `[shell]`/`[agent]` 并列，语义清晰 |
+| D41 | 规则裁决 = **最具体优先 + deny 短路**：先全局扫 `deny`（任一命中即拒）；否则在命中的规则中按「首个通配符前的字面字符数」取最大者，同分取后者；无匹配为 `allow` | OpenCode 的 `findLast` 会让末尾 catch-all 覆盖具体 `deny`（其社区最大吐点），不可照抄 |
+| D42 | 命令资源按 shell 分隔符（`;`、`&&`、`\|\|`、`\|`、换行）朴素拆分并剥离前导 `VAR=val`，逐段评估后聚合：任一 `deny` → deny；否则任一 `ask` → ask；否则 allow | `CI=true git commit` 一类 env 前缀可绕过 `git *`（OpenCode #16075）；解析仍是 best-effort，**不构成安全边界** |
+| D43 | 非交互 `ask`：写 `approval_pending` → stderr 打印待批清单 → 以退出码 `6` 退出，**不写** `tool_result`；`yaa --approve`（无参）放行**最旧**未决 pending：执行其命令、写 `approval_resolved: approve` 与 `tool_result`，随后继续 agent loop | 非交互下 ask 绝不可阻塞（OpenCode #36762 教训）；无参逐一放行忠于 `design.md` |
+| D44 | `--auto` 自动放行命中 `ask` 的调用（写 `approval_pending` + `approval_resolved: approve` 后执行）；显式 `deny` 不受影响 | 非交互批量场景的逃生舱；`deny` 永远强制（对齐 OpenCode V2 语义） |
+| D45 | `deny` 命中即拒：写 `approval_pending` + `approval_resolved: deny` + 失败 `tool_result`（模型可见被拒），**不退出**；普通 run 启动时若存在未决 pending，先补 `approval_resolved: deny` | `design.md`：被拒不中断循环，模型可改命令；新提示词视为放弃旧待批 |
+| D46 | 审批只作用于 `origin=ai` 的工具调用；`init`/`llm` 钩子与 `yaa --notify` 不经 `shell` 工具，天然豁免 | 与 plan 原定义一致 |
+| D47 | 审批轮顺带修复 A4（畸形 `tool_call` 不再静默丢弃）、A5（非末步正文不上 stdout）、A6（`--config` 沿钩子链传递） | 同属「不静默降级 / 展示正确性」主题，避免二次开工 |
 
 > D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。
 
@@ -132,6 +143,7 @@ tail_chars = 2048
 
 [agent]
 max_steps = 30
+request_timeout_secs = 300
 ```
 
 `llm` 钩子 stdout 按 TOML 解析：
@@ -171,6 +183,8 @@ tool_call   { type, id, ts, origin: ai|user, call_id, command, description? }
 tool_result { type, id, ts, call_id, stdout, stderr, code, timed_out,
               truncated, output_files?: { stdout?, stderr? } }
 system      { type, id, ts, source, command?, output_files?, content }
+approval_pending  { type, id, ts, call_id, command, matched_rule }
+approval_resolved { type, id, ts, call_id, decision: approve|deny }
 ```
 
 - `id` 为 ULID，全记录唯一，阶段 4 以此幂等去重。
@@ -181,7 +195,7 @@ system      { type, id, ts, source, command?, output_files?, content }
 - 可选 `output_files` 与 `tool_result` 同构（相对数据根），承载 `--notify`（命令或 stdin）超限截断后落盘的完整输出；正文自身只含 `yaa-exec` 的头尾截断标记，截断提示与相对路径由投影层 `display::system_text` 追加（D32）。旧记录缺该字段解析为 `None`。
 - `ai.reasoning` 为可选思考内容，落盘、可由 `--verbose` 展示，并按 `endpoint_format` 决定是否回传（D23/D24）。
 - 相对旧 schema 的移除项见 D21。
-- `approval_pending`/`approval_resolved` 阶段 2 引入。
+- `approval_pending` / `approval_resolved` 为阶段 2 引入的审批记录（D40–D46）：前者承载一次待批调用（`call_id` 指向已落盘的 `tool_call`，`matched_rule` 为命中的规则文本），后者承载决策（`decision: approve|deny`）。两者都用 `call_id` 与工具调用配对，**不参与模型消息投影**，也不改变 `assistant`/`tool` 配对。
 
 ### 追加的原子性
 
@@ -293,9 +307,46 @@ async fn run_agent_loop(session, cfg, guard) -> Result<ExitCode> {
 ### 错误与退出策略
 
 - 模型 429/5xx/网络错误：指数退避，总尝试最多 3 次（首发 + 2 次重试）；仍失败则以模型错误退出。此时历史停在「工具批次已完成」的合法状态，下次运行可续接。
-- 退出码：`0` 成功，`1` 通用错误，`2` 用法错误，`3` 配置/钩子错误（含钩子执行失败），`4` 模型错误，`5` 达到 `max_steps`。
+- 退出码：`0` 成功，`1` 通用错误，`2` 用法错误，`3` 配置/钩子错误（含钩子执行失败），`4` 模型错误，`5` 达到 `max_steps`，`130` 被 SIGINT 中断（Ctrl-C）。
 - 空回复（无内容且无工具调用）视为回合结束，退出 `0`，并给出 stderr 提示。
 - 半批次收尾：模型失败或 Ctrl-C 后，已写入的 `tool_result` 保留；缺失的结果由渲染器兜底（见上）。
+
+## 审批（阶段 2）
+
+审批把「哪些 `origin=ai` 的 shell 命令要问、哪些禁」做成配置（D40–D46）。**它是防手滑与审计手段，不是安全边界**：命令资源是 best-effort 拆分的文本，无法穷举 shell 的全部等价写法，包装器、重定向、变量展开等绕过依然可达。真正想收紧时用窄 `allow` + 精准 `deny`，而不是指望审批流拦截一切。
+
+### 配置
+
+```toml
+[approval]
+rules = [
+  { pattern = "rm *",    action = "deny" },
+  { pattern = "git *",   action = "allow" },
+  { pattern = "curl *",  action = "ask" },
+]
+```
+
+- `pattern` 为 glob（`*` 跨任意字符含空格，`?` 单字符），对**整段命令**做整串匹配。
+- `action` ∈ `allow` / `ask` / `deny`；无规则命中时默认 `allow`。
+- 裁决顺序（D41）：先全局扫 `deny`，任一命中即拒；否则在命中的规则中按「首个通配符前的字面字符数」取最大者（更具体者胜），同分取靠后者；仍无命中为 `allow`。
+
+### 命令资源与聚合
+
+模型的一次 `shell` 调用可能含多个命令段。评估前先做**朴素拆分**：按 `;`、`&&`、`||`、`|`、换行切段，剥离每段前导的 `VAR=val`。逐段求裁决后聚合（D42）：任一 `deny` → deny；否则任一 `ask` → ask；否则 allow。任一步骤解析失败（如引号不配平）按 `ask` 处理，绝不静默放行。
+
+### 非交互落地
+
+| 裁决              | 记录                                                              | 行为                                            |
+| ----------------- | ----------------------------------------------------------------- | ----------------------------------------------- |
+| `allow`（含默认） | 不写审批记录                                                      | 直接执行                                        |
+| `deny`            | `approval_pending` + `approval_resolved: deny` + 失败 `tool_result` | 提示模型被拒，**继续循环**；不退出              |
+| `ask` + `--auto`  | `approval_pending` + `approval_resolved: approve`                  | 直接执行（`deny` 不受 `--auto` 影响）             |
+| `ask`（默认）     | `approval_pending`                                                 | stderr 打印待批清单，**以退出码 6 退出**，不写 `tool_result` |
+
+- **待批清单**：每条 pending 打印其 `call_id`、`matched_rule` 与 shell 转义后的可重放命令。
+- **`yaa --approve`**（无参）：取**最旧**未决 pending（有 `approval_pending`、无对应 `approval_resolved`），执行其命令，写 `approval_resolved: approve` 与 `tool_result`，然后**继续 agent loop**（不写 `user`、不重跑 `init`）。一次调用只放行一条；多个命令需连续执行多次（忠于 `design.md`）。
+- **普通 run 放弃旧待批**：启动若发现未决 pending，先补 `approval_resolved: deny` 并落一条失败 `tool_result`，再走正常流程（D45）。
+- **`--auto`**：自动放行所有命中 `ask` 的调用；显式 `deny` 仍强制（D44）。
 
 ## CLI（阶段 1）
 
@@ -311,13 +362,15 @@ yaa --config <path>
 yaa --cwd <path>             # 改变进程工作目录
 yaa --verbose                # 追加思考内容与命令输出
 yaa --quiet                  # 只打印最终回复
+yaa --approve                # 放行最旧一条待批命令并继续循环
+yaa --auto                   # 自动放行命中 `ask` 的命令（`deny` 仍强制）
 ```
 
 - `--notify` 是短路路径：不加载 `llm` 配置、不进入 agent loop，只解析会话、执行命令或读 stdin、原子追加一条 `system(source=notify)`。
 - 过程记录默认打到 stderr（见 D13、D15、D16）：注入与通知用与工具调用一致的块样式（`# 注释` + 内容），工具调用用 `# 描述` + `% 命令`；块间以 `---` 分隔；非末步的模型正文也在此打印，末步回复只走 stdout。
 - 展示条目与模型消息同源，由 `yaa-core` 的投影产出；`--quiet` 抑制全部过程输出。
 
-后移到阶段 2 及以后：`--json`（展示条目 schema 未定）、`--no-store`、`--approve`、`--notify` 的 `--to` 与跨会话解析。
+后移到阶段 3 及以后：`--json`（展示条目 schema 未定）、`--no-store`（阶段 3）；`--notify` 的 `--to` 与跨会话解析（阶段 5）。
 
 ## 阶段划分与验收
 
@@ -347,7 +400,23 @@ yaa --quiet                  # 只打印最终回复
 
 ### 阶段 2：审批
 
-规则（allow/deny/ask 通配符）、`approval_pending`/`approval_resolved`、`--approve` 同意一次、用户发新提示词时 pending 自动 deny。审批只作用于 `origin=ai` 的工具调用；`init`/`llm` 钩子与 `yaa --notify` 不经过 `shell` 工具，天然豁免。同阶段补 `--json`/`--no-store`。
+内部顺序：**记录类型（`approval_pending`/`approval_resolved`）+ 规则解析与裁决单测 → 命令拆分与聚合 → agent loop 拦截与退出码 6 → `--approve` 恢复路径 → `--auto` → 展示与 `--config` 贯通 → A4/A5/A6 修复**。
+
+范围（D40–D47）：配置与裁决、命令资源聚合、非交互待批与 `--approve` 恢复、`--auto`、`deny` 的模型可见拒绝、新提示词放弃旧待批。**不含** `--json`/`--no-store`（后移阶段 3）。审批只作用于 `origin=ai` 的工具调用；`init`/`llm` 钩子与 `yaa --notify` 不经 `shell` 工具，天然豁免。
+
+验收：
+
+1. 裁决单测：deny 短路（含 `*: ask` 尾随不覆盖具体 deny）；最具体优先（`git push *` 胜过 `git *`）；同分取后者；无匹配默认 allow；`?` 与 `*` 语义；命令拆分（`a && b`、`VAR=x b`）后按段聚合。
+2. `ask` 拦截：命中 `ask` 时 `default.jsonl` 出现 `approval_pending`、stderr 打印可重放命令与 `matched_rule`、进程以 `6` 退出、且**不写** `tool_result`。
+3. `--approve`：对上述会话执行 `yaa --approve`，命令被执行并写 `approval_resolved: approve` + `tool_result`，随后继续循环直至最终回复；不写 `user`、不重跑 `init`；多个 pending 时每次只放行最旧一条。
+4. `--auto`：`yaa --auto "……"` 自动放行命中 `ask` 的调用并完成循环；显式 `deny` 仍被拒。
+5. `deny`：命中即写 `approval_pending` + `approval_resolved: deny` + 失败 `tool_result`，进程不退出，模型在下一跳能看到被拒结果。
+6. 新提示词放弃旧待批：存在未决 pending 时执行普通 `yaa "新提示词"`，旧 pending 先补 `approval_resolved: deny` 与失败 `tool_result`。
+7. 审批记录不进入模型消息投影；`approval_pending`/`approval_resolved` 不改变 `assistant`/`tool` 配对。
+8. A4：模型返回 `tool_call.arguments` 非字符串或缺 `id` 时不再静默丢弃——报明确的模型错误（退出码 4），测试断言可观测。
+9. A5：末步为空回复时 stdout 不打印本轮非末步正文；`yaa 你好 > 回复.txt` 只含最终回复。
+10. A6：`yaa --config <path>` 在 `init` 钩子内 `yaa --notify` 的限额解析与主进程一致（同一 `[shell]`）。
+11. `--get-prompt`/`--clear`/`--status`/`--notify` 等短路路径不因新增审批逻辑改变行为；`--approve`/`--auto` 与 `--notify` 组合按用法错误拒绝。
 
 ### 阶段 3：压缩
 
@@ -373,6 +442,9 @@ pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前
 - 会话目标测试：hook 环境注入 `YAA_SESSION`；`--notify` 解析顺序 `--session` → `YAA_SESSION` → cwd 默认。
 - 初始化测试：无 `system(source=init)` 簿记时执行 `init` 并写簿记（含已有 `notify` 记录的会话）；已写簿记的会话不重跑；`init` 失败仍写 `user`、不写簿记且退出码为配置错误，改好后下次运行能重试成功。
 - 展示测试：展示条目 golden；首轮注入展示一次；默认摘要与 `--verbose` 全文两种形态；`--quiet` 抑制；`llm` 不产生记录。
+- 模型请求超时测试：无响应端点（accept 后不读不写）在配置超时内返回错误；`request_timeout_secs = 0` 被拒绝、缺省 300、可解析。
+- SIGINT 测试：向运行中的 yaa 发 SIGINT 应清理工具进程组并以 130 退出。
+- 展示唯一性测试：单次运行的工具步骤在 stderr 恰好展示一次；模型请求期间外部 notify 不丢不重。
 - 防漂移测试：系统提示词 section 必须提及 schema 的工具名与参数名；展示 - 模型一致性不变量（见阶段 1 验收第 9 条）。
 - 集成测试：`dev-dependencies` 起极简假 OpenAI 服务（`axum` 或 `hyper`，仅测试用），按脚本返回 `tool_calls`，端到端跑通并用临时目录隔离。
 - 收尾运行 `autocorrect --fix` 与 `autocorrect --lint docs crates`。
@@ -389,9 +461,11 @@ pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前
 8. 旧 schema 会话不兼容，需 `--clear`（D26）。
 9. **（F12）展示与渲染对 `system` 的谓词不对称**：展示只看 `source == "notify"`，渲染看「非 `init` 且（`content` 非空或 `output_files` 存在）」。将来出现新 `source`（如阶段 5 的后台结果）时必须统一谓词；阶段 1 暂不修，以免在只有两种 `source` 时引入无消费者的抽象。
 10. **逃逸进程组攥管道时输出仍可能被放弃**：后台进程若 `setsid` 脱离工具进程组并继续持有 stdout/stderr 管道，读取会在宽限后被放弃，输出以占位提示自解释；但这**不再误报**为 `timed_out`（D35）。长任务应用 `nohup <cmd> >/dev/null 2>&1 &` 主动脱离工具管道，而不是依赖读取宽限。
+11. **SIGINT 只清理 `shell` 工具进程组**：`init`/`llm` 钩子的进程组未纳入信号转发；钩子自身有硬超时兜底。
+12. **审批不是安全边界**（阶段 2）：命令资源为 best-effort 文本拆分，包装器（`xargs`/`find -exec`/`sudo`）、重定向目标、变量展开等仍可绕过；收紧应使用窄 `allow` + 精准 `deny`，不要指望审批流拦截一切（D42）。
 
 ## 已确认项与默认假设
 
 已确认：XDG 双根（D10）、`ai` 与 `tool_call` 分离记录 + 单批原子写（D12）、统一通知注入（D19）、簿记驱动的初始化（D20）、分层装配（D22）、`ai.reasoning` 落盘（D23）、`endpoint_format` 取代 `provider`（D24）、阶段 1 引入 `YAA_SESSION`（D25）、离群通知双向最大连续段（D28）。
 
-默认假设（未特别反对即执行）：截断阈值 `max_stream_chars=32768`、`head_chars=8192`、`tail_chars=2048`；`endpoint_format` 默认 `"openai"`；注入合并用空行分隔；包 `yaa-cli` 产出二进制 `yaa`；workspace 版本从 `0.1.0` 起。
+默认假设（未特别反对即执行）：截断阈值 `max_stream_chars=32768`、`head_chars=8192`、`tail_chars=2048`；`endpoint_format` 默认 `"openai"`；注入合并用空行分隔；包 `yaa-cli` 产出二进制 `yaa`；`request_timeout_secs` 默认 300；workspace 版本从 `0.1.0` 起。
