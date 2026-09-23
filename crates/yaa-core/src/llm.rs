@@ -1,7 +1,8 @@
 //! 模型供应配置与 OpenAI Chat Completions 适配。
 //!
 //! `llm` 钩子的 stdout 是 TOML，经 `LlmConfig::from_toml` 解析；`api_key` 永不写入
-//! 日志或错误信息（自定义 `Debug` 亦做遮蔽）。
+//! 日志或错误信息（自定义 `Debug` 亦做遮蔽）。`endpoint_format` 是唯一驱动出站
+//! 方言分支的字段：它决定 `reasoning` 是否作为顶层 `reasoning_content` 回传（D24）。
 
 use std::time::Duration;
 
@@ -17,10 +18,34 @@ const MAX_ATTEMPTS: usize = 3;
 /// 首次重试退避（毫秒），之后按 ×3 指数增长（200ms、600ms）。
 const BASE_BACKOFF_MS: u64 = 200;
 
+/// 出站端点方言。决定是否回传思考内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointFormat {
+    /// OpenAI 官方 Chat Completions：不认 `reasoning_content`，不回传。
+    #[default]
+    OpenAi,
+    /// DeepSeek：请求带 `tools` 时须回传 `reasoning_content`。
+    DeepSeek,
+    /// Kimi：同 DeepSeek 系。
+    Kimi,
+    /// Qwen：同 DeepSeek 系。
+    Qwen,
+    /// GLM：同 DeepSeek 系。
+    Glm,
+}
+
+impl EndpointFormat {
+    /// 是否把 `ai.reasoning` 作为 assistant 顶层 `reasoning_content` 回传。
+    pub fn replays_reasoning(self) -> bool {
+        !matches!(self, EndpointFormat::OpenAi)
+    }
+}
+
 /// 模型供应配置。
 #[derive(Clone, PartialEq)]
 pub struct LlmConfig {
-    pub provider: String,
+    pub endpoint_format: EndpointFormat,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -31,7 +56,7 @@ pub struct LlmConfig {
 impl std::fmt::Debug for LlmConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LlmConfig")
-            .field("provider", &self.provider)
+            .field("endpoint_format", &self.endpoint_format)
             .field("base_url", &self.base_url)
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
@@ -43,8 +68,8 @@ impl std::fmt::Debug for LlmConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawLlmConfig {
-    #[serde(default = "default_provider")]
-    provider: String,
+    #[serde(default)]
+    endpoint_format: EndpointFormat,
     base_url: String,
     api_key: String,
     model: String,
@@ -52,10 +77,6 @@ struct RawLlmConfig {
     temperature: f32,
     #[serde(default = "default_max_tokens")]
     max_tokens: u32,
-}
-
-fn default_provider() -> String {
-    "openai".to_string()
 }
 
 fn default_temperature() -> f32 {
@@ -69,13 +90,13 @@ fn default_max_tokens() -> u32 {
 impl LlmConfig {
     /// 解析 `llm` 钩子的 stdout。
     ///
-    /// `base_url`、`model`、`api_key` 必填；`provider`、`temperature`、`max_tokens`
-    /// 有默认值。
+    /// `base_url`、`model`、`api_key` 必填；`endpoint_format`、`temperature`、
+    /// `max_tokens` 有默认值。
     pub fn from_toml(text: &str) -> Result<Self> {
         let raw: RawLlmConfig =
             toml::from_str(text).context("解析 llm 钩子输出失败（应为 TOML）")?;
         Ok(Self {
-            provider: raw.provider,
+            endpoint_format: raw.endpoint_format,
             base_url: raw.base_url,
             api_key: raw.api_key,
             model: raw.model,
@@ -99,11 +120,19 @@ pub fn endpoint(base_url: &str) -> String {
 }
 
 /// 构造 OpenAI Chat Completions 请求体。请求体绝不含 `api_key`。
+///
+/// 每条消息经 [`ChatMessage::to_request_value`] 组装，是否回传 `reasoning_content`
+/// 由 `endpoint_format` 决定。
 pub fn build_request(
     cfg: &LlmConfig,
     messages: &[ChatMessage],
     tools: &serde_json::Value,
 ) -> serde_json::Value {
+    let replay_reasoning = cfg.endpoint_format.replays_reasoning();
+    let messages: Vec<serde_json::Value> = messages
+        .iter()
+        .map(|message| message.to_request_value(replay_reasoning))
+        .collect();
     serde_json::json!({
         "model": cfg.model,
         "temperature": cfg.temperature,
@@ -235,7 +264,7 @@ mod tests {
 
     fn sample() -> LlmConfig {
         LlmConfig {
-            provider: "openai".to_string(),
+            endpoint_format: EndpointFormat::OpenAi,
             base_url: "https://api.example.com".to_string(),
             api_key: "secret".to_string(),
             model: "gpt-test".to_string(),
@@ -244,11 +273,51 @@ mod tests {
         }
     }
 
+    fn shell_call() -> AssistantToolCall {
+        AssistantToolCall {
+            id: "call_1".to_string(),
+            name: crate::tools::shell::NAME.to_string(),
+            arguments: "{\"command\":\"ls\"}".to_string(),
+        }
+    }
+
+    #[test]
+    fn endpoint_format_parses_all_values() {
+        for (text, expected) in [
+            ("openai", EndpointFormat::OpenAi),
+            ("deepseek", EndpointFormat::DeepSeek),
+            ("kimi", EndpointFormat::Kimi),
+            ("qwen", EndpointFormat::Qwen),
+            ("glm", EndpointFormat::Glm),
+        ] {
+            let cfg = LlmConfig::from_toml(&format!(
+                "endpoint_format = \"{text}\"\nbase_url = \"u\"\napi_key = \"k\"\nmodel = \"m\""
+            ))
+            .unwrap();
+            assert_eq!(cfg.endpoint_format, expected, "endpoint_format={text}");
+        }
+    }
+
+    #[test]
+    fn endpoint_format_defaults_to_openai() {
+        let cfg = LlmConfig::from_toml("base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"").unwrap();
+        assert_eq!(cfg.endpoint_format, EndpointFormat::OpenAi);
+    }
+
+    #[test]
+    fn replays_reasoning_only_for_non_openai() {
+        assert!(!EndpointFormat::OpenAi.replays_reasoning());
+        assert!(EndpointFormat::DeepSeek.replays_reasoning());
+        assert!(EndpointFormat::Kimi.replays_reasoning());
+        assert!(EndpointFormat::Qwen.replays_reasoning());
+        assert!(EndpointFormat::Glm.replays_reasoning());
+    }
+
     #[test]
     fn from_toml_full() {
         let cfg = LlmConfig::from_toml(
             r#"
-provider = "deepseek"
+endpoint_format = "deepseek"
 base_url = "https://api.deepseek.com"
 api_key = "sk-x"
 model = "deepseek-chat"
@@ -257,7 +326,7 @@ max_tokens = 1024
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.provider, "deepseek");
+        assert_eq!(cfg.endpoint_format, EndpointFormat::DeepSeek);
         assert_eq!(cfg.base_url, "https://api.deepseek.com");
         assert_eq!(cfg.model, "deepseek-chat");
         assert_eq!(cfg.temperature, 0.2);
@@ -274,9 +343,19 @@ model = "m"
 "#,
         )
         .unwrap();
-        assert_eq!(cfg.provider, "openai");
+        assert_eq!(cfg.endpoint_format, EndpointFormat::OpenAi);
         assert_eq!(cfg.temperature, 0.7);
         assert_eq!(cfg.max_tokens, 4096);
+    }
+
+    #[test]
+    fn legacy_provider_field_is_ignored() {
+        // `provider` 已不是字段：写了也不影响，仍取默认端点格式。
+        let cfg = LlmConfig::from_toml(
+            "provider = \"deepseek\"\nbase_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.endpoint_format, EndpointFormat::OpenAi);
     }
 
     #[test]
@@ -320,15 +399,49 @@ model = "m"
     #[test]
     fn build_request_shape() {
         let messages = vec![ChatMessage::user("hi")];
-        let tools = crate::prompt::shell_tools();
+        let tools = crate::tools::shell::tools();
         let value = build_request(&sample(), &messages, &tools);
         assert_eq!(value["model"], "gpt-test");
         let temperature = value["temperature"].as_f64().unwrap();
         assert!((temperature - 0.7).abs() < 1e-6);
         assert_eq!(value["max_tokens"], 4096);
         assert_eq!(value["messages"][0]["role"], "user");
-        assert_eq!(value["tools"][0]["function"]["name"], "shell");
+        assert_eq!(
+            value["tools"][0]["function"]["name"],
+            crate::tools::shell::NAME
+        );
         assert!(value.get("api_key").is_none());
+    }
+
+    #[test]
+    fn deepseek_replays_empty_reasoning_for_tool_calls() {
+        let mut cfg = sample();
+        cfg.endpoint_format = EndpointFormat::DeepSeek;
+        let messages = vec![ChatMessage::assistant(None, Some(vec![shell_call()]), None)];
+        let value = build_request(&cfg, &messages, &serde_json::json!([]));
+        assert_eq!(value["messages"][0]["reasoning_content"], "");
+        // 带工具调用的 assistant 消息仍保留 tool_calls。
+        assert_eq!(value["messages"][0]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn deepseek_replays_reasoning_when_present() {
+        let mut cfg = sample();
+        cfg.endpoint_format = EndpointFormat::DeepSeek;
+        let messages = vec![ChatMessage::assistant(
+            Some("回复".to_string()),
+            None,
+            Some("思考".to_string()),
+        )];
+        let value = build_request(&cfg, &messages, &serde_json::json!([]));
+        assert_eq!(value["messages"][0]["reasoning_content"], "思考");
+    }
+
+    #[test]
+    fn openai_omits_reasoning_content() {
+        let messages = vec![ChatMessage::assistant(None, Some(vec![shell_call()]), None)];
+        let value = build_request(&sample(), &messages, &serde_json::json!([]));
+        assert!(value["messages"][0].get("reasoning_content").is_none());
     }
 
     #[test]

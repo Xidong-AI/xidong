@@ -43,11 +43,12 @@ impl Record {
         })
     }
 
-    /// 模型回复。
+    /// 模型回复。`reasoning` 为可选思考内容，落盘、可展示，是否回传由端点格式决定。
     pub fn ai(
         model: impl Into<String>,
         tool_schema_hash: impl Into<String>,
         content: impl Into<String>,
+        reasoning: Option<String>,
     ) -> Self {
         Record::Ai(Ai {
             id: new_id(),
@@ -55,6 +56,7 @@ impl Record {
             model: model.into(),
             tool_schema_hash: tool_schema_hash.into(),
             content: content.into(),
+            reasoning,
         })
     }
 
@@ -64,8 +66,6 @@ impl Record {
         call_id: impl Into<String>,
         command: impl Into<String>,
         description: Option<String>,
-        hook: Option<HookInfo>,
-        redacted: bool,
     ) -> Self {
         Record::ToolCall(ToolCall {
             id: new_id(),
@@ -74,8 +74,6 @@ impl Record {
             call_id: call_id.into(),
             command: command.into(),
             description,
-            hook,
-            redacted,
         })
     }
 
@@ -104,17 +102,17 @@ impl Record {
         })
     }
 
-    /// 系统消息（通知、错误、警告等）。
+    /// 系统消息（通知、初始化簿记等）。`command` 可选，只用于展示，不进入上下文。
     pub fn system(
         source: impl Into<String>,
-        scope: impl Into<String>,
         content: impl Into<String>,
+        command: Option<String>,
     ) -> Self {
         Record::System(System {
             id: new_id(),
             ts: now_ms(),
             source: source.into(),
-            scope: scope.into(),
+            command,
             content: content.into(),
         })
     }
@@ -144,22 +142,16 @@ pub struct Ai {
     pub model: String,
     pub tool_schema_hash: String,
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// 工具调用来源。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolOrigin {
-    Hook,
     Ai,
     User,
-}
-
-/// 钩子身份：名称与执行指纹。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HookInfo {
-    pub name: String,
-    pub fingerprint: String,
 }
 
 /// 工具调用记录。
@@ -172,9 +164,6 @@ pub struct ToolCall {
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hook: Option<HookInfo>,
-    pub redacted: bool,
 }
 
 /// 工具结果记录。
@@ -203,13 +192,14 @@ pub struct OutputFiles {
     pub stderr: Option<String>,
 }
 
-/// 系统记录。
+/// 系统记录。`command` 可选，只用于展示，不进入上下文。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct System {
     pub id: String,
     pub ts: i64,
     pub source: String,
-    pub scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     pub content: String,
 }
 
@@ -256,13 +246,14 @@ mod tests {
     }
 
     #[test]
-    fn ai_golden_and_round_trip() {
+    fn ai_golden_without_reasoning() {
         let r = Record::Ai(Ai {
             id: "01JAI".into(),
             ts: 2,
             model: "deepseek-chat".into(),
             tool_schema_hash: "abc".into(),
             content: "在".into(),
+            reasoning: None,
         });
         let line = serde_json::to_string(&r).expect("serialize");
         assert_eq!(
@@ -273,35 +264,62 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_golden_and_round_trip() {
-        let r = Record::ToolCall(ToolCall {
-            id: "01JCALL".into(),
-            ts: 3,
-            origin: ToolOrigin::Hook,
-            call_id: "call_1".into(),
-            command: "echo hi".into(),
-            description: None,
-            hook: Some(HookInfo {
-                name: "system_prompt".into(),
-                fingerprint: "fp".into(),
-            }),
-            redacted: false,
+    fn ai_golden_with_reasoning() {
+        let r = Record::Ai(Ai {
+            id: "01JAI".into(),
+            ts: 2,
+            model: "deepseek-chat".into(),
+            tool_schema_hash: "abc".into(),
+            content: "在".into(),
+            reasoning: Some("想".into()),
         });
         let line = serde_json::to_string(&r).expect("serialize");
         assert_eq!(
             line,
-            r#"{"type":"tool_call","id":"01JCALL","ts":3,"origin":"hook","call_id":"call_1","command":"echo hi","hook":{"name":"system_prompt","fingerprint":"fp"},"redacted":false}"#
+            r#"{"type":"ai","id":"01JAI","ts":2,"model":"deepseek-chat","tool_schema_hash":"abc","content":"在","reasoning":"想"}"#
+        );
+        assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn tool_call_golden_and_round_trip() {
+        let r = Record::ToolCall(ToolCall {
+            id: "01JCALL".into(),
+            ts: 3,
+            origin: ToolOrigin::Ai,
+            call_id: "call_1".into(),
+            command: "echo hi".into(),
+            description: None,
+        });
+        let line = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            line,
+            r#"{"type":"tool_call","id":"01JCALL","ts":3,"origin":"ai","call_id":"call_1","command":"echo hi"}"#
+        );
+        assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn tool_call_golden_with_description() {
+        let r = Record::ToolCall(ToolCall {
+            id: "01JCALL".into(),
+            ts: 3,
+            origin: ToolOrigin::Ai,
+            call_id: "call_1".into(),
+            command: "echo hi".into(),
+            description: Some("打招呼".into()),
+        });
+        let line = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            line,
+            r#"{"type":"tool_call","id":"01JCALL","ts":3,"origin":"ai","call_id":"call_1","command":"echo hi","description":"打招呼"}"#
         );
         assert_eq!(round_trip(&r), r);
     }
 
     #[test]
     fn tool_origin_is_lowercase() {
-        for (origin, tag) in [
-            (ToolOrigin::Hook, "hook"),
-            (ToolOrigin::Ai, "ai"),
-            (ToolOrigin::User, "user"),
-        ] {
+        for (origin, tag) in [(ToolOrigin::Ai, "ai"), (ToolOrigin::User, "user")] {
             assert_eq!(
                 serde_json::to_string(&origin).expect("serialize"),
                 format!("\"{tag}\"")
@@ -374,18 +392,35 @@ mod tests {
     }
 
     #[test]
-    fn system_golden_and_round_trip() {
+    fn system_golden_with_command() {
         let r = Record::System(System {
             id: "01JSYS".into(),
             ts: 5,
             source: "notify".into(),
-            scope: "ai".into(),
-            content: "done".into(),
+            command: Some("git status".into()),
+            content: "……".into(),
         });
         let line = serde_json::to_string(&r).expect("serialize");
         assert_eq!(
             line,
-            r#"{"type":"system","id":"01JSYS","ts":5,"source":"notify","scope":"ai","content":"done"}"#
+            r#"{"type":"system","id":"01JSYS","ts":5,"source":"notify","command":"git status","content":"……"}"#
+        );
+        assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn system_golden_without_command() {
+        let r = Record::System(System {
+            id: "01JSYS".into(),
+            ts: 5,
+            source: "init".into(),
+            command: None,
+            content: String::new(),
+        });
+        let line = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            line,
+            r#"{"type":"system","id":"01JSYS","ts":5,"source":"init","content":""}"#
         );
         assert_eq!(round_trip(&r), r);
     }

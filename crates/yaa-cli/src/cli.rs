@@ -1,7 +1,7 @@
 //! 命令行参数定义。
 //!
 //! 阶段 1 的表面见 `docs/plan.md` 的「CLI（阶段 1）」；`--json`、`--no-store`、
-//! `--approve`、`--notify` 等后移到阶段 2 及以后。
+//! `--approve`、`--notify` 的 `--to` 等后移到阶段 2 及以后。
 
 use std::path::PathBuf;
 
@@ -27,7 +27,7 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub session: Option<PathBuf>,
 
-    /// 打印内置提示词（`system` 或 `user`）后退出。
+    /// 打印内置提示词（`system`）后退出。
     #[arg(long, value_name = "NAME")]
     pub get_prompt: Option<String>,
 
@@ -39,6 +39,14 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub cwd: Option<PathBuf>,
 
+    /// 把命令的输出作为通知写入会话；缺注释时用「由用户执行」。
+    #[arg(long, value_name = "注释", num_args = 0..=1, require_equals = true, default_missing_value = "由用户执行")]
+    pub notify: Option<String>,
+
+    /// `--notify` 要执行的命令（写在 `--` 之后）。
+    #[arg(last = true, value_name = "CMD", num_args = 0..)]
+    pub command: Vec<String>,
+
     /// 把钩子、工具等事件打到 stderr。
     #[arg(long, conflicts_with = "quiet")]
     pub verbose: bool,
@@ -46,4 +54,38 @@ pub struct Cli {
     /// 只在 stdout 打印最终回复。
     #[arg(long)]
     pub quiet: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notify_with_equals_and_trailing_command() {
+        let cli = Cli::parse_from(["yaa", "--notify=注释", "--", "echo", "hi"]);
+        assert_eq!(cli.notify.as_deref(), Some("注释"));
+        assert_eq!(cli.command, vec!["echo".to_string(), "hi".to_string()]);
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn notify_without_value_defaults_comment() {
+        let cli = Cli::parse_from(["yaa", "--notify", "--", "echo", "hi"]);
+        assert_eq!(cli.notify.as_deref(), Some("由用户执行"));
+        assert_eq!(cli.command, vec!["echo".to_string(), "hi".to_string()]);
+    }
+
+    #[test]
+    fn notify_without_command_reads_stdin_shape() {
+        let cli = Cli::parse_from(["yaa", "--notify=注释"]);
+        assert_eq!(cli.notify.as_deref(), Some("注释"));
+        assert!(cli.command.is_empty());
+        assert!(cli.prompt.is_empty());
+    }
+
+    #[test]
+    fn empty_notify_value_is_preserved_for_runtime_fallback() {
+        let cli = Cli::parse_from(["yaa", "--notify="]);
+        assert_eq!(cli.notify.as_deref(), Some(""));
+    }
 }

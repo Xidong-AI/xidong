@@ -1,5 +1,6 @@
-//! YAA 的唯一工具：Shell。
+//! YAA 的 Shell 执行机制。
 //!
+//! 不含工具语义（schema、参数解析、错误文案与调用编排在 `yaa-core::tools::shell`）。
 //! 执行 `sh -c <command>`，`stdin` 置空；超时对整进程组 `SIGKILL`；stdout/stderr
 //! 并发流式读取并在超过阈值时截断，完整输出落盘。
 //!
@@ -19,14 +20,16 @@ pub struct ShellLimits {
     pub tail_chars: usize,
 }
 
-/// 一次工具调用请求。
+/// 一次 Shell 执行请求。
 #[derive(Debug, Clone)]
 pub struct ShellCommand {
     pub call_id: String,
     pub command: String,
+    /// 额外注入子进程的环境变量（如 `YAA_SESSION`），在继承的父环境之上覆盖。
+    pub env: Vec<(String, String)>,
 }
 
-/// 一次工具调用结果。
+/// 一次 Shell 执行结果。
 #[derive(Debug, Clone)]
 pub struct ShellOutput {
     pub call_id: String,
@@ -48,7 +51,7 @@ pub enum ShellError {
     Io(#[from] std::io::Error),
     #[error("Shell 任务失败：{0}")]
     Join(String),
-    #[error("Shell 工具仅支持 POSIX 系统")]
+    #[error("Shell 执行仅支持 POSIX 系统")]
     Unsupported,
     #[error("子进程缺少管道：{0}")]
     MissingPipe(&'static str),
@@ -88,6 +91,7 @@ mod tests {
         ShellCommand {
             call_id: "call_test".into(),
             command: command.into(),
+            env: Vec::new(),
         }
     }
 

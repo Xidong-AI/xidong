@@ -9,6 +9,7 @@ use anyhow::anyhow;
 use clap::Parser;
 use tokio::io::AsyncReadExt;
 use yaa_core::agent::ExitCode;
+use yaa_core::display::{DisplayItem, Sink};
 use yaa_msg::Record;
 
 use cli::Cli;
@@ -74,7 +75,7 @@ async fn main() {
     let cli = Cli::parse();
 
     // `--get-prompt` 必须在加载配置、解析会话与执行任何钩子之前短路，否则默认
-    // `system_prompt` 钩子内部调用 `yaa --get-prompt system` 会形成递归环。
+    // `init` 钩子内部调用 `yaa --get-prompt system` 会形成递归环。
     if let Some(name) = cli.get_prompt.as_deref() {
         match yaa_core::prompt::builtin(name) {
             Some(text) => {
@@ -82,7 +83,7 @@ async fn main() {
                 std::process::exit(0);
             }
             None => {
-                eprintln!("错误：未知的内置提示词 `{name}`（可用：system、user）。");
+                eprintln!("错误：未知的内置提示词 `{name}`（可用：system）。");
                 std::process::exit(2);
             }
         }
@@ -113,6 +114,11 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     let config_root = yaa_core::paths::config_root(&env, &home);
     let data_root = yaa_core::paths::data_root(&env, &home);
 
+    // `--notify` 是短路写入路径：不加载配置、不进入 agent loop、不触发 init。
+    if cli.notify.is_some() {
+        return notify(&cli, &env, &data_root).await.map_err(CliError::from);
+    }
+
     if cli.clear {
         return clear(&cli, &data_root).map_err(CliError::from);
     }
@@ -121,6 +127,74 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     }
 
     run_agent(cli, &env, &home, &config_root, &data_root).await
+}
+
+/// 把命令输出或 stdin 作为通知原子写入目标会话。
+///
+/// 目标解析顺序：`--session` → 环境变量 `YAA_SESSION`（非空才算） → 当前 cwd
+/// 默认会话（见 `docs/plan.md` D25 与规则 8）。
+async fn notify(
+    cli: &Cli,
+    env: &impl Fn(&str) -> Option<String>,
+    data_root: &Path,
+) -> anyhow::Result<i32> {
+    let session = notify_session(cli, env, data_root)?;
+    // 缺注释或注释为空串时统一用「由用户执行」。
+    let comment = match cli.notify.as_deref() {
+        Some(text) if !text.is_empty() => text,
+        _ => "由用户执行",
+    };
+
+    // 有命令则在 `--` 后直接执行；否则从 stdin 读到 EOF。
+    let (body, command, exit) = if cli.command.is_empty() {
+        (read_stdin().await?, None, 0)
+    } else {
+        let output = run_notify_command(&cli.command)?;
+        // stderr 已透传到本进程 stderr；这里只取 stdout 作正文。
+        let body = String::from_utf8_lossy(&output.stdout).into_owned();
+        // 信号致死时 `code()` 为 `None`，按通用错误码 1 处理。
+        let exit = output.status.code().unwrap_or(1);
+        (body, Some(cli.command.join(" ")), exit)
+    };
+
+    // 去掉正文结尾换行，使信封内不留多余空行（design.md 的示例形态）。
+    let content = format!("<{comment}>\n{}\n</{comment}>", body.trim_end_matches('\n'));
+    yaa_store::append(&session, &[Record::system("notify", content, command)])?;
+    Ok(exit)
+}
+
+/// 解析 `--notify` 的目标会话；显式路径按当前 cwd 补全为绝对路径。
+fn notify_session(
+    cli: &Cli,
+    env: &impl Fn(&str) -> Option<String>,
+    data_root: &Path,
+) -> anyhow::Result<yaa_store::Session> {
+    if let Some(path) = &cli.session {
+        return Ok(yaa_store::Session::new(absolute_path(path)?));
+    }
+    if let Some(path) = env("YAA_SESSION").filter(|value| !value.is_empty()) {
+        return Ok(yaa_store::Session::new(absolute_path(Path::new(&path))?));
+    }
+    let cwd = std::env::current_dir()?;
+    Ok(yaa_core::session::resolve(&cwd, None, data_root)?.session)
+}
+
+/// 词法绝对化；相对路径相对当前工作目录补全。
+fn absolute_path(path: &Path) -> anyhow::Result<PathBuf> {
+    Ok(std::path::absolute(path)?)
+}
+
+/// 直接执行 `--notify` 命令：不经 `sh -c`，stdin 置空，stdout 捕获，stderr 透传。
+fn run_notify_command(args: &[String]) -> anyhow::Result<std::process::Output> {
+    let (program, rest) = args
+        .split_first()
+        .ok_or_else(|| anyhow!("--notify 的命令为空"))?;
+    let output = std::process::Command::new(program)
+        .args(rest)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()?;
+    Ok(output)
 }
 
 /// 归档当前会话，打印目标路径。
@@ -196,10 +270,10 @@ async fn run_agent(
         .clone()
         .unwrap_or_else(|| yaa_core::paths::config_file(env, home));
     if !config_path.exists() {
-        use yaa_core::events::{Event, EventSink};
-        sink.emit(Event::Notice {
-            content: format!("警告：配置不存在，使用默认配置：{}", config_path.display()),
-        });
+        sink.emit(DisplayItem::Notice(format!(
+            "警告：配置不存在，使用默认配置：{}",
+            config_path.display()
+        )));
     }
     // 配置读取/解析失败是配置错误（退出码 3），不是通用错误。
     let config = yaa_core::config::Config::load(&config_path).map_err(CliError::config)?;
@@ -222,6 +296,11 @@ async fn run_agent(
         cwd_warned: resolved.warned,
         sink: &sink,
     };
+    // 运行前的水位：只允许打印本次运行新产生、且非空的最末 `ai` 正文，避免在空回复
+    // 或不完整回合里把上一条历史回复误当成本次结果。
+    let watermark = yaa_store::load(&resolved.session)
+        .map_err(anyhow::Error::from)?
+        .len();
     let exit = runner
         .run(&prompt, |cfg| yaa_core::agent::OpenAiModel { cfg })
         .await?;
@@ -231,7 +310,7 @@ async fn run_agent(
     match exit {
         ExitCode::Success => {
             sink.finish_transcript();
-            print_final_ai(&resolved.session)?;
+            print_final_ai(&resolved.session, watermark)?;
         }
         ExitCode::MaxSteps => {
             eprintln!(
@@ -239,7 +318,7 @@ async fn run_agent(
                 config.agent.max_steps
             );
             sink.finish_transcript();
-            print_final_ai(&resolved.session)?;
+            print_final_ai(&resolved.session, watermark)?;
         }
         // 其他退出码：stdout 保持干净。
         _ => {}
@@ -248,13 +327,18 @@ async fn run_agent(
     Ok(exit.code())
 }
 
-/// 打印历史中最后一条非空 `ai` 内容；没有则什么都不打印。
-fn print_final_ai(session: &yaa_store::Session) -> anyhow::Result<()> {
+/// 打印 `records[watermark..]` 中最后一条非空 `ai` 内容；没有则什么都不打印。
+fn print_final_ai(session: &yaa_store::Session, watermark: usize) -> anyhow::Result<()> {
     let records = yaa_store::load(session)?;
-    if let Some(content) = records.iter().rev().find_map(|record| match record {
-        Record::Ai(ai) if !ai.content.is_empty() => Some(ai.content.as_str()),
-        _ => None,
-    }) {
+    let start = watermark.min(records.len());
+    if let Some(content) = records[start..]
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            Record::Ai(ai) if !ai.content.is_empty() => Some(ai.content.as_str()),
+            _ => None,
+        })
+    {
         println!("{content}");
     }
     Ok(())

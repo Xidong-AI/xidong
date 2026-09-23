@@ -40,6 +40,7 @@ pub(crate) fn run_blocking(
     command
         .arg("-c")
         .arg(&cmd.command)
+        .envs(cmd.env.iter().map(|(key, value)| (key, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

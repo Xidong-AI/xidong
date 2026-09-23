@@ -1,8 +1,8 @@
 //! 钩子执行。
 //!
 //! 钩子以 `sh -c <command>` 运行，`stdin` 置空、stdout/stderr 管道读取，每个流有
-//! 独立 1 MiB 硬上限：超限立即终止进程并报错，绝不静默截断（提示词钩子的输出即
-//! 完整提示词，静默裁掉会破坏语义）。
+//! 独立 1 MiB 硬上限：超限立即终止进程并报错，绝不静默截断（钩子输出可能承载配置
+//! 或提示词，静默裁掉会破坏语义）。
 //!
 //! 不依赖 `yaa-exec`：Shell 工具的流式截断策略与钩子的「超限即错」策略不同。
 
@@ -10,8 +10,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-
-use sha2::{Digest, Sha256};
 
 /// 单流输出上限（1 MiB）。超过即报错，不截断。
 const MAX_STREAM_BYTES: usize = 1024 * 1024;
@@ -179,21 +177,6 @@ async fn drain_both(
     Ok((out, err))
 }
 
-/// 钩子缓存键的指纹：sha2-256 十六进制。
-///
-/// 输入为 `name \0 command \0 yaa 版本 \0 extra`，任何一项变化都会使缓存失效。
-pub fn fingerprint(name: &str, command: &str, extra: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(name.as_bytes());
-    hasher.update([0]);
-    hasher.update(command.as_bytes());
-    hasher.update([0]);
-    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
-    hasher.update([0]);
-    hasher.update(extra.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,16 +270,5 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "超时应及时返回：{elapsed:?}"
         );
-    }
-
-    #[test]
-    fn fingerprint_is_stable_and_sensitive() {
-        let a = fingerprint("llm", "cat llm.toml", "");
-        let b = fingerprint("llm", "cat llm.toml", "");
-        assert_eq!(a, b);
-        assert_ne!(a, fingerprint("llm", "cat other.toml", ""));
-        assert_ne!(a, fingerprint("system", "cat llm.toml", ""));
-        assert_ne!(a, fingerprint("llm", "cat llm.toml", "extra"));
-        assert_eq!(a.len(), 64);
     }
 }

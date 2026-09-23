@@ -9,14 +9,18 @@ use serde::Deserialize;
 
 use crate::paths;
 
-/// 默认系统提示词钩子：调用 `"$YAA_BIN" --get-prompt system` 拼入内置模板。
+/// 默认初始化钩子：空会话时执行一次，用三条 `yaa --notify` 拼出「系统提示词 /
+/// 用户总提示词 / 当前环境」。stdout 不进入上下文，写入上下文的唯一方式就是
+/// 命令内的 `--notify`。
 ///
-/// 用 `$YAA_BIN`（当前可执行文件绝对路径）而非裸 `yaa`，否则 PATH 中没有 yaa 时钩子
-/// 会静默失败；`hook_env` 负责注入该变量。
-pub const DEFAULT_SYSTEM_PROMPT: &str =
-    r#"echo "工作目录：$(pwd)" && "$YAA_BIN" --get-prompt system"#;
-/// 默认用户提示词钩子。
-pub const DEFAULT_USER_PROMPT: &str = "cat $GLB_CFG/AGENTS.md";
+/// 用 `$YAA_BIN`（当前可执行文件绝对路径）而非裸 `yaa`，否则 PATH 中没有 yaa 时
+/// 钩子会静默失败；`hook_env` 负责注入该变量。`AGENTS.md` 缺失时跳过 notify，
+/// 避免注入空信封（D30）。首行 `set -e` 保证任一条 notify 失败即整体失败，不会出现
+/// 「前两条失败、末条成功 ⇒ 退出 0 被当成功」的假成功。
+pub const DEFAULT_INIT: &str = r#"set -e
+"$YAA_BIN" --notify="系统提示词" -- "$YAA_BIN" --get-prompt system
+if [ -f "$GLB_CFG/AGENTS.md" ]; then "$YAA_BIN" --notify="用户总提示词" -- cat "$GLB_CFG/AGENTS.md"; fi
+"$YAA_BIN" --notify="当前环境" -- echo "工作目录：$(pwd)""#;
 /// 默认模型配置钩子。
 pub const DEFAULT_LLM: &str = "cat $YAA_CONFIG_HOME/llm.toml";
 
@@ -36,10 +40,12 @@ pub struct Config {
 }
 
 /// 钩子命令与执行限额。
+///
+/// 阶段 1 只有两个钩子：`init`（空会话初始化）与 `llm`（模型供应配置，不进入
+/// 上下文、不写记录）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hooks {
-    pub system_prompt: String,
-    pub user_prompt: String,
+    pub init: String,
     pub llm: String,
     /// 单次钩子执行的硬超时（秒），覆盖启动与读尽输出的全过程。
     pub timeout_secs: u64,
@@ -63,8 +69,7 @@ pub struct AgentConfig {
 impl Default for Hooks {
     fn default() -> Self {
         Self {
-            system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-            user_prompt: DEFAULT_USER_PROMPT.to_string(),
+            init: DEFAULT_INIT.to_string(),
             llm: DEFAULT_LLM.to_string(),
             timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
         }
@@ -111,8 +116,7 @@ struct RawConfig {
 
 #[derive(Debug, Deserialize)]
 struct RawHooks {
-    system_prompt: Option<String>,
-    user_prompt: Option<String>,
+    init: Option<String>,
     llm: Option<String>,
     timeout_secs: Option<u64>,
 }
@@ -166,11 +170,8 @@ impl Config {
 fn merge(raw: RawConfig) -> Config {
     let mut config = Config::default();
     if let Some(hooks) = raw.hooks {
-        if let Some(value) = hooks.system_prompt {
-            config.hooks.system_prompt = value;
-        }
-        if let Some(value) = hooks.user_prompt {
-            config.hooks.user_prompt = value;
+        if let Some(value) = hooks.init {
+            config.hooks.init = value;
         }
         if let Some(value) = hooks.llm {
             config.hooks.llm = value;
@@ -241,12 +242,30 @@ mod tests {
     }
 
     #[test]
+    fn default_hooks_are_init_and_llm() {
+        let hooks = Hooks::default();
+        assert_eq!(hooks.init, DEFAULT_INIT);
+        assert_eq!(hooks.llm, DEFAULT_LLM);
+        // 旧的两条提示词钩子已删除：默认值里不再出现它们的名字。
+        assert!(!DEFAULT_INIT.contains("system_prompt"));
+        assert!(!DEFAULT_INIT.contains("user_prompt"));
+    }
+
+    #[test]
+    fn default_init_contains_set_e_and_three_notify_lines() {
+        assert_eq!(DEFAULT_INIT.lines().count(), 4);
+        assert_eq!(DEFAULT_INIT.lines().next(), Some("set -e"));
+        assert_eq!(DEFAULT_INIT.matches("--notify=").count(), 3);
+        assert!(DEFAULT_INIT.contains("--get-prompt system"));
+        assert!(DEFAULT_INIT.contains("AGENTS.md"));
+    }
+
+    #[test]
     fn full_toml_is_parsed() {
         let file = write_config(
             r#"
 [hooks]
-system_prompt = "echo system"
-user_prompt = "echo user"
+init = "echo init"
 llm = "cat llm.toml"
 timeout_secs = 7
 
@@ -261,8 +280,7 @@ max_steps = 7
 "#,
         );
         let config = Config::load(file.path()).unwrap();
-        assert_eq!(config.hooks.system_prompt, "echo system");
-        assert_eq!(config.hooks.user_prompt, "echo user");
+        assert_eq!(config.hooks.init, "echo init");
         assert_eq!(config.hooks.llm, "cat llm.toml");
         assert_eq!(config.hooks.timeout_secs, 7);
         assert_eq!(
@@ -288,9 +306,37 @@ timeout_secs = 9
         let config = Config::load(file.path()).unwrap();
         assert_eq!(config.shell.timeout_secs, 9);
         assert_eq!(config.shell.head_chars, DEFAULT_HEAD_CHARS);
-        assert_eq!(config.hooks.system_prompt, DEFAULT_SYSTEM_PROMPT);
+        assert_eq!(config.hooks.init, DEFAULT_INIT);
+        assert_eq!(config.hooks.llm, DEFAULT_LLM);
         assert_eq!(config.hooks.timeout_secs, DEFAULT_HOOK_TIMEOUT_SECS);
         assert_eq!(config.agent.max_steps, DEFAULT_MAX_STEPS);
+    }
+
+    #[test]
+    fn missing_hooks_section_uses_defaults() {
+        let file = write_config("[agent]\nmax_steps = 3\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.hooks.init, DEFAULT_INIT);
+        assert_eq!(config.hooks.llm, DEFAULT_LLM);
+        assert_eq!(config.hooks.timeout_secs, DEFAULT_HOOK_TIMEOUT_SECS);
+        assert_eq!(config.agent.max_steps, 3);
+    }
+
+    #[test]
+    fn hooks_init_and_llm_can_be_overridden() {
+        let file = write_config("[hooks]\ninit = \"run-init\"\nllm = \"run-llm\"\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.hooks.init, "run-init");
+        assert_eq!(config.hooks.llm, "run-llm");
+    }
+
+    #[test]
+    fn provider_is_not_a_hooks_field() {
+        // 未知键被忽略：`provider` 已删除，写进配置也不产生任何效果。
+        let file = write_config("[hooks]\nprovider = \"deepseek\"\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.hooks.init, DEFAULT_INIT);
+        assert_eq!(config.hooks.llm, DEFAULT_LLM);
     }
 
     #[test]

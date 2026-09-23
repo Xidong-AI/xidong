@@ -1,23 +1,22 @@
 //! OpenAI 兼容的聊天消息类型。
 //!
-//! `ChatMessage` 以 `None` 字段省略的方式序列化，得到合法的 OpenAI 请求体；
-//! `AssistantToolCall` 自定义 serde，以线格式
-//! `{id, type:"function", function:{name, arguments}}` 表示。
+//! `ChatMessage` 的出站请求体由 [`ChatMessage::to_request_value`] 显式构造：它按
+//! `endpoint_format` 决定是否回传 `reasoning_content`，不依赖结构体自身的 serde 派生。
+//! `AssistantToolCall` 保留自定义 serde：反序列化用于解析模型响应，序列化则产出
+//! `{id, type:"function", function:{name, arguments}}` 的线格式，供请求体拼装复用。
 
 use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// 一条聊天消息。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<AssistantToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    pub reasoning: Option<String>,
 }
 
 /// 助手发起的工具调用。
@@ -29,35 +28,39 @@ pub struct AssistantToolCall {
 }
 
 impl ChatMessage {
+    /// 系统消息。
     pub fn system(content: impl Into<String>) -> Self {
         Self::plain("system", content.into())
     }
 
+    /// 用户消息。
     pub fn user(content: impl Into<String>) -> Self {
         Self::plain("user", content.into())
     }
 
-    pub fn assistant(content: impl Into<String>) -> Self {
-        Self::plain("assistant", content.into())
-    }
-
-    /// 带工具调用的助手消息（无文本内容）。
-    pub fn assistant_tool_calls(tool_calls: Vec<AssistantToolCall>) -> Self {
+    /// 助手消息；`content`、`tool_calls` 与 `reasoning` 均可缺省。
+    pub fn assistant(
+        content: Option<String>,
+        tool_calls: Option<Vec<AssistantToolCall>>,
+        reasoning: Option<String>,
+    ) -> Self {
         Self {
             role: "assistant".to_string(),
-            content: None,
-            tool_calls: Some(tool_calls),
+            content,
+            tool_calls,
             tool_call_id: None,
+            reasoning,
         }
     }
 
     /// 工具结果消息。
-    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+    pub fn tool_result(tool_call_id: String, content: impl Into<String>) -> Self {
         Self {
             role: "tool".to_string(),
             content: Some(content.into()),
             tool_calls: None,
-            tool_call_id: Some(tool_call_id.into()),
+            tool_call_id: Some(tool_call_id),
+            reasoning: None,
         }
     }
 
@@ -67,7 +70,54 @@ impl ChatMessage {
             content: Some(content),
             tool_calls: None,
             tool_call_id: None,
+            reasoning: None,
         }
+    }
+
+    /// 出站请求体里的单条消息。
+    ///
+    /// 仅当 `role == "assistant"` 且 `replay_reasoning` 为真时写入 `reasoning_content`：
+    /// 有思考内容用其值；无思考但带工具调用时写空串（DeepSeek 系在请求带 `tools` 时
+    /// 即使思考为空也要求该字段）；否则不带该键。
+    pub fn to_request_value(&self, replay_reasoning: bool) -> serde_json::Value {
+        let mut value = serde_json::json!({ "role": self.role });
+        let object = value.as_object_mut().expect("`json!` 构造的对象必为 map");
+        if let Some(content) = &self.content {
+            object.insert(
+                "content".to_string(),
+                serde_json::Value::String(content.clone()),
+            );
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            object.insert(
+                "tool_calls".to_string(),
+                serde_json::to_value(tool_calls).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            object.insert(
+                "tool_call_id".to_string(),
+                serde_json::Value::String(tool_call_id.clone()),
+            );
+        }
+        if self.role == "assistant" && replay_reasoning {
+            if let Some(reasoning) = &self.reasoning {
+                object.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(reasoning.clone()),
+                );
+            } else if self
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+            {
+                object.insert(
+                    "reasoning_content".to_string(),
+                    serde_json::Value::String(String::new()),
+                );
+            }
+        }
+        value
     }
 }
 
@@ -153,24 +203,29 @@ impl<'de> Visitor<'de> for ToolCallVisitor {
 mod tests {
     use super::*;
 
+    fn call() -> AssistantToolCall {
+        AssistantToolCall {
+            id: "call_1".to_string(),
+            name: "shell".to_string(),
+            arguments: "{\"command\":\"ls\"}".to_string(),
+        }
+    }
+
     #[test]
-    fn system_message_omits_tool_fields() {
-        let value = serde_json::to_value(ChatMessage::system("hi")).unwrap();
+    fn system_message_omits_absent_fields() {
+        let value = ChatMessage::system("hi").to_request_value(false);
         let object = value.as_object().unwrap();
         assert_eq!(object.get("role").unwrap(), "system");
         assert_eq!(object.get("content").unwrap(), "hi");
         assert!(!object.contains_key("tool_calls"));
         assert!(!object.contains_key("tool_call_id"));
+        assert!(!object.contains_key("reasoning_content"));
     }
 
     #[test]
     fn tool_calls_use_openai_wire_shape() {
-        let message = ChatMessage::assistant_tool_calls(vec![AssistantToolCall {
-            id: "call_1".to_string(),
-            name: "shell".to_string(),
-            arguments: "{\"command\":\"ls\"}".to_string(),
-        }]);
-        let value = serde_json::to_value(&message).unwrap();
+        let message = ChatMessage::assistant(None, Some(vec![call()]), None);
+        let value = message.to_request_value(false);
         assert_eq!(value["tool_calls"][0]["id"], "call_1");
         assert_eq!(value["tool_calls"][0]["type"], "function");
         assert_eq!(value["tool_calls"][0]["function"]["name"], "shell");
@@ -182,11 +237,49 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_roundtrips() {
-        let original = ChatMessage::tool_result("call_1", "output");
-        let text = serde_json::to_string(&original).unwrap();
-        let parsed: ChatMessage = serde_json::from_str(&text).unwrap();
-        assert_eq!(original, parsed);
+    fn tool_result_message_carries_tool_call_id() {
+        let message = ChatMessage::tool_result("call_1".to_string(), "output");
+        let value = message.to_request_value(false);
+        assert_eq!(value["role"], "tool");
+        assert_eq!(value["content"], "output");
+        assert_eq!(value["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn reasoning_replayed_only_for_assistant_when_requested() {
+        let message = ChatMessage::assistant(None, Some(vec![call()]), Some("思考".into()));
+        assert_eq!(message.to_request_value(true)["reasoning_content"], "思考");
+        // openai 端点（replay=false）不回传。
+        assert!(
+            message
+                .to_request_value(false)
+                .get("reasoning_content")
+                .is_none()
+        );
+        // 非 assistant 角色不写入。
+        let user = ChatMessage::user("hi");
+        assert!(
+            user.to_request_value(true)
+                .get("reasoning_content")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn assistant_with_tool_calls_and_empty_reasoning_replays_empty_string() {
+        let message = ChatMessage::assistant(None, Some(vec![call()]), None);
+        assert_eq!(message.to_request_value(true)["reasoning_content"], "");
+    }
+
+    #[test]
+    fn assistant_without_tool_calls_and_without_reasoning_omits_key() {
+        let message = ChatMessage::assistant(Some("回复".into()), None, None);
+        assert!(
+            message
+                .to_request_value(true)
+                .get("reasoning_content")
+                .is_none()
+        );
     }
 
     #[test]
@@ -196,9 +289,9 @@ mod tests {
             "type": "function",
             "function": {"name": "shell", "arguments": "{}"}
         }"#;
-        let call: AssistantToolCall = serde_json::from_str(text).unwrap();
-        assert_eq!(call.id, "call_9");
-        assert_eq!(call.name, "shell");
-        assert_eq!(call.arguments, "{}");
+        let parsed: AssistantToolCall = serde_json::from_str(text).unwrap();
+        assert_eq!(parsed.id, "call_9");
+        assert_eq!(parsed.name, "shell");
+        assert_eq!(parsed.arguments, "{}");
     }
 }

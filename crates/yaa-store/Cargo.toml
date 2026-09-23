@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 yaa-msg = { path = "../yaa-msg" }
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

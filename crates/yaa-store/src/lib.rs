@@ -10,6 +10,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use yaa_msg::Record;
 
 /// 一个会话：JSONL 文件及其父目录（会话根）。
@@ -35,7 +36,9 @@ pub enum StoreError {
     Io(#[from] std::io::Error),
     #[error("JSON 错误：{0}")]
     Json(#[from] serde_json::Error),
-    #[error("会话文件第 {line} 行损坏：{source}")]
+    #[error(
+        "会话文件第 {line} 行无法解析：{source}（可能是旧版 schema，可运行 `yaa --clear` 归档旧会话后重开）"
+    )]
     Corrupt {
         line: usize,
         #[source]
@@ -164,19 +167,30 @@ fn repair_trailing(file: &mut File) -> Result<()> {
 
 /// 归档会话：把 `default.jsonl` 移到 `<history_root>/<sid>/sessions-<ts>.jsonl`。
 ///
-/// `<sid>` 取会话根目录名，`history_root` 由调用方给出，避免猜测数据根。只移动
-/// JSONL，不动 `outputs/`，因此归档记录里的相对路径仍然有效。
+/// `<sid>` 取会话根目录名；会话根没有目录名（会话文件就是裸文件名、无父目录）时，
+/// 回退为 `sha256(绝对文件路径)` 前 32 位十六进制，保证 `--clear --session s.jsonl`
+/// 也能归档而不是报错。`history_root` 由调用方给出，避免猜测数据根。只移动 JSONL，
+/// 不动 `outputs/`，因此归档记录里的相对路径仍然有效。
 pub fn archive(session: &Session, history_root: &Path, ts: i64) -> Result<PathBuf> {
-    let sid = session
-        .root
-        .file_name()
-        .ok_or_else(|| StoreError::Layout(format!("会话根无目录名：{}", session.root.display())))?;
+    let sid = match session.root.file_name() {
+        Some(name) => name.to_string_lossy().into_owned(),
+        None => path_sid(&session.file),
+    };
 
-    let target_dir = history_root.join(sid);
+    let target_dir = history_root.join(&sid);
     fs::create_dir_all(&target_dir)?;
     let target = target_dir.join(format!("sessions-{ts}.jsonl"));
     fs::rename(&session.file, &target)?;
     Ok(target)
+}
+
+/// 裸文件名会话的 sid 兜底：绝对路径的 sha256 前 32 位十六进制。
+fn path_sid(file: &Path) -> String {
+    let absolute = std::path::absolute(file).unwrap_or_else(|_| file.to_path_buf());
+    let mut hasher = Sha256::new();
+    hasher.update(absolute.as_os_str().as_encoded_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..32].to_string()
 }
 
 /// 解析以换行分隔的记录。
@@ -232,7 +246,7 @@ mod tests {
     fn append_then_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let session = session_in(dir.path());
-        let records = vec![Record::user("你好"), Record::ai("m", "h", "回复")];
+        let records = vec![Record::user("你好"), Record::ai("m", "h", "回复", None)];
         append(&session, &records).unwrap();
 
         let loaded = load(&session).unwrap();
@@ -272,10 +286,33 @@ mod tests {
         data.push('\n');
         fs::write(&session.file, data).unwrap();
 
-        assert!(matches!(
-            load(&session).unwrap_err(),
-            StoreError::Corrupt { .. }
-        ));
+        let err = load(&session).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt { .. }));
+        let message = err.to_string();
+        assert!(
+            message.contains("可能是旧版 schema"),
+            "错误应提示旧版 schema，实际：{message}"
+        );
+        assert!(
+            message.contains("--clear"),
+            "错误应提示 --clear，实际：{message}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_unparseable_mid_file_line_with_clear_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        let mut data = serde_json::to_string(&Record::user("a")).unwrap();
+        data.push('\n');
+        data.push_str("{\"type\":\"tool_call\",\"hook\":{}}\n");
+        data.push_str(&serde_json::to_string(&Record::user("b")).unwrap());
+        data.push('\n');
+        fs::write(&session.file, data).unwrap();
+
+        let err = load(&session).unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt { line: 2, .. }));
+        assert!(err.to_string().contains("--clear"));
     }
 
     #[test]
@@ -292,7 +329,7 @@ mod tests {
         assert!(empty.is_empty());
         assert_eq!(same, offset);
 
-        let second = Record::ai("m", "h", "two");
+        let second = Record::ai("m", "h", "two", None);
         append(&session, std::slice::from_ref(&second)).unwrap();
         let (records, next) = read_from(&session, offset).unwrap();
         assert_eq!(records, vec![second]);
@@ -324,6 +361,28 @@ mod tests {
         assert!(!session.file.exists());
         assert!(target.exists());
         assert_eq!(target, history.join("abc").join("sessions-1234.jsonl"));
+        assert_eq!(load(&Session::new(target)).unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn archive_bare_filename_falls_back_to_path_sid() {
+        let dir = tempfile::tempdir().unwrap();
+        // 会话文件是数据根之外的普通文件，会话根为空（无目录名）——模拟
+        // `--clear --session s.jsonl` 的裸文件名形态。
+        let file = dir.path().join("s.jsonl");
+        let session = Session {
+            file: file.clone(),
+            root: PathBuf::new(),
+        };
+        let record = Record::user("裸文件名");
+        append(&session, std::slice::from_ref(&record)).unwrap();
+
+        let history = dir.path().join("history");
+        let target = archive(&session, &history, 1234).unwrap();
+        assert!(!file.exists(), "裸文件名会话应已归档");
+        let sid = path_sid(&file);
+        assert_eq!(sid.len(), 32);
+        assert_eq!(target, history.join(&sid).join("sessions-1234.jsonl"));
         assert_eq!(load(&Session::new(target)).unwrap(), vec![record]);
     }
 
