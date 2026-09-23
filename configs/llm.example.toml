@@ -7,8 +7,12 @@ base_url = "https://api.deepseek.com"
 api_key = "sk-……"
 model = "deepseek-chat"
 
-# 以下均为可选，缺省值为 provider = "openai"、temperature = 0.7、max_tokens = 4096。
-provider = "openai"
+# endpoint_format 决定思考（reasoning）内容是否回传上游：
+#   - openai（缺省）：不回传；
+#   - deepseek / kimi / qwen / glm：请求带 tools 时，带 tool_calls 的 assistant
+#     消息回传顶层 reasoning_content（思考为空时也发空串）。
+# 以下均为可选，缺省值为 endpoint_format = "openai"、temperature = 0.7、max_tokens = 4096。
+endpoint_format = "deepseek"
 temperature = 0.7
 max_tokens = 4096
 

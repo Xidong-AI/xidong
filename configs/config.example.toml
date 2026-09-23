@@ -1,17 +1,20 @@
 # yaa 配置示例。
 #
 # 复制到 $YAA_CONFIG_HOME/config.toml（默认 ~/.config/yaa/config.toml）。
-# 钩子是一段 shell 命令，以 `sh -c` 执行，stdout 即其结果：
-#   - system_prompt / user_prompt：输出完整提示词（替换语义，不叠加内置模板）；
-#   - llm：输出模型供应配置的 TOML（格式见 llm.example.toml）。
-# 提示词钩子每会话执行一次，llm 钩子每次运行执行一次。
+# 钩子是一段 shell 命令，以 `sh -c` 执行：
+#   - init：空会话初始化，仅执行一次；stdout 不进入上下文，内容由命令内的
+#     `yaa --notify` 写入；
+#   - llm：每次运行执行一次，输出模型供应配置的 TOML（格式见 llm.example.toml）。
 
 [hooks]
-# 内置模板由 `"$YAA_BIN" --get-prompt system` 提供，可在此自由拼接。
 # `$YAA_BIN` 是当前 yaa 可执行文件的绝对路径，避免 PATH 中没有 yaa 时钩子失败。
-system_prompt = "echo \"工作目录：$(pwd)\" && \"$YAA_BIN\" --get-prompt system"
-# 没有 AGENTS.md 时输出为空，不当作失败。
-user_prompt = "if [ -f \"$GLB_CFG/AGENTS.md\" ]; then cat \"$GLB_CFG/AGENTS.md\"; fi"
+# 内置系统提示词由 `"$YAA_BIN" --get-prompt system` 提供。
+# 没有 AGENTS.md 时不 notify，避免注入空信封。
+init = '''
+"$YAA_BIN" --notify="系统提示词" -- "$YAA_BIN" --get-prompt system
+if [ -f "$GLB_CFG/AGENTS.md" ]; then "$YAA_BIN" --notify="用户总提示词" -- cat "$GLB_CFG/AGENTS.md"; fi
+"$YAA_BIN" --notify="当前环境" -- echo "工作目录：$(pwd)"
+'''
 llm = "cat $YAA_CONFIG_HOME/llm.toml"
 # 单次钩子执行硬超时（秒），覆盖启动与读尽输出；超时整组击杀，绝不挂起。
 timeout_secs = 30

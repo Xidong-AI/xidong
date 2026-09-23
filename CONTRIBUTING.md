@@ -20,10 +20,10 @@ git config core.hooksPath .githooks
 
 ```plaintext
 crates/
-  yaa-cli/    二进制 yaa：参数解析、入口、stdout/stderr 策略
-  yaa-core/   配置与路径、钩子、模型调用、渲染、agent loop、事件
+  yaa-cli/    二进制 yaa：参数解析、入口、展示渲染、stdout/stderr 策略
+  yaa-core/   配置与路径、工具定义、模型调用、渲染与展示投影、agent loop
   yaa-store/  会话 JSONL 读写、按偏移读、归档
-  yaa-shell/  唯一工具：执行、超时、截断、完整输出落盘
+  yaa-exec/   Shell 执行机制：进程组、超时、流式截断、完整输出落盘
   yaa-msg/    记录类型与序列化
 ```
 
@@ -54,7 +54,7 @@ autocorrect --lint crates docs
 
 仓库的提交钩子会拒绝包含警告或排版问题的代码。
 
-端到端测试位于 `crates/yaa-cli/tests/e2e.rs`，它启动一个本地假 OpenAI 兼容服务并用真实二进制跑通「钩子注入 → 工具调用 → 最终回复」，不访问网络。
+端到端测试位于 `crates/yaa-cli/tests/e2e.rs`，它启动一个本地假 OpenAI 兼容服务并用真实二进制跑通「初始化注入 → 工具调用 → 最终回复」，不访问网络。
 
 ## 提交更改
 

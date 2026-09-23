@@ -13,7 +13,7 @@
 ## Highlights
 
 - **The shell is the only tool**: no built-in file, search, or web tools. Write whatever commands you need; external commands (such as your own `webfetch`) are callable as long as they are on `PATH`.
-- **Hook-driven**: the system prompt, the user prompt, and the model provider configuration are all produced by hook commands, so they can be wired to `cat`, `pass`, `op`, and friends.
+- **Minimal hooks**: only an `init` hook for empty-session initialization and an `llm` hook for the model provider configuration; initialization injections enter the context through `yaa --notify`, and can be wired to `cat`, `pass`, `op`, and friends.
 - **Auditable history**: each session is an append-only JSONL file; at render time records are mapped to model-interface messages.
 - **Per-directory sessions**: the session id is a hash of the canonical working directory, so running `yaa` again in the same directory resumes the session.
 - **Non-interactive**: one `yaa "..."` runs multiple steps internally until the model stops calling tools.
@@ -56,6 +56,8 @@ echo "summarize this repo" | yaa
 yaa --clear                       # archive the current directory's session
 yaa --status                      # print a session summary
 yaa --get-prompt system           # print the built-in system prompt template
+yaa --notify="comment" -- cmd      # run cmd and write its stdout as a notification
+cmd | yaa --notify="comment"       # read stdin and write it as a notification
 yaa --cwd /path/to/project 你好    # set the working directory
 yaa --session /path/to/default.jsonl 你好
 yaa --config /path/to/config.toml 你好
@@ -63,26 +65,27 @@ yaa --verbose                     # also show reasoning and command output
 yaa --quiet                       # print only the final reply
 ```
 
-By default the process log goes to stderr: hook and tool commands are printed as `# description` / `% command` blocks separated by `---`, together with the assistant text of non-final steps; the final reply goes to stdout only, so `yaa 你好 > reply.txt` stays clean.
-`--verbose` adds the model's reasoning and tool command output; hooks only show their description and command, and hook output is never printed. `--quiet` suppresses the whole process log.
+By default the process log goes to stderr: initialization injections, external notifications, and tool commands are printed as `# comment`/`# description` and `% command` blocks separated by `---`, together with the assistant text of non-final steps; the final reply goes to stdout only, so `yaa 你好 > reply.txt` stays clean.
+`--verbose` adds the model's reasoning and tool command output; the `llm` hook is never persisted and never displayed. `--quiet` suppresses the whole process log.
 
 Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook error, `4` model error, `5` reached `max_steps`.
 
 ## How it works
 
-1. **Prompt hooks** (`system_prompt`, `user_prompt`) run once per session; their output is written to history as `system` messages.
+1. **Initialization injection**: on an empty session the `init` hook runs once; the `yaa --notify` calls inside it write `system(source=notify)` events (system prompt, user-wide prompt, current environment).
 2. The **`llm` hook** runs once per invocation; its stdout is parsed into the model provider configuration. It is never persisted and never enters the context.
-3. **Main loop**: re-read history → render to model messages → call the model → run the shell tool → record the result, until the model stops calling tools or `max_steps` is reached.
-4. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded.
+3. **Layered rendering**: injections before the first `user` merge into one `system` message as a stable prefix; later out-of-band notifications merge into the adjacent `user`, keeping the prefix untouched.
+4. **Main loop**: re-read history → render to model messages → call the model → run the shell tool → record the result, until the model stops calling tools or `max_steps` is reached.
+5. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded.
 
 ## Layout
 
 | crate       | Responsibility                                                  |
 | ----------- | --------------------------------------------------------------- |
 | `yaa-cli`   | `yaa` binary: argument parsing, entry point, stdout/stderr policy |
-| `yaa-core`  | Config and paths, hooks, model calls, rendering, agent loop, events |
+| `yaa-core`  | Config and paths, tool definition, model calls, rendering and display projection, agent loop |
 | `yaa-store` | Session JSONL read/write, offset reads, archiving                |
-| `yaa-shell` | The only tool: execution, timeout, truncation, full-output files |
+| `yaa-exec`  | Shell execution mechanism: process group, timeout, streaming truncation, full-output files |
 | `yaa-msg`   | Record types and serialization                                   |
 
 Background: [docs/design.md](docs/design.md); implementation plan: [docs/plan.md](docs/plan.md).

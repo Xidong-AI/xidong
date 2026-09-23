@@ -31,11 +31,11 @@
 
 ```jsonl
 {"type":"system","ts":...,"id":"01J...","source":"notify","command":"\"$YAA_BIN\" --get-prompt system","content":"<系统提示词>\n当前智能体环境是 YAA，一个以 Shell 为唯一工具的智能体。……\n</系统提示词>"}
-{"type":"system","ts":...,"id":"01J...","source":"notify","command":"sh -c 'if [ -f \"$GLB_CFG/AGENTS.md\" ]; then cat \"$GLB_CFG/AGENTS.md\"; fi'","content":"<用户总提示词>\n……AGENTS.md 内容……\n</用户总提示词>"}
+{"type":"system","ts":...,"id":"01J...","source":"notify","command":"cat \"$GLB_CFG/AGENTS.md\"","content":"<用户总提示词>\n……AGENTS.md 内容……\n</用户总提示词>"}
 {"type":"system","ts":...,"id":"01J...","source":"notify","command":"echo \"工作目录：$(pwd)\"","content":"<当前环境>\n工作目录：/home/pj568/项目/yaa\n</当前环境>"}
 {"type":"system","ts":...,"id":"01J...","source":"init","content":""}
 {"type":"user","ts":...,"id":"01J...","content":"你好"}
-{"type":"ai","ts":...,"id":"01J...","model":"...","tool_schema_hash":"...","content":"..."}
+{"type":"ai","ts":...,"id":"01J...","model":"...","tool_schema_hash":"...","content":"...","reasoning":"..."}
 {"type":"tool_call","origin":"ai|user","ts":...,"id":"01J...","call_id":"call_xxx","command":"...","description":"……"}
 {"type":"approval_pending","ts":...,"id":"01J...","call_id":"call_xxx","command":"...","matched_rule":"..."}
 {"type":"approval_resolved","ts":...,"id":"01J...","call_id":"call_xxx","decision":"approve|deny"}
@@ -94,7 +94,7 @@ $ yaa 你好吗？
 
 ---
 # 用户总提示词
-% sh -c 'if [ -f "$GLB_CFG/AGENTS.md" ]; then cat "$GLB_CFG/AGENTS.md"; fi'
+% cat "$GLB_CFG/AGENTS.md"
 
 ---
 # 当前环境
@@ -117,7 +117,7 @@ $ yaa 不用子智能体，帮我查未来五天的天气并写入到文件 \`/h
 
 ---
 # 用户总提示词
-% sh -c 'if [ -f "$GLB_CFG/AGENTS.md" ]; then cat "$GLB_CFG/AGENTS.md"; fi'
+% cat "$GLB_CFG/AGENTS.md"
 
 ---
 # 当前环境
@@ -218,7 +218,7 @@ yaa --config $path_to/config.toml
 ## 配置文件
 
 配置文件 `$YAA_CONFIG_HOME/config.toml` 内配置钩子命令、命令和目录拦截放行规则、压缩触发条件、timeout 和 max-steps 什么的。
-钩子只有两个：`init`（空会话初始化，内容经 `yaa --notify` 写入上下文）与 `llm`（模型供应配置，不进入上下文）。默认命令均可替换。
+钩子只有两个：`init`（空会话初始化，内容经 `yaa --notify` 写入上下文）与 `llm`（模型供应配置，不进入上下文）。默认命令均可替换。`llm` 输出的配置含 `endpoint_format`，用于决定思考内容是否回传（见 [`plan.md`](plan.md) D24）。
 
 阶段 1 已实现钩子命令、timeout 与 max-steps；拦截放行规则属阶段 2，压缩触发条件属阶段 3。
 
