@@ -179,25 +179,44 @@ pub fn archive(session: &Session, history_root: &Path, ts: i64) -> Result<PathBu
 
     let target_dir = history_root.join(&sid);
     fs::create_dir_all(&target_dir)?;
-    let target = unique_archive_path(&target_dir, ts);
+    let target = unique_archive_path(&target_dir, ts)?;
     fs::rename(&session.file, &target)?;
     Ok(target)
 }
 
 /// 归档目标路径：`sessions-<ts>.jsonl` 已存在时追加 `-<n>`（n 从 1 递增），
 /// 不再静默覆盖同一毫秒内的既有归档。
-fn unique_archive_path(target_dir: &Path, ts: i64) -> PathBuf {
+///
+/// 候选路径用 `create_new` **原子占位**后再返回，而非先 `exists()` 再交给调用方
+/// `rename`。并发归档时 `exists()` 与 `rename` 之间存在窗口，两个进程可能选中同一
+/// 路径，后到的 `rename` 会原子覆盖前者、永久丢一份历史（违反「归档即不可变历史」）。
+/// 占位文件随后被 `archive` 的 `rename` 覆盖；若在占位后、`rename` 前崩溃，只会留下
+/// 一个空归档文件，这是可接受的后果。
+fn unique_archive_path(target_dir: &Path, ts: i64) -> Result<PathBuf> {
     let target = target_dir.join(format!("sessions-{ts}.jsonl"));
-    if !target.exists() {
-        return target;
+    if let Some(path) = try_reserve(&target)? {
+        return Ok(path);
     }
     for n in 1u32.. {
         let candidate = target_dir.join(format!("sessions-{ts}-{n}.jsonl"));
-        if !candidate.exists() {
-            return candidate;
+        if let Some(path) = try_reserve(&candidate)? {
+            return Ok(path);
         }
     }
     unreachable!("u32 序号耗尽不应发生")
+}
+
+/// 对候选路径原子占位：`create_new` 成功返回路径，已存在返回 `None`，其它错误传播。
+fn try_reserve(candidate: &Path) -> Result<Option<PathBuf>> {
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(candidate)
+    {
+        Ok(_) => Ok(Some(candidate.to_path_buf())),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// 裸文件名会话的 sid 兜底：绝对路径的 sha256 前 32 位十六进制。
@@ -410,6 +429,21 @@ mod tests {
     }
 
     #[test]
+    fn unique_archive_path_reserves_each_call() {
+        let dir = tempfile::tempdir().unwrap();
+        // 两次「同一 ts 的占位」必须各自独占一个路径，否则并发归档会互相覆盖。
+        let first = unique_archive_path(dir.path(), 1234).unwrap();
+        let second = unique_archive_path(dir.path(), 1234).unwrap();
+        assert_ne!(first, second, "同一 ts 的每次占位都必须拿到独占路径");
+        assert_eq!(first, dir.path().join("sessions-1234.jsonl"));
+        assert_eq!(second, dir.path().join("sessions-1234-1.jsonl"));
+        assert!(
+            first.exists() && second.exists(),
+            "占位应留下空文件以防覆盖"
+        );
+    }
+
+    #[test]
     fn archive_bare_filename_falls_back_to_path_sid() {
         let dir = tempfile::tempdir().unwrap();
         // 会话文件是数据根之外的普通文件，会话根为空（无目录名）——模拟
@@ -499,6 +533,55 @@ mod tests {
         append(&session, std::slice::from_ref(&third)).unwrap();
 
         assert_eq!(load(&session).unwrap(), vec![first, second, third]);
+    }
+
+    /// B1 的确定性复现：并发 `append` 的 `repair_trailing` 会把另一个写者的
+    /// 短写半行当作断电撕裂尾段 `set_len` 截断，导致其已写内容永久丢失、
+    /// 后续补写错位成中部损坏行。
+    ///
+    /// 用分步 `write` 模拟进程 A 的 `write_all` 被短写打断，再让进程 B 的
+    /// `append` 介入，最后 A 恢复补写剩余字节（`O_APPEND` 定位到新 EOF）。
+    /// 留作已知并发缺陷的实证，待阶段 4 引入 runner 写锁后应删除并替换为
+    /// 并发安全测试；当前用 `#[ignore]` 避免把缺陷行为固化为常规断言。
+    #[test]
+    #[ignore = "已知并发缺陷：待阶段 4 runner 写锁修复后删除"]
+    fn concurrent_short_write_is_truncated_by_another_appender() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+
+        // 进程 A 的 `write_all` 被短写打断：完整记录后只写出下一条记录的前半。
+        let full = Record::user("A完整");
+        let a_record = serde_json::to_string(&Record::user("A后半")).unwrap();
+        let a_bytes = a_record.as_bytes();
+        let mid = a_bytes.len() / 2;
+        let (a_head, a_tail) = a_bytes.split_at(mid);
+        let mut initial = serde_json::to_string(&full).unwrap().into_bytes();
+        initial.push(b'\n');
+        initial.extend_from_slice(a_head);
+        fs::write(&session.file, &initial).unwrap();
+
+        // 进程 B 的 append 介入：把 A 的无换行半行当撕裂尾段截断。
+        let b = Record::user("B");
+        append(&session, std::slice::from_ref(&b)).unwrap();
+
+        // 进程 A 恢复：剩余字节经 O_APPEND 落到 B 之后。
+        let mut file = OpenOptions::new().append(true).open(&session.file).unwrap();
+        file.write_all(a_tail).unwrap();
+        file.write_all(b"\n").unwrap();
+        file.sync_all().unwrap();
+
+        // A 的前半已被 B 永久删除。
+        let raw = fs::read(&session.file).unwrap();
+        assert!(
+            !raw.windows(a_head.len()).any(|w| w == a_head),
+            "A 的半行前半应已被 B 的 repair 截断删除"
+        );
+        // A 的后半错位成不可解析的中部行，整个会话读取报损坏。
+        let err = load(&session).unwrap_err();
+        assert!(
+            matches!(err, StoreError::Corrupt { .. }),
+            "错位的半行应导致中部损坏，实际：{err:?}"
+        );
     }
 
     #[test]

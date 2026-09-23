@@ -7,6 +7,14 @@
 //! 本进程组、仍持有管道的后台进程会导致输出在读取宽限期后被放弃（回填占位提示），
 //! 但这不等于超时，不置 `timed_out`。长任务应自行 `nohup <cmd> >/dev/null 2>&1 &`
 //! 脱离工具管道，而不是依赖读取宽限。
+//!
+//! # 已知限制：被放弃的读取线程与管道 fd
+//!
+//! 放弃流时不会 join 读取线程（join 会与「永不挂起」的保证冲突）。这**不是永久
+//! fd 泄漏**：读取线程阻塞在管道 `read` 上，只有当所有写端关闭（直接子进程与仍
+//! 持有管道的逃逸进程都已退出）后 `read` 才返回 EOF，线程随之结束并释放其持有的
+//! 管道 fd。也就是说，放弃只造成**暂时**占用；能被观测到的长期占用来源于把管道
+//! 写端留在原地、永久存活的后台进程——这与放弃策略是同一取舍，并非额外的泄漏。
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -138,9 +146,10 @@ pub(crate) fn run_blocking(
     }
 
     // 被放弃的流只回填占位文本，**不**把 `timed_out` 置真：逃逸进程组攥住管道并非
-    // 超时，误报会让调用方以为命令被超时击杀（T5）。
-    let (stdout, _stdout_abandoned) = resolve_stream(out_result, "stdout")?;
-    let (stderr, _stderr_abandoned) = resolve_stream(err_result, "stderr")?;
+    // 超时，误报会让调用方以为命令被超时击杀（T5）。放弃的读取线程会在管道写端
+    // 全部关闭后自行结束并释放 fd（见模块「已知限制」），无需也无法在此 join。
+    let stdout = resolve_stream(out_result, "stdout")?;
+    let stderr = resolve_stream(err_result, "stderr")?;
 
     let truncated = stdout.truncated || stderr.truncated;
     let canonical = |path: Option<PathBuf>| path.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
@@ -174,17 +183,14 @@ fn recv_until(
 fn resolve_stream(
     result: Option<io::Result<StreamOutput>>,
     name: &str,
-) -> Result<(StreamOutput, bool), ShellError> {
+) -> Result<StreamOutput, ShellError> {
     match result {
-        Some(Ok(stream)) => Ok((stream, false)),
+        Some(Ok(stream)) => Ok(stream),
         Some(Err(e)) => Err(e.into()),
-        None => Ok((
-            StreamOutput {
-                text: format!("[{name} 读取超时：已放弃等待持有管道的后台进程]"),
-                truncated: false,
-            },
-            true,
-        )),
+        None => Ok(StreamOutput {
+            text: format!("[{name} 读取超时：已放弃等待持有管道的后台进程]"),
+            truncated: false,
+        }),
     }
 }
 

@@ -100,12 +100,13 @@ pub struct ShellOutput {
 }
 
 /// 一个被捕获的流（如 stdin）的截断结果与完整输出文件。
+///
+/// 没有 `truncated` 字段：是否截断可由 `file` 是否为 `Some` 唯一判定（只有截断才
+/// 会落盘完整输入），保留独立布尔值只会产生两处可互相矛盾的状态。
 #[derive(Debug, Clone)]
 pub struct CapturedStream {
     /// 入记录文本：未截断为全量，截断为头尾拼接并带 `... [truncated] ...` 标记。
     pub text: String,
-    /// 是否发生了截断。
-    pub truncated: bool,
     /// 仅在发生截断时给出，绝对路径，指向完整输入。
     pub file: Option<PathBuf>,
 }
@@ -162,7 +163,6 @@ where
             .map(|path| std::fs::canonicalize(&path).unwrap_or(path));
         Ok::<_, ShellError>(CapturedStream {
             text: stream.text,
-            truncated: stream.truncated,
             file,
         })
     })
@@ -346,7 +346,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(!captured.truncated);
         assert!(captured.file.is_none());
         assert_eq!(captured.text, "hello\n");
     }
@@ -364,7 +363,6 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(captured.truncated);
         assert!(captured.text.contains("\n... [truncated] ...\n"));
         assert!(captured.text.starts_with("1\n2\n"));
         assert!(captured.text.trim_end().ends_with("100000"));
