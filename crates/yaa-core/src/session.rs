@@ -35,11 +35,7 @@ pub fn resolve(
 
     if let Some(path) = session_arg {
         let session = yaa_store::Session::new(path);
-        let sid = session
-            .root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let sid = sid_of(&session);
         return Ok(Resolved {
             session,
             sid,
@@ -57,6 +53,51 @@ pub fn resolve(
         cwd_absolute,
         warned,
     })
+}
+
+/// 解析会话目标，优先级：显式 `--session` → 环境变量 `YAA_SESSION`（非空才算）
+/// → 当前 cwd 默认会话。
+///
+/// 显式路径相对当前 cwd 词法绝对化（与 `--notify` 的既有语义一致）；`YAA_SESSION`
+/// 不属于「cwd 规范化回退」，故 `warned = false`、`cwd_absolute` 取当前工作目录。
+/// 默认分支复用 [`resolve`]，不改变 `--clear`/`--status` 与普通 run 的既有行为。
+pub fn resolve_target(
+    cwd: &Path,
+    session_arg: Option<&Path>,
+    env_session: Option<&str>,
+    data_root: &Path,
+) -> anyhow::Result<Resolved> {
+    if let Some(path) = session_arg {
+        let session = yaa_store::Session::new(std::path::absolute(path)?);
+        let sid = sid_of(&session);
+        let (cwd_absolute, warned) = absolute_cwd(cwd);
+        return Ok(Resolved {
+            session,
+            sid,
+            cwd_absolute,
+            warned,
+        });
+    }
+    if let Some(path) = env_session.filter(|value| !value.is_empty()) {
+        let session = yaa_store::Session::new(std::path::absolute(Path::new(path))?);
+        let sid = sid_of(&session);
+        return Ok(Resolved {
+            session,
+            sid,
+            cwd_absolute: cwd.to_path_buf(),
+            warned: false,
+        });
+    }
+    resolve(cwd, None, data_root)
+}
+
+/// 会话根目录名作为 sid；无目录名时回退空串。
+fn sid_of(session: &yaa_store::Session) -> String {
+    session
+        .root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// 会话输出目录：`<会话根>/outputs`。
@@ -145,6 +186,40 @@ mod tests {
         assert_eq!(resolved.session.root, dir.path().join("custom"));
         assert_eq!(resolved.sid, "custom");
         assert!(!resolved.warned);
+    }
+
+    #[test]
+    fn resolve_target_prefers_explicit_then_env_then_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let explicit = dir.path().join("explicit.jsonl");
+        let from_env = dir.path().join("env").join("from-env.jsonl");
+
+        // 显式参数优先于环境变量。
+        let resolved = resolve_target(
+            &cwd,
+            Some(&explicit),
+            Some(from_env.to_str().unwrap()),
+            &data,
+        )
+        .unwrap();
+        assert_eq!(resolved.session.file, explicit);
+
+        // 无显式参数时用 YAA_SESSION；显式路径不算 cwd 规范化回退，故不告警。
+        let resolved = resolve_target(&cwd, None, Some(from_env.to_str().unwrap()), &data).unwrap();
+        assert_eq!(resolved.session.file, from_env);
+        assert!(!resolved.warned);
+        assert_eq!(resolved.cwd_absolute, cwd);
+
+        // 空串环境变量视为未设置，回退 cwd 默认会话。
+        let resolved = resolve_target(&cwd, None, Some(""), &data).unwrap();
+        assert_eq!(
+            resolved.session.root,
+            data.join("sessions").join(&resolved.sid)
+        );
+        assert!(is_lower_hex(&resolved.sid));
     }
 
     #[test]
