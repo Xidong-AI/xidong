@@ -525,6 +525,8 @@ impl Counts {
             Record::ToolCall(_) => self.tool_call += 1,
             Record::ToolResult(_) => self.tool_result += 1,
             Record::System(_) => self.system += 1,
+            // 审批记录不计入阶段 1 的统计口径。
+            Record::ApprovalPending(_) | Record::ApprovalResolved(_) => {}
         }
     }
 }
@@ -537,6 +539,8 @@ fn record_ts(record: &Record) -> i64 {
         Record::ToolCall(record) => record.ts,
         Record::ToolResult(record) => record.ts,
         Record::System(record) => record.ts,
+        Record::ApprovalPending(record) => record.ts,
+        Record::ApprovalResolved(record) => record.ts,
     }
 }
 

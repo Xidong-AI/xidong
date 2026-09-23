@@ -7,6 +7,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::approval::{Action, Rule};
 use crate::paths;
 
 /// 默认初始化钩子：空会话时执行一次，用三条 `yaa --notify` 拼出「系统提示词 /
@@ -38,6 +39,13 @@ pub struct Config {
     pub hooks: Hooks,
     pub shell: ShellConfig,
     pub agent: AgentConfig,
+    pub approval: ApprovalConfig,
+}
+
+/// 审批规则配置。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ApprovalConfig {
+    pub rules: Vec<Rule>,
 }
 
 /// 钩子命令与执行限额。
@@ -116,6 +124,7 @@ struct RawConfig {
     hooks: Option<RawHooks>,
     shell: Option<RawShell>,
     agent: Option<RawAgent>,
+    approval: Option<RawApproval>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +148,17 @@ struct RawAgent {
     request_timeout_secs: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+struct RawApproval {
+    rules: Option<Vec<RawRule>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRule {
+    pattern: String,
+    action: String,
+}
+
 impl Config {
     /// 从路径加载配置。
     ///
@@ -157,7 +177,7 @@ impl Config {
         };
         let raw: RawConfig = toml::from_str(&text)
             .map_err(|err| anyhow::anyhow!("解析配置失败 {}：{err}", path.display()))?;
-        let config = merge(raw);
+        let config = merge(raw)?;
         validate(&config)?;
         Ok(config)
     }
@@ -172,7 +192,9 @@ impl Config {
 }
 
 /// 把可能缺键的原始配置合并到默认值上。
-fn merge(raw: RawConfig) -> Config {
+///
+/// `action` 需映射为枚举，未知取值在此报错（配置错误语义），因此返回 `Result`。
+fn merge(raw: RawConfig) -> anyhow::Result<Config> {
     let mut config = Config::default();
     if let Some(hooks) = raw.hooks {
         if let Some(value) = hooks.init {
@@ -207,7 +229,37 @@ fn merge(raw: RawConfig) -> Config {
             config.agent.request_timeout_secs = value;
         }
     }
-    config
+    if let Some(approval) = raw.approval
+        && let Some(rules) = approval.rules
+    {
+        config.approval.rules = rules
+            .into_iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                let action = parse_action(&rule.action).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "配置非法：approval.rules[{index}].action 取值未知：{}（应为 allow / ask / deny）。",
+                        rule.action
+                    )
+                })?;
+                Ok(Rule {
+                    pattern: rule.pattern,
+                    action,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+    }
+    Ok(config)
+}
+
+/// 把配置中的动作字符串映射为枚举。
+fn parse_action(value: &str) -> Option<Action> {
+    match value {
+        "allow" => Some(Action::Allow),
+        "ask" => Some(Action::Ask),
+        "deny" => Some(Action::Deny),
+        _ => None,
+    }
 }
 
 /// 校验限额，非法时返回清晰错误而不是静默错误行为。
@@ -443,6 +495,71 @@ tail_chars = 2
         );
         let config = Config::load(file.path()).unwrap();
         assert_eq!(config.shell.max_stream_chars, 10);
+    }
+
+    #[test]
+    fn approval_defaults_to_empty_rules() {
+        let config = Config::default();
+        assert!(config.approval.rules.is_empty());
+    }
+
+    #[test]
+    fn approval_rules_are_parsed() {
+        let file = write_config(
+            r#"
+[approval]
+rules = [
+  { pattern = "rm *",  action = "deny" },
+  { pattern = "git *", action = "allow" },
+  { pattern = "curl *", action = "ask" },
+]
+"#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(
+            config.approval.rules,
+            vec![
+                Rule {
+                    pattern: "rm *".into(),
+                    action: Action::Deny,
+                },
+                Rule {
+                    pattern: "git *".into(),
+                    action: Action::Allow,
+                },
+                Rule {
+                    pattern: "curl *".into(),
+                    action: Action::Ask,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn approval_empty_rules_is_valid() {
+        let file = write_config("[approval]\nrules = []\n");
+        let config = Config::load(file.path()).unwrap();
+        assert!(config.approval.rules.is_empty());
+    }
+
+    #[test]
+    fn approval_unknown_action_is_rejected() {
+        let file =
+            write_config("[approval]\nrules = [{ pattern = \"rm *\", action = \"block\" }]\n");
+        let err = Config::load(file.path()).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("approval"),
+            "错误应指明 approval：{message}"
+        );
+        assert!(message.contains("block"), "错误应含非法取值：{message}");
+    }
+
+    #[test]
+    fn missing_approval_section_keeps_defaults() {
+        let file = write_config("[shell]\ntimeout_secs = 9\n");
+        let config = Config::load(file.path()).unwrap();
+        assert!(config.approval.rules.is_empty());
     }
 
     #[test]

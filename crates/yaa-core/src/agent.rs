@@ -525,6 +525,8 @@ mod tests {
             Record::ToolCall(_) => "tool_call",
             Record::ToolResult(_) => "tool_result",
             Record::System(_) => "system",
+            Record::ApprovalPending(_) => "approval_pending",
+            Record::ApprovalResolved(_) => "approval_resolved",
         }
     }
 

@@ -1,9 +1,9 @@
-//! 记录类型定义（阶段 1 冻结 schema）。
+//! 记录类型定义。
 //!
-//! 内部标签枚举，`type` 取值 `user` / `ai` / `tool_call` / `tool_result` / `system`。
+//! 内部标签枚举，`type` 取值 `user` / `ai` / `tool_call` / `tool_result` / `system` /
+//! `approval_pending` / `approval_resolved`。
 //! 所有记录都带唯一 `id`（阶段 4 幂等去重），`tool_result` 另用 `call_id` 配对
-//! `tool_call`。`approval_pending` / `approval_resolved` 属阶段 2，此处刻意不定义，
-//! 以免引入当前无消费者的死分支。
+//! `tool_call`；两条审批记录也用 `call_id` 与工具调用配对，但不参与模型消息投影。
 
 use serde::{Deserialize, Serialize};
 
@@ -18,6 +18,8 @@ pub enum Record {
     ToolCall(ToolCall),
     ToolResult(ToolResult),
     System(System),
+    ApprovalPending(ApprovalPending),
+    ApprovalResolved(ApprovalResolved),
 }
 
 impl Record {
@@ -29,6 +31,8 @@ impl Record {
             Record::ToolCall(r) => &r.id,
             Record::ToolResult(r) => &r.id,
             Record::System(r) => &r.id,
+            Record::ApprovalPending(r) => &r.id,
+            Record::ApprovalResolved(r) => &r.id,
         }
     }
 
@@ -121,6 +125,31 @@ impl Record {
             content: content.into(),
         })
     }
+
+    /// 待批工具调用。`call_id` 指向已落盘的 `tool_call`，`matched_rule` 为命中的规则文本。
+    pub fn approval_pending(
+        call_id: impl Into<String>,
+        command: impl Into<String>,
+        matched_rule: impl Into<String>,
+    ) -> Self {
+        Record::ApprovalPending(ApprovalPending {
+            id: new_id(),
+            ts: now_ms(),
+            call_id: call_id.into(),
+            command: command.into(),
+            matched_rule: matched_rule.into(),
+        })
+    }
+
+    /// 审批决策，与 `approval_pending` 共用 `call_id` 配对。
+    pub fn approval_resolved(call_id: impl Into<String>, decision: ApprovalDecision) -> Self {
+        Record::ApprovalResolved(ApprovalResolved {
+            id: new_id(),
+            ts: now_ms(),
+            call_id: call_id.into(),
+            decision,
+        })
+    }
 }
 
 fn new_id() -> String {
@@ -211,6 +240,33 @@ pub struct System {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_files: Option<OutputFiles>,
     pub content: String,
+}
+
+/// 审批决策。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// 待批工具调用记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalPending {
+    pub id: String,
+    pub ts: i64,
+    pub call_id: String,
+    pub command: String,
+    pub matched_rule: String,
+}
+
+/// 审批决策记录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalResolved {
+    pub id: String,
+    pub ts: i64,
+    pub call_id: String,
+    pub decision: ApprovalDecision,
 }
 
 #[cfg(test)]
@@ -476,5 +532,60 @@ mod tests {
         let b = Record::user("b");
         assert_ne!(a.id(), b.id());
         assert!(!a.id().is_empty());
+    }
+
+    #[test]
+    fn approval_pending_golden_and_round_trip() {
+        let r = Record::ApprovalPending(ApprovalPending {
+            id: "01JAP".into(),
+            ts: 6,
+            call_id: "call_1".into(),
+            command: "rm -rf /".into(),
+            matched_rule: "rm *".into(),
+        });
+        let line = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            line,
+            r#"{"type":"approval_pending","id":"01JAP","ts":6,"call_id":"call_1","command":"rm -rf /","matched_rule":"rm *"}"#
+        );
+        assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn approval_resolved_golden_and_round_trip() {
+        let r = Record::ApprovalResolved(ApprovalResolved {
+            id: "01JAR".into(),
+            ts: 7,
+            call_id: "call_1".into(),
+            decision: ApprovalDecision::Approve,
+        });
+        let line = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            line,
+            r#"{"type":"approval_resolved","id":"01JAR","ts":7,"call_id":"call_1","decision":"approve"}"#
+        );
+        assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn approval_decision_is_snake_case() {
+        for (decision, tag) in [
+            (ApprovalDecision::Approve, "approve"),
+            (ApprovalDecision::Deny, "deny"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&decision).expect("serialize"),
+                format!("\"{tag}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn approval_constructors_assign_unique_ids() {
+        let pending = Record::approval_pending("call_1", "echo hi", "echo *");
+        let resolved = Record::approval_resolved("call_1", ApprovalDecision::Deny);
+        assert_ne!(pending.id(), resolved.id());
+        assert!(!pending.id().is_empty());
+        assert!(!resolved.id().is_empty());
     }
 }

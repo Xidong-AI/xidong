@@ -1,6 +1,7 @@
 //! `yaa-core`：配置、agent loop、渲染投影、工具定义、钩子与模型调用。
 
 pub mod agent;
+pub mod approval;
 pub mod config;
 pub mod display;
 pub mod hook;
