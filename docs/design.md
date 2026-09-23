@@ -12,41 +12,53 @@
 
 对每个模块做最小化设计。智能体只有 Shell 命令这一个工具调用。
 为确保高度可维护性，模块数量和功能数量应做到最少。
-系统生命周期钩子：比如上下文和提示词注入，也由系统内部钩子触发 Shell 命令实现；钩子命令与智能体工具调用分开执行、策略不同，但同样以 `origin=hook` 的 `tool_call`/`tool_result` 记录，供审计与缓存判定。
 
 可能先做三到四个 crate 吧：
 
-- `yaa-cli`：参数解析、入口、stdout/stderr 策略。
-- `yaa-core`：智能体循环（Agent loop）、提示词组装、模型调用、消息模型、压缩并渲染上下文视图。
+- `yaa-cli`：参数解析、入口、展示渲染、stdout/stderr 策略；`yaa --notify` 的写入路径也在此短路。
+- `yaa-core`：智能体循环（Agent loop）、工具定义（`tools`）、模型调用、消息模型、渲染与展示投影、上下文分层装配（见 [`dsh-context.md`](dsh-context.md)）。
 - `yaa-store`：会话 JSONL、归档、加载。
-- `yaa-shell`：唯一工具，负责执行命令、超时、截断、策略。
+- `yaa-exec`：Shell 执行机制，负责进程组、超时、流式截断、完整输出落盘；不含工具定义。
 - `yaa-msg`：消息类型。
+
+唯一工具的全部知识——function schema、提示词片段、参数解析、错误文案、调用编排与结果转换——集中在 `yaa-core::tools`，不跨 crate 维护；`yaa-exec` 只是被它调用的执行机制。单工具场景不引入 trait/registry 与模板引擎。
+
+向上下文注入内容只有一条外部接口：`yaa --notify` 把外部产出（初始化脚本、后台任务、用户管道）写成 `system` 事件。系统提示词不再走专用的钩子记录，而是空会话初始化脚本调用 `yaa --notify` 写入的普通事件；`llm` 配置加载不进入上下文，也不留记录。
 
 ## 历史消息
 
 历史消息管理框架模块以消息队列的形式存储历史消息。
 
 ```jsonl
+{"type":"system","ts":...,"id":"01J...","source":"notify","command":"\"$YAA_BIN\" --get-prompt system","content":"<系统提示词>\n当前智能体环境是 YAA，一个以 Shell 为唯一工具的智能体。……\n</系统提示词>"}
+{"type":"system","ts":...,"id":"01J...","source":"notify","command":"sh -c 'if [ -f \"$GLB_CFG/AGENTS.md\" ]; then cat \"$GLB_CFG/AGENTS.md\"; fi'","content":"<用户总提示词>\n……AGENTS.md 内容……\n</用户总提示词>"}
+{"type":"system","ts":...,"id":"01J...","source":"notify","command":"echo \"工作目录：$(pwd)\"","content":"<当前环境>\n工作目录：/home/pj568/项目/yaa\n</当前环境>"}
+{"type":"system","ts":...,"id":"01J...","source":"init","content":""}
 {"type":"user","ts":...,"id":"01J...","content":"你好"}
-{"type":"tool_call","origin":"hook","ts":...,"id":"01J...","call_id":"call_xxx","command":"echo \"工作目录：$(pwd)\" && \"$YAA_BIN\" --get-prompt \"system\"","hook":{"name":"system_prompt","fingerprint":"..."},"redacted":false}
-{"type":"tool_result","ts":...,"id":"01J...","call_id":"call_xxx","stdout":"...","stderr":"...","code":0,"timed_out":false,"truncated":false}
-{"type":"tool_call","origin":"hook","ts":...,"id":"01J...","call_id":"call_xxx","command":"cat $YAA_CONFIG_HOME/AGENTS.md","hook":{"name":"user_prompt","fingerprint":"..."},"redacted":false}
-{"type":"tool_result","ts":...,"id":"01J...","call_id":"call_xxx","stdout":"...","stderr":"...","code":0,"timed_out":false,"truncated":false}
 {"type":"ai","ts":...,"id":"01J...","model":"...","tool_schema_hash":"...","content":"..."}
-{"type":"tool_call","origin":"ai|user","ts":...,"id":"01J...","call_id":"call_xxx","command":"...","description":"……","redacted":false}
+{"type":"tool_call","origin":"ai|user","ts":...,"id":"01J...","call_id":"call_xxx","command":"...","description":"……"}
 {"type":"approval_pending","ts":...,"id":"01J...","call_id":"call_xxx","command":"...","matched_rule":"..."}
 {"type":"approval_resolved","ts":...,"id":"01J...","call_id":"call_xxx","decision":"approve|deny"}
 {"type":"tool_result","ts":...,"id":"01J...","call_id":"call_xxx","stdout":"...","stderr":"...","code":0,"timed_out":false,"truncated":true,"output_files":{"stdout":"sessions/<sid>/outputs/01J....stdout.out"}}
-{"type":"system","source":"notify|error|...","scope":"ai|shell|store|...","ts":...,"id":"01J...","content":"（系统警告、后台任务返回或错误等的消息）"}
+{"type":"system","ts":...,"id":"01J...","source":"notify","command":"git status --short","content":"<由用户执行>\n……外部通知……\n</由用户执行>"}
 ```
 
 > `ts` 为 Unix 毫秒；`id` 为 ULID，全记录唯一；`tool_result` 用 `call_id` 与 `tool_call` 配对。
 >
-> 提示词钩子记录在 `user` 之后写入（用户输入先落盘），渲染时才提升为消息列表最前的 `system`；钩子的 `tool_call` 不写 `description`，该文案由 CLI 展示层现算。
+> `system` 事件是内容进入上下文的唯一通道：`source=notify` 承载 `yaa --notify` 写入的通知，正文内联 `<注释>` 信封（呈献给模型时即此文本）；`source=init` 是空会话初始化的簿记，`content` 为空、不渲染。可选 `command` 保存产生该通知的命令，**只用于展示，不进入上下文**；stdin 形态与簿记没有此项。注入内容的渲染角色由事件在日志中的**物理位置**决定，不依赖额外字段。
 
 过往历史消息不可变，上下文只是基于历史消息构造的渲染视图。
 渲染时语义转换为对应接口格式的消息，所以模型始终看到的是结构和内容合规的上下文。
-如开头的提示词注入被格式化为 OpenAI 的 `system` 而非 `assistant.tool_calls` 和 `tool`。
+如开头的初始化注入被格式化为 OpenAI 的 `system`，而非 `assistant.tool_calls` 和 `tool`。
+
+上下文按稳定性分层装配（对齐 [`dsh-context.md`](dsh-context.md)）：稳定前缀放消息列表最前的 `system`，易变内容追加在历史尾部，工具 schema 独立于消息。渲染规则：
+
+- 首条 `user` 事件之前的所有 `system` 通知按物理顺序合并为**一条** `system` 消息，作为初始化注入的稳定前缀。
+- 首条 `user` 之后的离群 `system` 通知与相邻 `user` 事件合并为一条 `user` 消息；其后没有 `user` 时单独成为一条 `user` 消息。易变内容因此留在历史尾部，不污染前缀。
+- 空内容的 `system`（初始化簿记）不产生消息。
+- `ai` 与其 `tool_call`、配对 `tool_result` 分别投影 `assistant` 与 `tool` 消息；`tool_call(origin=user)` 绝不做成 `tool` 消息。
+
+渲染视图是模型消息与用户展示的共同事实源：两者都从同一份事件日志派生，不维护第二套执行事件流。`llm` 配置加载不写事件，既不渲染、也不展示。
 
 上下文压缩参考 DSH (DeepSeek Harness) 的 `compaction-basic`：先跑无模型的头尾 pruner，仍超阈值再发一次摘要 LLM 调用。
 压缩只发生在渲染阶段，原始 JSONL 不变。
@@ -77,12 +89,16 @@ $YAA_DATA_HOME/history/<sid>/sessions-<ts>.jsonl                  # 主历史归
 
 ```zsh
 $ yaa 你好吗？
-# 注入系统提示词
-% echo "工作目录：$(pwd)" && "$YAA_BIN" --get-prompt system
+# 系统提示词
+% "$YAA_BIN" --get-prompt system
 
 ---
-# 注入用户提示词
-% cat $YAA_CONFIG_HOME/AGENTS.md
+# 用户总提示词
+% sh -c 'if [ -f "$GLB_CFG/AGENTS.md" ]; then cat "$GLB_CFG/AGENTS.md"; fi'
+
+---
+# 当前环境
+% echo "工作目录：$(pwd)"
 
 ---
 我很好，谢谢，您还有什么需要帮助的吗？
@@ -91,16 +107,21 @@ $ yaa 不用了，只是确认是否能正常回复。
 好的，需要帮助时随时叫我。
 
 $ yaa --clear
-# 归档历史消息（内部完成，不经过 Shell 钩子）
+# 归档历史消息（内部完成，不调用工具或钩子）
 $YAA_DATA_HOME/history/<sid>/sessions-<ts>.jsonl
 
+$ cd /home/pj568/桌面
 $ yaa 不用子智能体，帮我查未来五天的天气并写入到文件 \`/home/pj568/桌面/temp.txt\`。
-# 注入系统提示词
-% echo "工作目录：$(pwd)" && "$YAA_BIN" --get-prompt system
+# 系统提示词
+% "$YAA_BIN" --get-prompt system
 
 ---
-# 注入用户提示词
-% cat $YAA_CONFIG_HOME/AGENTS.md
+# 用户总提示词
+% sh -c 'if [ -f "$GLB_CFG/AGENTS.md" ]; then cat "$GLB_CFG/AGENTS.md"; fi'
+
+---
+# 当前环境
+% echo "工作目录：$(pwd)"
 
 ---
 当前工作目录已在 `/home/pj568/桌面/`。
@@ -161,11 +182,13 @@ $ yaa --approve
 
 遇到拦截时退出，`--approve` 允许执行并继续，直接写提示词等情况默认拒绝并提示已被拒绝（审批整体属阶段 2）。
 
+初始化注入与外部通知都用与工具调用一致的块样式展示：默认 `# 注释` + `% 命令`（摘要），`--verbose` 追加内容全文；初始化只在空会话触发一次，`llm` 配置加载不展示。
+
 本节是使用效果示意，非逐字规范：具体参数以下文“参数（待定）”为准，实现状态见 `docs/plan.md`。示例里的 `yaa-webfetch` 是外部辅助命令，不属于 `yaa` 自带工具；提示词打印已定为 `yaa --get-prompt` 子命令。
 
 ## 参数（待定）
 
-阶段 1 已实现 `--status`/`--session`/`--clear`/`--verbose`/`--quiet`/`--get-prompt`/`--cwd`/`--config`；`--json`/`--no-store`/`--approve` 属阶段 2，`--notify` 属阶段 5。
+阶段 1 已实现 `--status`/`--session`/`--clear`/`--verbose`/`--quiet`/`--get-prompt`/`--cwd`/`--config`，以及 `--notify` 的写入形态；`--json`/`--no-store`/`--approve` 属阶段 2；`--notify` 的跨会话目标解析（`--to`/`YAA_NOTIFY`）属阶段 5。
 
 ```plaintext
 yaa [PROMPT]...              # 多个位置参数以空格连接；空则从 stdin 读
@@ -175,13 +198,13 @@ yaa --session $path_to/session.jsonl
 yaa --clear                  # 归档当前目录的会话；若已有 runner 在跑，此时再运行 `yaa "内容"` 会把消息排入 inbox 并跟随输出到循环结束（阶段 4）。
 yaa --verbose                # 追加思考内容与命令输出
 yaa --quiet                  # 仅打印最终结果输出
-yaa --get-prompt system|……   # 仅打印相关提示词
+yaa --get-prompt system      # 仅打印内置系统提示词
+yaa --notify="注释" -- cmd   # 执行 cmd，把输出作为通知写入当前会话
+cmd | yaa --notify="注释"    # 从 stdin 读，写入当前会话
 yaa --json                   # 结构化事件
 yaa --approve                # 同意一次
 yaa --cwd="……"               # 设置会话目录
 yaa --no-store
-yaa --notify --to $SESSION   # 从 stdin 读，完毕后作为 system 消息原子追加进“通知目标会话”。
-yaa --notify -- some-command --args
 yaa --config $path_to/config.toml
 ……
 ```
@@ -194,8 +217,8 @@ yaa --config $path_to/config.toml
 
 ## 配置文件
 
-配置文件 `$YAA_CONFIG_HOME/config.toml` 内配置各部分的钩子调用的命令、命令和目录拦截放行规则、压缩触发条件、timeout 和 max-steps 什么的。
-钩子调用的命令包括默认的系统命令也可替换，模型供应各项配置也是通过钩子命令获取的。
+配置文件 `$YAA_CONFIG_HOME/config.toml` 内配置钩子命令、命令和目录拦截放行规则、压缩触发条件、timeout 和 max-steps 什么的。
+钩子只有两个：`init`（空会话初始化，内容经 `yaa --notify` 写入上下文）与 `llm`（模型供应配置，不进入上下文）。默认命令均可替换。
 
 阶段 1 已实现钩子命令、timeout 与 max-steps；拦截放行规则属阶段 2，压缩触发条件属阶段 3。
 
@@ -203,20 +226,27 @@ yaa --config $path_to/config.toml
 
 和 OpenCode 相似，默认 allow，可配置 deny 和 ask 名单通配符什么的。
 
-## 后台命令（阶段 5）
+## 通知与后台任务
 
-`<任何命令> | yaa --notify &` 执行后不阻塞主循环，待后台任务完毕后能把消息和压缩的执行结果以系统消息发回 inbox。
-其中执行结果的压缩复用工具调用的过长截断压缩加外部完整原始输出文件。
+`yaa --notify` 是内容进入会话的外部接口（写入形态属阶段 1，后台与跨会话语义属阶段 5）：
 
-后台子智能体也复用同一方法，如：
+- `yaa --notify="注释" -- cmd`：执行命令，把 stdout 作为通知写入会话。
+- `cmd | yaa --notify="注释"`：从 stdin 读内容写入。
+- 注释可省略，缺省为「由用户执行」；通知正文内联 `<注释>` 信封。
+
+`system(source=notify)` 事件不被夹在模型的 `assistant.tool_calls` 与配对 `tool` 消息之间，因此是「离群」的；渲染时自动转换为呈现层信封，见上文渲染规则。
+
+模型可以让 shell 工具执行 `some-cmd | yaa --notify="注释" &`：命令立即转入后台，`shell` 工具马上拿到空输出；后台任务结束后，`yaa --notify` 进程把结果原子追加进会话，模型在下一轮才看到它。通知结果的压缩复用工具调用的过长截断与外部完整输出文件。
+
+后台子智能体复用同一方法，如：
 
 ```shellscript
-cd .workspace/temp && yaa --quiet -- "你作为子智能体做某些任务。" | yaa --notify &
+cd .workspace/temp && yaa --quiet -- "你作为子智能体做某些任务。" | yaa --notify="子智能体" &
 # 或可取得更多信息的包装模式
-cd .workspace/temp && yaa --notify -- aa --quiet -- "你作为子智能体做某些任务。"
+cd .workspace/temp && yaa --notify="子智能体" -- yaa --quiet -- "你作为子智能体做某些任务。"
 ```
 
-### 通知目标
+### 通知目标（阶段 5）
 
 维护两个环境变量和一个规则：
 
@@ -230,17 +260,17 @@ cd .workspace/temp && yaa --notify -- aa --quiet -- "你作为子智能体做某
 
 ```zsh
 # 子智能体内部后台任务，默认回子自己
-some-cmd | yaa --notify &
+some-cmd | yaa --notify="注释" &
 
 # 子智能体想显式通知父
-some-cmd | yaa --notify --to "$YAA_PARENT" &
+some-cmd | yaa --notify="注释" --to "$YAA_PARENT" &
 ```
 
 `yaa --notify` 发现目标不存在时 stderr 警告。
 
 ### 主循环召回
 
-`yaa --notify` “召回”时也是拿文件锁（flock 或 `O_APPEND`）写一行，写完释放。
+`yaa --notify` 写入时也对文件拿锁（flock 或 `O_APPEND`）写一行，写完释放。
 
 | 状态         | 收到 `system` 消息的时机 |
 | ------------ | ------------------------ |
