@@ -395,13 +395,14 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
 
     println!("会话文件：{}", resolved.session.file.display());
     println!(
-        "记录：{} 条（user {} / ai {} / tool_call {} / tool_result {} / system {}）",
+        "记录：{} 条（user {} / ai {} / tool_call {} / tool_result {} / system {} / approval {}）",
         records.len(),
         counts.user,
         counts.ai,
         counts.tool_call,
         counts.tool_result,
         counts.system,
+        counts.approval,
     );
     if let Some(text) = last_ai {
         println!("最近 ai：{}", snippet(text, 80));
@@ -559,6 +560,8 @@ struct Counts {
     tool_call: usize,
     tool_result: usize,
     system: usize,
+    /// `approval_pending` 与 `approval_resolved` 合并口径，使分类之和等于总数。
+    approval: usize,
 }
 
 impl Counts {
@@ -569,8 +572,7 @@ impl Counts {
             Record::ToolCall(_) => self.tool_call += 1,
             Record::ToolResult(_) => self.tool_result += 1,
             Record::System(_) => self.system += 1,
-            // 审批记录不计入阶段 1 的统计口径。
-            Record::ApprovalPending(_) | Record::ApprovalResolved(_) => {}
+            Record::ApprovalPending(_) | Record::ApprovalResolved(_) => self.approval += 1,
         }
     }
 }
@@ -690,6 +692,34 @@ mod tests {
             resolved.session.root.starts_with(&data_root),
             "普通 run 不得因 YAA_SESSION 改变目标：{}",
             resolved.session.file.display()
+        );
+    }
+
+    #[test]
+    fn status_counts_include_approval_and_sum_to_total() {
+        let records = vec![
+            Record::user("你好"),
+            Record::ai("model", "hash", "答", None),
+            Record::tool_call(yaa_msg::ToolOrigin::Ai, "c1", "echo hi", None),
+            Record::tool_result("c1", "hi\n", "", 0, false, false, None),
+            Record::system("notify", "x", None, None),
+            Record::approval_pending("c1", "echo hi", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Approve),
+        ];
+        let mut counts = Counts::default();
+        for record in &records {
+            counts.add(record);
+        }
+        assert_eq!(counts.approval, 2, "待批与决策都应计入审批项");
+        assert_eq!(
+            counts.user
+                + counts.ai
+                + counts.tool_call
+                + counts.tool_result
+                + counts.system
+                + counts.approval,
+            records.len(),
+            "分类计数之和必须等于记录总数",
         );
     }
 }
