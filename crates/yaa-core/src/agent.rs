@@ -314,8 +314,11 @@ impl Runner<'_> {
                 return Ok(ExitCode::Success);
             }
 
+            // 同批中所有命中 ask 的调用都要落 pending，allow/deny/不可执行的调用也要
+            // 各自落记录；全部处理完后才以退出码 6 结束，避免后续调用被伪装成中断。
+            let mut pending_any = false;
             for (call, parsed) in tool_calls.iter().zip(&parsed_calls) {
-                if let Some(exit) = self
+                if self
                     .gate_tool_call(
                         call,
                         parsed,
@@ -326,8 +329,11 @@ impl Runner<'_> {
                     )
                     .await?
                 {
-                    return Ok(exit);
+                    pending_any = true;
                 }
+            }
+            if pending_any {
+                return Ok(ExitCode::Pending);
             }
         }
 
@@ -338,8 +344,8 @@ impl Runner<'_> {
 
     /// 对一次 `origin=ai` 的工具调用求审批裁决并按落地表处理。
     ///
-    /// 返回 `Some(exit)` 表示需要立即结束本轮运行（`ask` 待批退出，退出码 6）；
-    /// 返回 `None` 表示已放行/拒绝并继续处理同批次后续调用。
+    /// 返回 `true` 表示该调用命中非 auto 的 `ask`、已落 `approval_pending`；调用方在
+    /// 处理完整批后据此以退出码 6 结束。返回 `false` 表示已放行/拒绝/不可执行并继续。
     async fn gate_tool_call(
         &self,
         call: &crate::message::AssistantToolCall,
@@ -348,7 +354,7 @@ impl Runner<'_> {
         outputs_dir: &Path,
         extra_env: &[(String, String)],
         watermark: &mut usize,
-    ) -> anyhow::Result<Option<ExitCode>> {
+    ) -> anyhow::Result<bool> {
         // R1：参数非法、工具名不符或命令为空者根本不可执行，绝不进入审批分支
         // （否则 `--approve` 会把非法 pending 当合法命令执行，语义与 `--auto` 相反）。
         // 落一条失败 `tool_result` 让模型下一跳可见，并继续循环、不退出。
@@ -356,7 +362,7 @@ impl Runner<'_> {
             let result = Record::tool_result(&call.id, "", &reason, -1, false, false, None);
             self.append_and_emit(std::slice::from_ref(&result), watermark)
                 .await?;
-            return Ok(None);
+            return Ok(false);
         }
 
         let verdict = self.evaluate_call(parsed);
@@ -405,8 +411,8 @@ impl Runner<'_> {
                 self.append_and_emit(std::slice::from_ref(&result), watermark)
                     .await?;
             }
-            // 非 auto 的 ask：只写 pending，展示待批清单后以退出码 6 结束；
-            // 不执行、不写 tool_result；同批次后续调用不再处理。
+            // 非 auto 的 ask：只写 pending，不执行、不写 tool_result；由调用方在处理完
+            // 同批其余调用后以退出码 6 结束，保证批内每条 tool_call 都有归属记录。
             Action::Ask => {
                 let batch = [Record::approval_pending(
                     &call.id,
@@ -414,10 +420,10 @@ impl Runner<'_> {
                     matched.clone(),
                 )];
                 self.append_and_emit(&batch, watermark).await?;
-                return Ok(Some(ExitCode::Pending));
+                return Ok(true);
             }
         }
-        Ok(None)
+        Ok(false)
     }
 
     /// 计算一次**可执行**工具调用的审批裁决。
@@ -772,6 +778,15 @@ mod tests {
             reasoning: None,
             tool_calls: calls,
             finish_reason: Some("tool_calls".to_string()),
+        }
+    }
+
+    /// 构造一次 `shell` 工具调用。
+    fn shell_call(id: &str, arguments: &str) -> crate::message::AssistantToolCall {
+        crate::message::AssistantToolCall {
+            id: id.to_string(),
+            name: tools::shell::NAME.to_string(),
+            arguments: arguments.to_string(),
         }
     }
 
@@ -1267,6 +1282,100 @@ mod tests {
             )),
             "应展示待批条目"
         );
+    }
+
+    /// R2：同批多个 ask 都要落 pending，之后以退出码 6 结束，不得伪装成中断。
+    #[tokio::test]
+    async fn multiple_asks_in_one_batch_all_recorded() {
+        let harness = Harness::new(approval_config("echo *", Action::Ask));
+        let sink = RecordingSink::default();
+        let model = FakeModel::new(vec![calls_response(vec![
+            shell_call("call_1", r#"{"command":"echo a"}"#),
+            shell_call("call_2", r#"{"command":"echo b"}"#),
+        ])]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Pending);
+
+        let records = harness.records();
+        let pendings: Vec<&str> = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::ApprovalPending(pending) => Some(pending.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pendings, vec!["call_1", "call_2"], "同批 ask 都应落盘");
+
+        // 批内每个 tool_call 都应有 pending 配对，不得产生游离记录。
+        let call_ids: Vec<&str> = records
+            .iter()
+            .filter_map(|record| match record {
+                Record::ToolCall(call) => Some(call.call_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(call_ids, pendings, "每个 tool_call 都应有 approval_pending");
+
+        assert!(
+            !records.iter().any(|r| matches!(r, Record::ToolResult(_))),
+            "ask 拦截不得写 tool_result"
+        );
+        assert_eq!(
+            sink.items()
+                .iter()
+                .filter(|item| matches!(item, DisplayItem::ApprovalPending { .. }))
+                .count(),
+            2,
+            "两条待批都应展示"
+        );
+    }
+
+    /// R2：同批中 allow 的调用照常执行并落结果，ask 的落 pending 后以 6 退出。
+    #[tokio::test]
+    async fn mixed_allow_and_ask_same_batch() {
+        // 规则只问 `curl *`；`echo hi` 无匹配默认 allow。
+        let harness = Harness::new(approval_config("curl *", Action::Ask));
+        let sink = RecordingSink::default();
+        let model = FakeModel::new(vec![calls_response(vec![
+            shell_call("call_1", r#"{"command":"echo hi"}"#),
+            shell_call("call_2", r#"{"command":"curl x"}"#),
+        ])]);
+
+        let exit = harness
+            .runner(&sink)
+            .run("你好", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Pending);
+
+        let records = harness.records();
+        assert_eq!(
+            records.iter().map(record_label).collect::<Vec<_>>(),
+            vec![
+                "system",
+                "user",
+                "ai",
+                "tool_call",
+                "tool_call",
+                "tool_result",
+                "approval_pending"
+            ],
+            "allow 先执行落结果，ask 落 pending"
+        );
+        let Record::ToolResult(result) = &records[5] else {
+            panic!("allow 调用应有 tool_result");
+        };
+        assert_eq!(result.call_id, "call_1");
+        assert_eq!(result.stdout, "hi\n");
+        let Record::ApprovalPending(pending) = &records[6] else {
+            panic!("ask 调用应有 approval_pending");
+        };
+        assert_eq!(pending.call_id, "call_2");
     }
 
     #[tokio::test]
