@@ -54,7 +54,7 @@
 | D46 | 审批只作用于 `origin=ai` 的工具调用；`init`/`llm` 钩子与 `yaa --notify` 不经 `shell` 工具，天然豁免 | 与 plan 原定义一致 |
 | D47 | 审批轮顺带修复 A4（畸形 `tool_call` 不再静默丢弃）、A5（非末步正文不上 stdout）、A6（`--config` 沿钩子链传递） | 同属「不静默降级 / 展示正确性」主题，避免二次开工 |
 | D48 | 阶段 3 交付 = 压缩 + `--json` + `--no-store`；`outputs/` 保留策略顺延 | 三项各自独立可验收；混阶段会让验收标准互相稀释 |
-| D49 | 压缩配置归 `[compaction]` 节；`context_window` 缺失即整支禁用（静默，不报错） | 压缩是可选能力，缺窗口无从计算阈值；比率与 pruner 预算集中同节，与 `[shell]`/`[agent]` 并列 |
+| D49 | 压缩策略（比率、pruner 预算、`retries`）归 `[compaction]`；模型上下文窗口 `context_window` 随 `llm` 钩子输出（供应侧，与 `model` 同源，换模型只改一处），缺失即整支禁用（静默，不报错） | 窗口是模型属性而非策略；DSH 同样从路由适配器解析 capacity。策略与预算在 `[compaction]` 与 `[shell]`/`[agent]` 并列 |
 | D50 | 压缩只发生在渲染期、**不改 `default.jsonl`**；摘要产物写 `sessions/<sid>/summaries/<hash>.json` 侧车（`hash` = 被遮蔽记录 id 序列 + 模型） | 忠于 `design.md`「压缩只发生在渲染阶段，原始 JSONL 不变」；key 含记录 id 使缓存精确，同内容不同划分不误命中 |
 | D51 | 摘要**链式递进**：新摘要输入 = 旧摘要文本 + 新遮蔽区，`previous` 记录前驱；渲染时只应用链尾摘要 | 无状态重算会让长会话第二次压缩把已蔽原文整段重喂、可能直接超窗口；链式使每次摘要输入有界 |
 | D52 | token 估算按 `chars_per_token`（默认 4）对**投影消息文本**（`content` + `tool_calls` 参数 + `reasoning`）计，不含工具 schema | 对齐 DSH 的固定密度启发式；工具 schema 固定且小，省略可接受，且避免把 schema 传进渲染层 |
@@ -156,10 +156,9 @@ tail_chars = 2048
 max_steps = 30
 request_timeout_secs = 300
 
-# 阶段 3：渲染期压缩。context_window 缺失即禁用整支压缩（不报错）。
+# 阶段 3：渲染期压缩。模型窗口在 llm 配置（context_window）提供，缺失即禁用整支压缩。
 [compaction]
 enabled = true
-context_window = 128000      # 模型上下文窗口（token）
 threshold_ratio = 0.8        # 投影超过窗口 × 该比例即触发压缩
 retain_ratio = 0.16          # 逐字保留的近期尾部（窗口比例）；须 < threshold_ratio
 chars_per_token = 4          # token 估算密度（已知低估 CJK）
@@ -179,6 +178,8 @@ api_key     = "..."
 model       = "deepseek-chat"
 temperature = 0.7
 max_tokens  = 4096
+# 模型上下文窗口（token）；供渲染期压缩用，缺失即禁用压缩（供应侧，随 model 走）。
+context_window = 128000
 ```
 
 规则与不变量：
@@ -458,7 +459,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 验收：
 
-1. 配置：`[compaction]` 全字段解析与校验（比例 ∈ (0,1]、`retain_ratio < threshold_ratio`、`chars_per_token ≥ 1`、`prune_head + prune_tail ≤ prune_threshold`、`enabled` 布尔）；`context_window` 缺失时压缩静默禁用。
+1. 配置：`[compaction]` 全字段解析与校验（比例 ∈ (0,1]、`retain_ratio < threshold_ratio`、`chars_per_token ≥ 1`、`prune_head + prune_tail + 标记 ≤ prune_threshold`、`enabled` 布尔）；`llm` 配置的 `context_window` 解析与校验，缺失时压缩静默禁用。
 2. token 估算：`chars_per_token` 生效；`content`、`tool_calls` 参数与 `reasoning` 计入。
 3. pruner：仅 `tool` 消息被修剪、`system` 不受影响；未超 `prune_threshold_chars` 不动；修剪后码点数 ≤ 阈值且严格小于原文；按 Unicode 码点（不拆代理项对）。
 4. 选区间：稳定 `system` 头永不入区间；尾部按 `retain_tokens` 保留；切点回退到工具配对平衡；无可用区间返回 `None`（不产生空摘要）。
@@ -523,4 +524,4 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 默认假设（未特别反对即执行）：截断阈值 `max_stream_chars=32768`、`head_chars=8192`、`tail_chars=2048`；`endpoint_format` 默认 `"openai"`；注入合并用空行分隔；包 `yaa-cli` 产出二进制 `yaa`；`request_timeout_secs` 默认 300；workspace 版本从 `0.1.0` 起。
 
-阶段 3 已确认（D48–D58）：压缩配置与默认值（`threshold_ratio=0.8`、`retain_ratio=0.16`、`chars_per_token=4`、`max_tokens=8192`、pruner `8192/4096/1024`、`retries=1`）、`context_window` 缺失即禁用、渲染期压缩与侧车缓存、链式摘要、展示豁免、`--json` 与 `--no-store`。
+阶段 3 已确认（D48–D58）：压缩策略与默认值（`threshold_ratio=0.8`、`retain_ratio=0.16`、`chars_per_token=4`、`max_tokens=8192`、pruner `8192/4096/1024`、`retries=1`）、模型窗口 `context_window` 随 llm 配置（缺失即禁用）、渲染期压缩与侧车缓存、链式摘要、展示豁免、`--json` 与 `--no-store`。

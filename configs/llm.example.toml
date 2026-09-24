@@ -16,4 +16,8 @@ endpoint_format = "deepseek"
 temperature = 0.7
 max_tokens = 4096
 
+# 模型上下文窗口（token）；供渲染期压缩计算触发阈值，缺失即禁用压缩。
+# 属供应侧：换模型时与 model 一并调整，无需改 config.toml。
+context_window = 128000
+
 # base_url 已以 /v1 结尾时直接补 /chat/completions，否则补 /v1/chat/completions。

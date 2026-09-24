@@ -40,11 +40,9 @@ request_timeout_secs = 300
 
 [compaction]
 # 渲染期压缩：历史超阈值时先修剪工具正文，仍超阈值再调模型生成摘要；摘要写入会话目录
-# 的 summaries/，原始 default.jsonl 不变。`context_window` 缺失即整段禁用压缩（其余字段
-# 随之无效），因此不填该字段就能关闭压缩。
+# 的 summaries/，原始 default.jsonl 不变。触发阈值按模型上下文窗口计算，窗口在 llm 配置
+# （见 llm.example.toml 的 context_window）提供；未提供窗口即整段禁用压缩。
 enabled = true
-# 模型上下文窗口（token）；按所用模型填写，缺失即禁用压缩。
-context_window = 128000
 # 投影超过「窗口 × threshold_ratio」即触发压缩。
 threshold_ratio = 0.8
 # 逐字保留的近期尾部占窗口比例；须小于 threshold_ratio。
