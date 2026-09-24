@@ -168,6 +168,18 @@ impl Sink for StderrSink {
                     Self::write_block_text(&format!("% {command}"));
                 }
             }
+            // 压缩摘要：默认只报遮蔽条数与模型；`--verbose` 追加摘要全文。
+            DisplayItem::Compaction {
+                covered,
+                model,
+                summary,
+            } => {
+                self.start_block();
+                Self::write_block_text(&format!("# 已压缩早期历史（{covered} 条记录，模型 {model}）"));
+                if self.verbose {
+                    Self::write_block_text(&summary);
+                }
+            }
         }
     }
 }

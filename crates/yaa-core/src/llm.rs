@@ -122,11 +122,21 @@ pub fn endpoint(base_url: &str) -> String {
 /// 构造 OpenAI Chat Completions 请求体。请求体绝不含 `api_key`。
 ///
 /// 每条消息经 [`ChatMessage::to_request_value`] 组装，是否回传 `reasoning_content`
-/// 由 `endpoint_format` 决定。
+/// 由 `endpoint_format` 决定。输出上限取 [`LlmConfig::max_tokens`]。
 pub fn build_request(
     cfg: &LlmConfig,
     messages: &[ChatMessage],
     tools: &serde_json::Value,
+) -> serde_json::Value {
+    build_request_with_tokens(cfg, messages, tools, cfg.max_tokens)
+}
+
+/// 与 [`build_request`] 相同，但显式指定输出上限（摘要调用需要独立上限）。
+pub fn build_request_with_tokens(
+    cfg: &LlmConfig,
+    messages: &[ChatMessage],
+    tools: &serde_json::Value,
+    max_tokens: u32,
 ) -> serde_json::Value {
     let replay_reasoning = cfg.endpoint_format.replays_reasoning();
     let messages: Vec<serde_json::Value> = messages
@@ -136,7 +146,7 @@ pub fn build_request(
     serde_json::json!({
         "model": cfg.model,
         "temperature": cfg.temperature,
-        "max_tokens": cfg.max_tokens,
+        "max_tokens": max_tokens,
         "messages": messages,
         "tools": tools,
     })
@@ -226,8 +236,36 @@ pub async fn chat(
     messages: &[ChatMessage],
     tools: &serde_json::Value,
 ) -> Result<ChatResponse> {
+    request(client, cfg, messages, tools, cfg.max_tokens).await
+}
+
+/// 发送一次摘要请求（不带工具），返回摘要正文。
+///
+/// 复用 [`chat`] 的重试与错误遮蔽逻辑；空输出视为失败，绝不把空摘要写进侧车。
+pub async fn summarize(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    messages: &[ChatMessage],
+    max_tokens: u32,
+) -> Result<String> {
+    let response = request(client, cfg, messages, &serde_json::json!([]), max_tokens).await?;
+    let content = response.content.unwrap_or_default();
+    if content.trim().is_empty() {
+        anyhow::bail!("摘要调用返回空内容");
+    }
+    Ok(content)
+}
+
+/// 带显式输出上限的通用请求（[`chat`] 与 [`summarize`] 共用）。
+async fn request(
+    client: &reqwest::Client,
+    cfg: &LlmConfig,
+    messages: &[ChatMessage],
+    tools: &serde_json::Value,
+    max_tokens: u32,
+) -> Result<ChatResponse> {
     let url = endpoint(&cfg.base_url);
-    let body = build_request(cfg, messages, tools);
+    let body = build_request_with_tokens(cfg, messages, tools, max_tokens);
     let mut last_error: Option<anyhow::Error> = None;
 
     for attempt in 0..MAX_ATTEMPTS {

@@ -32,6 +32,15 @@ const DEFAULT_HEAD_CHARS: usize = 8192;
 const DEFAULT_TAIL_CHARS: usize = 2048;
 const DEFAULT_MAX_STEPS: u32 = 30;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_COMPACTION_ENABLED: bool = true;
+const DEFAULT_THRESHOLD_RATIO: f64 = 0.8;
+const DEFAULT_RETAIN_RATIO: f64 = 0.16;
+const DEFAULT_CHARS_PER_TOKEN: u32 = 4;
+const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
+const DEFAULT_PRUNE_THRESHOLD_CHARS: usize = 8192;
+const DEFAULT_PRUNE_HEAD_CHARS: usize = 4096;
+const DEFAULT_PRUNE_TAIL_CHARS: usize = 1024;
+const DEFAULT_COMPACTION_RETRIES: u32 = 1;
 
 /// 顶层配置。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -40,6 +49,7 @@ pub struct Config {
     pub shell: ShellConfig,
     pub agent: AgentConfig,
     pub approval: ApprovalConfig,
+    pub compaction: CompactionConfig,
 }
 
 /// 审批规则配置。
@@ -107,6 +117,51 @@ impl Default for AgentConfig {
     }
 }
 
+/// 渲染期压缩配置（阶段 3，D48–D58）。
+///
+/// `context_window` 缺失即「无从计算阈值」，压缩静默禁用（D49）；`enabled = false`
+/// 同样禁用，且优先级最高。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionConfig {
+    /// 是否启用压缩。
+    pub enabled: bool,
+    /// 模型上下文窗口（token）；`None` 时压缩静默禁用。
+    pub context_window: Option<u32>,
+    /// 触发阈值占窗口的比例：投影 token ≥ `floor(context_window × 该值)` 即压缩。
+    pub threshold_ratio: f64,
+    /// 逐字保留的近期尾部占窗口的比例；必须小于 `threshold_ratio`。
+    pub retain_ratio: f64,
+    /// token 估算密度（每个 token 的字符数）。
+    pub chars_per_token: u32,
+    /// 摘要调用的输出上限。
+    pub max_tokens: u32,
+    /// 工具消息正文超过此码点数才修剪。
+    pub prune_threshold_chars: usize,
+    /// 修剪保留的头部码点数。
+    pub prune_head_chars: usize,
+    /// 修剪保留的尾部码点数。
+    pub prune_tail_chars: usize,
+    /// 摘要后仍超阈值的额外压缩尝试次数。
+    pub retries: u32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: DEFAULT_COMPACTION_ENABLED,
+            context_window: None,
+            threshold_ratio: DEFAULT_THRESHOLD_RATIO,
+            retain_ratio: DEFAULT_RETAIN_RATIO,
+            chars_per_token: DEFAULT_CHARS_PER_TOKEN,
+            max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            prune_threshold_chars: DEFAULT_PRUNE_THRESHOLD_CHARS,
+            prune_head_chars: DEFAULT_PRUNE_HEAD_CHARS,
+            prune_tail_chars: DEFAULT_PRUNE_TAIL_CHARS,
+            retries: DEFAULT_COMPACTION_RETRIES,
+        }
+    }
+}
+
 impl ShellConfig {
     /// 转换为 `yaa_exec` 的限额结构。
     pub fn to_limits(&self) -> yaa_exec::ShellLimits {
@@ -125,6 +180,7 @@ struct RawConfig {
     shell: Option<RawShell>,
     agent: Option<RawAgent>,
     approval: Option<RawApproval>,
+    compaction: Option<RawCompaction>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -151,6 +207,20 @@ struct RawAgent {
 #[derive(Debug, Deserialize)]
 struct RawApproval {
     rules: Option<Vec<RawRule>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawCompaction {
+    enabled: Option<bool>,
+    context_window: Option<u32>,
+    threshold_ratio: Option<f64>,
+    retain_ratio: Option<f64>,
+    chars_per_token: Option<u32>,
+    max_tokens: Option<u32>,
+    prune_threshold_chars: Option<usize>,
+    prune_head_chars: Option<usize>,
+    prune_tail_chars: Option<usize>,
+    retries: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +299,38 @@ fn merge(raw: RawConfig) -> anyhow::Result<Config> {
             config.agent.request_timeout_secs = value;
         }
     }
+    if let Some(compaction) = raw.compaction {
+        if let Some(value) = compaction.enabled {
+            config.compaction.enabled = value;
+        }
+        if let Some(value) = compaction.context_window {
+            config.compaction.context_window = Some(value);
+        }
+        if let Some(value) = compaction.threshold_ratio {
+            config.compaction.threshold_ratio = value;
+        }
+        if let Some(value) = compaction.retain_ratio {
+            config.compaction.retain_ratio = value;
+        }
+        if let Some(value) = compaction.chars_per_token {
+            config.compaction.chars_per_token = value;
+        }
+        if let Some(value) = compaction.max_tokens {
+            config.compaction.max_tokens = value;
+        }
+        if let Some(value) = compaction.prune_threshold_chars {
+            config.compaction.prune_threshold_chars = value;
+        }
+        if let Some(value) = compaction.prune_head_chars {
+            config.compaction.prune_head_chars = value;
+        }
+        if let Some(value) = compaction.prune_tail_chars {
+            config.compaction.prune_tail_chars = value;
+        }
+        if let Some(value) = compaction.retries {
+            config.compaction.retries = value;
+        }
+    }
     if let Some(approval) = raw.approval
         && let Some(rules) = approval.rules
     {
@@ -260,6 +362,14 @@ fn parse_action(value: &str) -> Option<Action> {
         "deny" => Some(Action::Deny),
         _ => None,
     }
+}
+
+/// 校验一个比例字段落在 `(0, 1]` 内。
+fn validate_ratio(name: &str, value: f64) -> anyhow::Result<()> {
+    if !value.is_finite() || value <= 0.0 || value > 1.0 {
+        anyhow::bail!("配置非法：{name} 必须是 (0, 1] 内的数，当前为 {value}。");
+    }
+    Ok(())
 }
 
 /// 校验限额，非法时返回清晰错误而不是静默错误行为。
@@ -297,6 +407,45 @@ fn validate(config: &Config) -> anyhow::Result<()> {
             "配置非法：shell.head_chars + shell.tail_chars（{}）不能超过 shell.max_stream_chars（{}）。",
             kept,
             config.shell.max_stream_chars
+        );
+    }
+    validate_ratio("compaction.threshold_ratio", config.compaction.threshold_ratio)?;
+    validate_ratio("compaction.retain_ratio", config.compaction.retain_ratio)?;
+    if config.compaction.retain_ratio >= config.compaction.threshold_ratio {
+        anyhow::bail!(
+            "配置非法：compaction.retain_ratio（{}）必须小于 compaction.threshold_ratio（{}）。",
+            config.compaction.retain_ratio,
+            config.compaction.threshold_ratio
+        );
+    }
+    if config.compaction.chars_per_token < 1 {
+        anyhow::bail!(
+            "配置非法：compaction.chars_per_token 必须 >= 1，当前为 {}。",
+            config.compaction.chars_per_token
+        );
+    }
+    if config.compaction.max_tokens < 1 {
+        anyhow::bail!(
+            "配置非法：compaction.max_tokens 必须 >= 1，当前为 {}。",
+            config.compaction.max_tokens
+        );
+    }
+    if let Some(window) = config.compaction.context_window
+        && window < 1
+    {
+        anyhow::bail!("配置非法：compaction.context_window 必须 >= 1，当前为 {window}。");
+    }
+    let prune_kept = config
+        .compaction
+        .prune_head_chars
+        .saturating_add(config.compaction.prune_tail_chars)
+        // 头尾之和加上修剪标记本身也不能超过阈值，才能保证修剪结果严格短于原文。
+        .saturating_add(crate::compaction::prune::PRUNE_MARKER.chars().count());
+    if prune_kept > config.compaction.prune_threshold_chars {
+        anyhow::bail!(
+            "配置非法：compaction.prune_head_chars + compaction.prune_tail_chars + 修剪标记（{}）不能超过 compaction.prune_threshold_chars（{}）。",
+            prune_kept,
+            config.compaction.prune_threshold_chars
         );
     }
     Ok(())
@@ -586,5 +735,140 @@ rules = [
         assert_eq!(limits.max_stream_chars, DEFAULT_MAX_STREAM_CHARS);
         assert_eq!(limits.head_chars, DEFAULT_HEAD_CHARS);
         assert_eq!(limits.tail_chars, DEFAULT_TAIL_CHARS);
+    }
+
+    #[test]
+    fn compaction_defaults() {
+        let config = Config::default();
+        assert_eq!(
+            config.compaction,
+            CompactionConfig {
+                enabled: true,
+                context_window: None,
+                threshold_ratio: 0.8,
+                retain_ratio: 0.16,
+                chars_per_token: 4,
+                max_tokens: 8192,
+                prune_threshold_chars: 8192,
+                prune_head_chars: 4096,
+                prune_tail_chars: 1024,
+                retries: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn compaction_is_parsed() {
+        let file = write_config(
+            r#"
+[compaction]
+enabled = true
+context_window = 64000
+threshold_ratio = 0.75
+retain_ratio = 0.2
+chars_per_token = 3
+max_tokens = 2048
+prune_threshold_chars = 4096
+prune_head_chars = 2048
+prune_tail_chars = 512
+retries = 2
+"#,
+        );
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.compaction.context_window, Some(64000));
+        assert_eq!(config.compaction.threshold_ratio, 0.75);
+        assert_eq!(config.compaction.retain_ratio, 0.2);
+        assert_eq!(config.compaction.chars_per_token, 3);
+        assert_eq!(config.compaction.max_tokens, 2048);
+        assert_eq!(config.compaction.prune_threshold_chars, 4096);
+        assert_eq!(config.compaction.prune_head_chars, 2048);
+        assert_eq!(config.compaction.prune_tail_chars, 512);
+        assert_eq!(config.compaction.retries, 2);
+    }
+
+    #[test]
+    fn missing_compaction_section_keeps_defaults_and_disables() {
+        let file = write_config("[agent]\nmax_steps = 3\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.compaction, CompactionConfig::default());
+        assert_eq!(
+            config.compaction.context_window, None,
+            "未配置窗口时无从计算阈值，应保持 None",
+        );
+    }
+
+    #[test]
+    fn compaction_retain_ratio_must_be_below_threshold() {
+        let file = write_config("[compaction]\nthreshold_ratio = 0.5\nretain_ratio = 0.5\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("retain_ratio"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn compaction_prune_budget_must_fit_threshold() {
+        let file = write_config(
+            "[compaction]\nprune_threshold_chars = 100\nprune_head_chars = 80\nprune_tail_chars = 40\n",
+        );
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("prune_threshold_chars"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn compaction_prune_budget_includes_marker_in_threshold() {
+        let marker = crate::compaction::prune::PRUNE_MARKER.chars().count();
+        let threshold = 200usize;
+        // head + tail 本身不超过阈值，但加上修剪标记就超过 → 应被拒。
+        let file = write_config(&format!(
+            "[compaction]\nprune_threshold_chars = {threshold}\nprune_head_chars = {}\nprune_tail_chars = 0\n",
+            threshold - marker + 1
+        ));
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("prune_threshold_chars"),
+            "含标记超阈值应被拒：{err}"
+        );
+
+        // 恰好容纳标记时通过。
+        let file = write_config(&format!(
+            "[compaction]\nprune_threshold_chars = {threshold}\nprune_head_chars = {}\nprune_tail_chars = 0\n",
+            threshold - marker
+        ));
+        assert!(Config::load(file.path()).is_ok(), "恰好含标记应通过");
+    }
+
+    #[test]
+    fn compaction_zero_context_window_is_rejected() {
+        let file = write_config("[compaction]\ncontext_window = 0\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("context_window"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn compaction_zero_chars_per_token_is_rejected() {
+        let file = write_config("[compaction]\nchars_per_token = 0\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("chars_per_token"),
+            "错误应指明字段：{err}"
+        );
+    }
+
+    #[test]
+    fn compaction_invalid_ratio_is_rejected() {
+        let file = write_config("[compaction]\nthreshold_ratio = 1.5\n");
+        let err = Config::load(file.path()).unwrap_err();
+        assert!(
+            err.to_string().contains("threshold_ratio"),
+            "错误应指明字段：{err}"
+        );
     }
 }

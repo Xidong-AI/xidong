@@ -49,6 +49,17 @@ pub enum DisplayItem {
         command: String,
         approved: bool,
     },
+    /// 压缩摘要（阶段 3）：早期历史被折叠为一条摘要；展示仍保留原始记录。
+    ///
+    /// 默认只展示遮蔽条数与模型，`--verbose` 追加摘要全文。
+    Compaction {
+        /// 被遮蔽的记录条数。
+        covered: usize,
+        /// 生成摘要的模型名。
+        model: String,
+        /// 摘要正文。
+        summary: String,
+    },
 }
 
 /// 展示条目的接收端。

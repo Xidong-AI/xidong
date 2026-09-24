@@ -21,6 +21,7 @@ use std::pin::Pin;
 use yaa_msg::{ApprovalDecision, Record, ToolOrigin};
 
 use crate::approval::{self, Action};
+use crate::compaction::{self, cache::SummaryCache};
 use crate::config::Config;
 use crate::display::{self, DisplayItem, Sink};
 use crate::llm::{self, ChatResponse, LlmConfig};
@@ -70,7 +71,7 @@ const ABANDONED_RESULT: &str = "上一轮待批命令已随新提示词作废，
 ///
 /// 阶段 1 只需要一次「请求→回复」，不引入流式与重试抽象（重试在 [`llm::chat`] 内），
 /// 因此保持最小形状并兼容 `dyn`。
-pub trait Model: Send + Sync {
+pub trait Model: Send + Sync + compaction::Summarizer {
     /// 发送一次对话请求。
     fn chat<'a>(
         &'a self,
@@ -105,6 +106,18 @@ impl Model for OpenAiModel {
 
     fn name(&self) -> &str {
         &self.cfg.model
+    }
+}
+
+impl compaction::Summarizer for OpenAiModel {
+    fn summarize<'a>(
+        &'a self,
+        messages: &'a [ChatMessage],
+        max_tokens: u32,
+    ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            llm::summarize(&self.client, &self.cfg, messages, max_tokens).await
+        })
     }
 }
 
@@ -267,13 +280,29 @@ impl Runner<'_> {
         let outputs_dir = session::outputs_dir(&self.session);
         // 工具子进程注入本会话路径，使 `cmd | yaa --notify` 写回本会话（D25）。
         let extra_env = [("YAA_SESSION".to_string(), session_path(&self.session))];
+        // 本次运行的摘要链尾：生成一次后后续步骤复用，避免重复调用摘要模型。
+        let mut compaction_state: Option<compaction::cache::SummaryEntry> = None;
 
         for _ in 0..self.config.agent.max_steps {
             let records = yaa_store::load(&self.session)?;
-            let messages = render::render(&records);
+            let plan = self.plan_messages(&records, model, &mut compaction_state).await;
 
             // 先展示自上次以来新增的记录（注入、用户、工具批次），再推进水位。
             self.emit_new(&records, &mut watermark);
+            // 压缩是渲染期变换：警告与摘要条目在记录增量之外单独展示（D56）。
+            if let Some(warning) = &plan.warning {
+                self.sink.emit(DisplayItem::Notice(warning.clone()));
+            }
+            if let Some(entry) = &plan.entry
+                && let Some(applied) = &plan.applied
+            {
+                self.sink.emit(DisplayItem::Compaction {
+                    covered: applied.covered.len(),
+                    model: entry.model.clone(),
+                    summary: entry.summary.clone(),
+                });
+            }
+            let messages = plan.messages;
 
             let response = match model.chat(&messages).await {
                 Ok(response) => response,
@@ -353,6 +382,52 @@ impl Runner<'_> {
         // 达到步数上限不在此发事件：`ExitCode::MaxSteps` 已是明确信号，具体警告与
         // 「是否仍打印部分回复」的显示策略完全由 CLI 决定。
         Ok(ExitCode::MaxSteps)
+    }
+
+    /// 计算本步要发给模型的消息：必要时修剪工具正文与压缩早期历史。
+    ///
+    /// `state` 是本次运行的摘要链尾：一旦生成摘要，后续步骤复用而不重复调用模型。
+    /// 首次进入时从侧车缓存读取，实现同区间跨运行复用（D50）；生成的新条目在此落盘。
+    async fn plan_messages<M: Model>(
+        &self,
+        records: &[Record],
+        model: &M,
+        state: &mut Option<compaction::cache::SummaryEntry>,
+    ) -> compaction::Plan {
+        let cfg = &self.config.compaction;
+        let Some(budgets) = compaction::Budgets::from_config(cfg) else {
+            return compaction::Plan {
+                messages: render::render(records),
+                applied: None,
+                entry: None,
+                warning: None,
+            };
+        };
+        let estimator = compaction::Estimator::new(cfg.chars_per_token);
+        let cache = SummaryCache::new(&self.session.root);
+        let previous = match state.clone() {
+            Some(entry) => Some(entry),
+            None => cache.load_latest().unwrap_or(None),
+        };
+        let plan = compaction::compact(
+            records,
+            model.name(),
+            &estimator,
+            &budgets,
+            cfg,
+            previous.as_ref(),
+            model,
+        )
+        .await;
+        if let Some(entry) = &plan.entry {
+            if let Err(err) = cache.store(entry) {
+                self.sink.emit(DisplayItem::Notice(format!(
+                    "压缩摘要落盘失败，本次仍使用内存摘要：{err:#}"
+                )));
+            }
+            *state = Some(entry.clone());
+        }
+        plan
     }
 
     /// 对一次 `origin=ai` 的工具调用求审批裁决并按落地表处理。
@@ -777,6 +852,16 @@ mod tests {
 
         fn name(&self) -> &str {
             "fake-model"
+        }
+    }
+
+    impl compaction::Summarizer for FakeModel {
+        fn summarize<'a>(
+            &'a self,
+            _messages: &'a [ChatMessage],
+            _max_tokens: u32,
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
+            Box::pin(async move { Ok("## Primary Request and Intent\n- 测试摘要".to_string()) })
         }
     }
 

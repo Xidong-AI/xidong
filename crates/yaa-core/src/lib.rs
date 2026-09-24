@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod compaction;
 pub mod config;
 pub mod display;
 pub mod hook;
