@@ -871,4 +871,16 @@ retries = 2
             "错误应指明字段：{err}"
         );
     }
+
+    #[test]
+    fn example_config_loads_and_enables_compaction() {
+        // 示例配置是使用者的第一入口，必须始终与 schema 一致。
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../configs/config.example.toml");
+        let config = Config::load(&path)
+            .unwrap_or_else(|err| panic!("示例配置应可加载：{err:#}"));
+        assert_eq!(config.compaction.context_window, Some(128000));
+        assert!(config.compaction.enabled);
+        assert_eq!(config.agent.max_steps, 30);
+    }
 }
