@@ -2,8 +2,10 @@
 //!
 //! 纯函数，无 I/O。渲染规则见 `docs/plan.md` 的「渲染管线与分层装配」：
 //!
-//! - 首条 `user` 之前的**所有非空 `system`**（`source=init` 与空内容除外）按物理顺序
-//!   以空行拼接为**一条** `system` 消息，置于消息列表最前（无则不加）。
+//! - 记录开头**连续的 `system`**（`source=init` 与空内容除外）按物理顺序以空行拼接为
+//!   **一条** `system` 消息，置于消息列表最前（无则不加）。以「开头连续」而非「首条
+//!   `user` 之前」界定，使渲染对任意切片都成立：压缩后的保留区可能从 `assistant`
+//!   步骤开始（无前导 `user`），此时前缀为空、主循环原样渲染该步骤。
 //! - 首条 `user` 起，`user` 与「非空 `system`」组成的**最大连续段**按物理顺序以空行
 //!   拼接为**一条** `user` 消息（双向合并）；段外的通知自然单独成一条 `user` 消息。
 //! - `ai` + 其后紧邻的 `tool_call(origin=ai)` → 一条 `assistant` 消息；工具调用参数由
@@ -56,36 +58,26 @@ pub fn render(records: &[Record]) -> Vec<ChatMessage> {
         }
     }
 
-    // 稳定前缀：首条 `user` 之前的非空 `system`（`init` 簿记与空内容除外）拼成一条。
+    // 稳定前缀：记录开头连续的 `system`（`init` 簿记与空内容除外）拼成一条。
     //
-    // 注意：本前缀只收集 `System`，首条 `user` 之前若出现 `tool_call(origin=user)`，
-    // 主循环从 `first_user` 起会将其丢弃。阶段 1/2 无该记录的生产者；若将来引入，
-    // 需在此一并处理。
-    let first_user = records
-        .iter()
-        .position(|record| matches!(record, Record::User(_)));
-    let prefix_end = first_user.unwrap_or(records.len());
-    let prefix: Vec<String> = records[..prefix_end]
-        .iter()
-        .filter_map(|record| match record {
-            Record::System(system) if is_projectable_system(system) => Some(project_system(system)),
-            _ => None,
-        })
-        .collect();
+    // 以「开头连续」而非「首条 `user` 之前」界定，使渲染对任意切片都成立：压缩后的
+    // 保留区可能从 `assistant` 步骤开始（无前导 `user`），此时前缀为空、主循环原样
+    // 渲染该步骤，不得丢弃其中的 `ai`/`tool` 消息。
+    let mut prefix_end = 0;
+    let mut prefix: Vec<String> = Vec::new();
+    while let Some(Record::System(system)) = records.get(prefix_end) {
+        if is_projectable_system(system) {
+            prefix.push(project_system(system));
+        }
+        prefix_end += 1;
+    }
     if !prefix.is_empty() {
         messages.push(ChatMessage::system(prefix.join("\n\n")));
     }
 
-    // 无 `user` 记录时，前导 `system` 已全部并入稳定前缀，主循环从头部继续处理
-    // 其余记录（`tool_call(origin=user)`、`ai` 等），但不得重复投影这些 `system`。
-    let skip_prefix_systems = first_user.is_none();
-    let mut index = first_user.unwrap_or(0);
+    let mut index = prefix_end;
 
     while index < records.len() {
-        if skip_prefix_systems && matches!(records[index], Record::System(_)) {
-            index += 1;
-            continue;
-        }
         if is_user_run_item(&records[index]) {
             // 双向最大连续段：`user` 与非空 `system` 交替出现时并入同一条消息。
             let mut parts: Vec<String> = Vec::new();
