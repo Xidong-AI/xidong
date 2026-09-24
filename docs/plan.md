@@ -53,8 +53,19 @@
 | D45 | `deny` 命中即拒：写 `approval_pending` + `approval_resolved: deny` + 失败 `tool_result`（模型可见被拒），**不退出**；普通 run 启动时若存在未决 pending，先补 `approval_resolved: deny` | `design.md`：被拒不中断循环，模型可改命令；新提示词视为放弃旧待批 |
 | D46 | 审批只作用于 `origin=ai` 的工具调用；`init`/`llm` 钩子与 `yaa --notify` 不经 `shell` 工具，天然豁免 | 与 plan 原定义一致 |
 | D47 | 审批轮顺带修复 A4（畸形 `tool_call` 不再静默丢弃）、A5（非末步正文不上 stdout）、A6（`--config` 沿钩子链传递） | 同属「不静默降级 / 展示正确性」主题，避免二次开工 |
+| D48 | 阶段 3 交付 = 压缩 + `--json` + `--no-store`；`outputs/` 保留策略顺延 | 三项各自独立可验收；混阶段会让验收标准互相稀释 |
+| D49 | 压缩配置归 `[compaction]` 节；`context_window` 缺失即整支禁用（静默，不报错） | 压缩是可选能力，缺窗口无从计算阈值；比率与 pruner 预算集中同节，与 `[shell]`/`[agent]` 并列 |
+| D50 | 压缩只发生在渲染期、**不改 `default.jsonl`**；摘要产物写 `sessions/<sid>/summaries/<hash>.json` 侧车（`hash` = 被遮蔽记录 id 序列 + 模型） | 忠于 `design.md`「压缩只发生在渲染阶段，原始 JSONL 不变」；key 含记录 id 使缓存精确，同内容不同划分不误命中 |
+| D51 | 摘要**链式递进**：新摘要输入 = 旧摘要文本 + 新遮蔽区，`previous` 记录前驱；渲染时只应用链尾摘要 | 无状态重算会让长会话第二次压缩把已蔽原文整段重喂、可能直接超窗口；链式使每次摘要输入有界 |
+| D52 | token 估算按 `chars_per_token`（默认 4）对**投影消息文本**（`content` + `tool_calls` 参数 + `reasoning`）计，不含工具 schema | 对齐 DSH 的固定密度启发式；工具 schema 固定且小，省略可接受，且避免把 schema 传进渲染层 |
+| D53 | pruner 用独立 `[compaction]` 预算（默认 8192/4096/1024），只修剪 `tool` 消息正文、跳过 `system`；标记 `\n\n[... tool result middle pruned ...]\n\n`；按 Unicode 码点 | 与 `[shell]` 的执行期截断语义不同（历史再修剪 vs 执行即截断），复用会把两种阈值混为一谈；跳过 `system` 避免裁掉稳定前缀 |
+| D54 | 摘要指令照搬 DSH `COMPACTION_INSTRUCTION`（英文 Markdown 结构）+ `CHECKPOINT_PREAMBLE` + `<compacted-summary>` 标签；摘要调用**不带 tools**、以被遮蔽消息 + 指令为输入 | 该指令是经 DSH 验证的工程化 prompt；不带 tools 避免模型返回 `tool_calls`、简化调用形状 |
+| D55 | 摘要失败（网络/超时/空输出/不比原文小/重试耗尽）→ stderr 警告 + 用完整历史继续；不中止回合 | 对齐 DSH「警告并携带完整历史继续」；压缩是优化而非正确性前提 |
+| D56 | 展示仍从原始记录增量投影（D15 不移）；压缩发生时额外展示一条摘要条目；D29 豁免新增「压缩摘要与被修剪的工具正文」 | 历史不可重写且展示增量，逐字一致在时间轴上不可能；以显式豁免取代静默漂移 |
+| D57 | `--json`：`DisplayItem` 逐条序列化为 JSONL 到 stdout（含最终回复与诊断）；与 `--quiet`/`--verbose` 冲突 | 机器接口需要单一稳定流；人类模式的双流（过程 stderr / 回复 stdout）不适合结构化消费 |
+| D58 | `--no-store`：本次运行指向临时目录会话，退出即淘；与 `--session` 冲突 | 「不留痕」要求连 `outputs/` 一并消失；临时目录复用全部既有写入路径，零特例 |
 
-> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。
+> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认。
 
 ## 对 design.md 的更正
 
@@ -144,6 +155,19 @@ tail_chars = 2048
 [agent]
 max_steps = 30
 request_timeout_secs = 300
+
+# 阶段 3：渲染期压缩。context_window 缺失即禁用整支压缩（不报错）。
+[compaction]
+enabled = true
+context_window = 128000      # 模型上下文窗口（token）
+threshold_ratio = 0.8        # 投影超过窗口 × 该比例即触发压缩
+retain_ratio = 0.16          # 逐字保留的近期尾部（窗口比例）；须 < threshold_ratio
+chars_per_token = 4          # token 估算密度（已知低估 CJK）
+max_tokens = 8192            # 摘要调用输出上限
+prune_threshold_chars = 8192 # 工具消息正文超过此码点数才修剪
+prune_head_chars = 4096      # 修剪保留的头部码点数
+prune_tail_chars = 1024      # 修剪保留的尾部码点数
+retries = 1                  # 摘要后仍超阈值的额外压缩尝试次数
 ```
 
 `llm` 钩子 stdout 按 TOML 解析：
@@ -364,13 +388,15 @@ yaa --verbose                # 追加思考内容与命令输出
 yaa --quiet                  # 只打印最终回复
 yaa --approve                # 放行最旧一条待批命令并继续循环
 yaa --auto                   # 自动放行命中 `ask` 的命令（`deny` 仍强制）
+yaa --json                   # 以 JSONL 输出展示事件（与 --quiet/--verbose 冲突）
+yaa --no-store               # 本次运行使用临时会话，退出即淘
 ```
 
 - `--notify` 是短路路径：不加载 `llm` 配置、不进入 agent loop，只解析会话、执行命令或读 stdin、原子追加一条 `system(source=notify)`。
 - 过程记录默认打到 stderr（见 D13、D15、D16）：注入与通知用与工具调用一致的块样式（`# 注释` + 内容），工具调用用 `# 描述` + `% 命令`；块间以 `---` 分隔；非末步的模型正文也在此打印，末步回复只走 stdout。
 - 展示条目与模型消息同源，由 `yaa-core` 的投影产出；`--quiet` 抑制全部过程输出。
 
-后移到阶段 3 及以后：`--json`（展示条目 schema 未定）、`--no-store`（阶段 3）；`--notify` 的 `--to` 与跨会话解析（阶段 5）。
+后移到阶段 5：`--notify` 的 `--to` 与跨会话解析。`--json` 与 `--no-store` 已于阶段 3 落地（D57/D58）。
 
 ## 阶段划分与验收
 
@@ -418,9 +444,33 @@ yaa --auto                   # 自动放行命中 `ask` 的命令（`deny` 仍�
 10. A6：`yaa --config <path>` 在 `init` 钩子内 `yaa --notify` 的限额解析与主进程一致（同一 `[shell]`）。
 11. `--get-prompt`/`--clear`/`--status`/`--notify` 等短路路径不因新增审批逻辑改变行为；`--approve`/`--auto` 与 `--notify` 组合按用法错误拒绝。
 
-### 阶段 3：压缩
+### 阶段 3：压缩、`--json` 与 `--no-store`
 
-pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前缀），仍超阈值再走 LLM 摘要。边界选择照搬 DSH：system 头不压缩、按 token 预算从尾部保留、切点向头部回退到工具配对平衡处。摘要产物写入 `sessions/<sid>/summaries/<key>.json` 侧车缓存（key = 被遮蔽区间 id + 模型），不修改 `default.jsonl`。参数 `thresholdRatio=0.8`、`retainRatio=0.16`、`CHARS_PER_TOKEN=4`（已知低估 CJK）改为读配置，不硬编码。
+内部顺序：**配置与 token 估算 → pruner → 选区间 → 侧车摘要缓存 → 摘要调用与编排 → 渲染期注入 → 展示条目 → `--json` → `--no-store` → e2e**。
+
+范围与行为（D48–D58）：
+
+- **压缩**在渲染期进行，不改 `default.jsonl`。触发链：投影 token ≥ `floor(context_window × threshold_ratio)` → 先 pruner（只修剪 `tool` 消息正文，跳过 `system`）→ 重测 → 仍超才摘要。
+- **选区间照搬 DSH**：跳过稳定 `system` 头；从尾部累计 token 到 `retain_tokens`（= `floor(context_window × retain_ratio)`）；切点向头部回退到工具配对平衡处（不切分 `assistant.tool_calls` 与配对 `tool`）。
+- **摘要链式递进**：输入 = 稳定前缀（可选）+ 被遮蔽区消息（含旧摘要消息）+ 指令；产物写侧车。渲染时只应用链尾摘要；`previous` 指向前驱，`covers` 为被遮蔽记录 id 序列。
+- 摘要成功但**不比原文小**、或调用失败/超时/空输出 → 警告并降级（D55）。
+- 展示保持一致（D56）：展示仍从原始记录增量投影，压缩额外展示一条摘要条目。
+
+验收：
+
+1. 配置：`[compaction]` 全字段解析与校验（比例 ∈ (0,1]、`retain_ratio < threshold_ratio`、`chars_per_token ≥ 1`、`prune_head + prune_tail ≤ prune_threshold`、`enabled` 布尔）；`context_window` 缺失时压缩静默禁用。
+2. token 估算：`chars_per_token` 生效；`content`、`tool_calls` 参数与 `reasoning` 计入。
+3. pruner：仅 `tool` 消息被修剪、`system` 不受影响；未超 `prune_threshold_chars` 不动；修剪后码点数 ≤ 阈值且严格小于原文；按 Unicode 码点（不拆代理项对）。
+4. 选区间：稳定 `system` 头永不入区间；尾部按 `retain_tokens` 保留；切点回退到工具配对平衡；无可用区间返回 `None`（不产生空摘要）。
+5. 触发：投影低于阈值不压缩、不产生侧车文件；跨过阈值先 pruner，修剪后已低于阈值则跳过摘要。
+6. 摘要与侧车：`summaries/<hash>.json` 生成且含 `covers`/`previous`/`model`/`summary`；**断言 `default.jsonl` 本次未新增压缩记录**；摘要不比原文小时不采用。
+7. 链式：第二次压缩的摘要请求体含旧摘要文本、**不含**已被旧摘要遮蔽的原文。
+8. 降级：摘要端点返回错误时，stderr 有警告、模型调用仍携带完整历史继续（退出码不为 4/3）。
+9. 展示：压缩触发时 stderr 出现一条摘要条目（默认摘要，`--verbose` 全文）；展示不重放被遮蔽原文；D15 不变量测试在「无压缩生效」时逐字一致。
+10. `--json`：stdout 为 JSONL，每条 `DisplayItem` 一行 JSON（含 `type`），最终回复在其中；退出码不变；与 `--quiet`/`--verbose` 组合为用法错误。
+11. `--no-store`：不创建也不修改既有会话文件；退出后临时目录无残留；与 `--session` 组合为用法错误；`--notify`/`--clear`/`--status` 与 `--no-store` 组合为用法错误。
+12. `--get-prompt`/`--clear`/`--status`/`--notify`/审批行为不因阶段 3 改动而改变。
+13. 原子验证：`cargo check --all-targets`、`cargo clippy`、`cargo test` 全绿；`autocorrect --lint docs crates` 通过。
 
 ### 阶段 4：单 runner 与多客户端注入
 
@@ -449,13 +499,13 @@ pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前
 - 集成测试：`dev-dependencies` 起极简假 OpenAI 服务（`axum` 或 `hyper`，仅测试用），按脚本返回 `tool_calls`，端到端跑通并用临时目录隔离。
 - 收尾运行 `autocorrect --fix` 与 `autocorrect --lint docs crates`。
 
-## 已知限制（阶段 1）
+## 已知限制
 
 1. 无锁：同会话并发运行的写入可能交织（虽然单次 `write_all` 保证不出现半行，但顺序不可控）；阶段 4 解决。
 2. 仅 POSIX（`sh -c`、`killpg`）；Windows 不在阶段 1 范围。
 3. `outputs/` 无保留策略，磁盘可能无界增长。
 4. 会话不承诺跨机迁移。
-5. token 估算低估 CJK。
+5. token 估算按固定密度（`chars_per_token`，默认 4），仍低估 CJK（D52）。
 6. `reasoning` 落盘：思考内容进入会话文件，增大存储与隐私面（D23）。
 7. 思考回传仅覆盖 `reasoning_content` 系端点（DeepSeek/Kimi/Qwen/GLM）；Anthropic/Responses/Gemini 的签名类结构化 metadata 不支持（D24）。
 8. 旧 schema 会话不兼容，需 `--clear`（D26）。
@@ -463,9 +513,14 @@ pruner 先跑（跳过 `system` 事件与初始化注入，避免裁掉稳定前
 10. **逃逸进程组攥管道时输出仍可能被放弃**：后台进程若 `setsid` 脱离工具进程组并继续持有 stdout/stderr 管道，读取会在宽限后被放弃，输出以占位提示自解释；但这**不再误报**为 `timed_out`（D35）。长任务应用 `nohup <cmd> >/dev/null 2>&1 &` 主动脱离工具管道，而不是依赖读取宽限。
 11. **SIGINT 只清理 `shell` 工具进程组**：`init`/`llm` 钩子的进程组未纳入信号转发；钩子自身有硬超时兜底。
 12. **审批不是安全边界**（阶段 2）：命令资源为 best-effort 文本拆分，包装器（`xargs`/`find -exec`/`sudo`）、重定向目标、变量展开等仍可绕过；收紧应使用窄 `allow` + 精准 `deny`，不要指望审批流拦截一切（D42）。
+13. **压缩使 KV cache 部分失效**：摘要替换稳定前缀之后的早期消息，provider 从第一个被替换 token 起的复用失效（压缩的本质代价，DSH 同样如此）。
+14. **摘要会再次发送被遮蔽内容**：摘要调用把被遮蔽消息发给模型，隐私面与主调用相同，不新增泄露面，但敏感历史会被多送一次。
+15. **`outputs/` 仍无保留策略**：磁盘可能无界增长（D48 顺延）。
 
 ## 已确认项与默认假设
 
 已确认：XDG 双根（D10）、`ai` 与 `tool_call` 分离记录 + 单批原子写（D12）、统一通知注入（D19）、簿记驱动的初始化（D20）、分层装配（D22）、`ai.reasoning` 落盘（D23）、`endpoint_format` 取代 `provider`（D24）、阶段 1 引入 `YAA_SESSION`（D25）、离群通知双向最大连续段（D28）。
 
 默认假设（未特别反对即执行）：截断阈值 `max_stream_chars=32768`、`head_chars=8192`、`tail_chars=2048`；`endpoint_format` 默认 `"openai"`；注入合并用空行分隔；包 `yaa-cli` 产出二进制 `yaa`；`request_timeout_secs` 默认 300；workspace 版本从 `0.1.0` 起。
+
+阶段 3 已确认（D48–D58）：压缩配置与默认值（`threshold_ratio=0.8`、`retain_ratio=0.16`、`chars_per_token=4`、`max_tokens=8192`、pruner `8192/4096/1024`、`retries=1`）、`context_window` 缺失即禁用、渲染期压缩与侧车缓存、链式摘要、展示豁免、`--json` 与 `--no-store`。
