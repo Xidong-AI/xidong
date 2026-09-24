@@ -13,7 +13,7 @@ use yaa_core::display::{DisplayItem, Sink};
 use yaa_msg::Record;
 
 use cli::Cli;
-use printer::StderrSink;
+use printer::{JsonSink, StderrSink};
 
 /// 带退出码的分发错误。
 ///
@@ -112,7 +112,14 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     let env = |key: &str| std::env::var(key).ok();
     let home = home_dir();
     let config_root = yaa_core::paths::config_root(&env, &home);
-    let data_root = yaa_core::paths::data_root(&env, &home);
+    // `--no-store`：本次运行把会话指向临时目录，退出即淘。`temp_dir` 必须存活到
+    // `dispatch` 返回——`main` 末尾的 `process::exit` 会跳过析构，清理只能靠这里的
+    // 作用域 drop；正常返回时整个临时目录（含 `outputs/`）随 `TempDir` 一并删除。
+    let temp_dir = cli.no_store.then(tempfile::TempDir::new).transpose()?;
+    let data_root = temp_dir
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+        .unwrap_or_else(|| yaa_core::paths::data_root(&env, &home));
 
     // `--notify` 是短路写入路径：不进入 agent loop、不触发 init；仅按需读取 `[shell]`
     // 限额（读取失败只告警，绝不让 notify 失败）。
@@ -419,7 +426,10 @@ async fn run_agent(
     config_root: &Path,
     data_root: &Path,
 ) -> Result<i32, CliError> {
-    let sink = StderrSink::new(cli.verbose, cli.quiet);
+    // `--json` 把所有展示条目序列化到 stdout（D57）；其余情况走 stderr 的人类可读渲染。
+    let stderr_sink = StderrSink::new(cli.verbose, cli.quiet);
+    let json_sink = JsonSink;
+    let sink: &dyn Sink = if cli.json { &json_sink } else { &stderr_sink };
 
     let config_path = cli
         .config
@@ -453,7 +463,7 @@ async fn run_agent(
         session: resolved.session.clone(),
         cwd_warned: resolved.warned,
         auto: cli.auto,
-        sink: &sink,
+        sink,
     };
     // Ctrl-C：向当前工具进程组转发 SIGINT，宽限内仍存活则 SIGKILL 兜底，再以 130 退出。
     // 无工具在运行时（模型请求中）直接退出；`--notify` 短路路径不启动该任务。
@@ -488,18 +498,23 @@ async fn run_agent(
 
     // stdout 只承载「成功的最终助手文本」：失败回合（模型/配置/用法错误）的原因已由
     // stderr 报告，若再打印上一条历史回复会把过期答案伪装成本次结果。
+    // `--json` 下最终回复已作为 `text` 事件进入 JSONL，不再单独打印。
     match exit {
         ExitCode::Success => {
-            sink.finish_transcript();
-            print_final_ai(&resolved.session, watermark)?;
+            if !cli.json {
+                stderr_sink.finish_transcript();
+                print_final_ai(&resolved.session, watermark)?;
+            }
         }
         ExitCode::MaxSteps => {
-            eprintln!(
+            sink.emit(DisplayItem::Notice(format!(
                 "警告：达到最大步数 {}，已停止；以下为当前最终回复。",
                 config.agent.max_steps
-            );
-            sink.finish_transcript();
-            print_final_ai(&resolved.session, watermark)?;
+            )));
+            if !cli.json {
+                stderr_sink.finish_transcript();
+                print_final_ai(&resolved.session, watermark)?;
+            }
         }
         // 其他退出码：stdout 保持干净。
         _ => {}

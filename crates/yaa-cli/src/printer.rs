@@ -184,6 +184,95 @@ impl Sink for StderrSink {
     }
 }
 
+/// 把展示条目逐条序列化为 JSONL 写到 stdout（`--json`）。
+///
+/// 与人类模式的双流（过程 stderr / 回复 stdout）不同，`--json` 下所有条目——含
+/// 诊断与最终回复——统一走 stdout，退出码语义不变，便于机器消费（D57）。
+pub struct JsonSink;
+
+impl Sink for JsonSink {
+    fn emit(&self, item: DisplayItem) {
+        let value = item_json(&item);
+        // `serde_json` 序列化固定结构不会失败；兜底为空对象以免破坏整条流。
+        println!(
+            "{}",
+            serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
+        );
+    }
+}
+
+/// 展示条目的 JSON 形态：带 `type` 标签，字段名即 `DisplayItem` 的字段。
+fn item_json(item: &DisplayItem) -> serde_json::Value {
+    use serde_json::json;
+    match item {
+        DisplayItem::Notice(text) => json!({ "type": "notice", "text": text }),
+        DisplayItem::Error(text) => json!({ "type": "error", "text": text }),
+        DisplayItem::Injection {
+            comment,
+            command,
+            content,
+        } => json!({
+            "type": "injection",
+            "comment": comment,
+            "command": command,
+            "content": content,
+        }),
+        DisplayItem::Text {
+            reasoning,
+            content,
+            final_step,
+        } => json!({
+            "type": "text",
+            "reasoning": reasoning,
+            "content": content,
+            "final_step": final_step,
+        }),
+        DisplayItem::ToolCall {
+            description,
+            command,
+        } => json!({
+            "type": "tool_call",
+            "description": description,
+            "command": command,
+        }),
+        DisplayItem::ToolOutput { stdout, stderr } => json!({
+            "type": "tool_output",
+            "stdout": stdout,
+            "stderr": stderr,
+        }),
+        DisplayItem::ApprovalPending {
+            call_id,
+            command,
+            matched_rule,
+        } => json!({
+            "type": "approval_pending",
+            "call_id": call_id,
+            "command": command,
+            "matched_rule": matched_rule,
+        }),
+        DisplayItem::ApprovalResolved {
+            call_id,
+            command,
+            approved,
+        } => json!({
+            "type": "approval_resolved",
+            "call_id": call_id,
+            "command": command,
+            "approved": approved,
+        }),
+        DisplayItem::Compaction {
+            covered,
+            model,
+            summary,
+        } => json!({
+            "type": "compaction",
+            "covered": covered,
+            "model": model,
+            "summary": summary,
+        }),
+    }
+}
+
 /// 审批决策块的标题行：带 `call_id` 以便多 pending 时逐条区分。
 fn approval_resolved_title(call_id: &str, approved: bool) -> String {
     let verb = if approved { "已批准" } else { "已拒绝" };

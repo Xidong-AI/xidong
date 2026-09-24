@@ -18,10 +18,12 @@ yaa-exec = { path = "../yaa-exec" }
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+# `--json` 的 JsonSink 在运行期序列化展示条目。
+serde_json.workspace = true
+# `--no-store` 运行期创建临时会话目录。
+tempfile.workspace = true
 
 [dev-dependencies]
 # 仅测试用：假的 OpenAI 兼容服务端。
 axum = "0.8"
-serde_json.workspace = true
 sha2.workspace = true
-tempfile.workspace = true

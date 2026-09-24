@@ -2597,3 +2597,204 @@ async fn quoted_env_prefix_does_not_bypass_approval() {
         "应落 approval_pending"
     );
 }
+
+/// 阶段 3 验收 5–7、9：历史超阈值时压缩为侧车摘要，投影被替换、`default.jsonl`
+/// 不被改写，并在 stderr 展示一条压缩条目。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn compaction_summarizes_history_into_sidecar_and_keeps_jsonl() {
+    // 第一次运行：压缩未启用，制造两轮大工具输出作为历史。
+    let (first_addr, _first_state) = start_server(vec![
+        tool_call_response("c1", "seq 1 4000", None, None),
+        tool_call_response("c2", "seq 9000 13000", None, None),
+        text_response("第一轮完成"),
+    ])
+    .await;
+    let env = TestEnv::new(first_addr.port());
+    env.write_config(
+        r#"
+[hooks]
+init = "true"
+
+[agent]
+max_steps = 10
+"#,
+    );
+    let first = env.run(&["第一问"]);
+    assert!(first.status.success(), "首次运行失败：{}", stderr_of(&first));
+
+    // 第二次运行：启用压缩（pruner 预算调大以免干扰本用例），既有历史立即超阈值。
+    let (second_addr, second_state) = start_server(vec![
+        text_response("## Primary Request and Intent\n- 回顾早前目标"),
+        text_response("最终答复"),
+    ])
+    .await;
+    env.write_llm(&llm_toml_with(second_addr.port(), "openai"));
+    env.write_config(
+        r#"
+[hooks]
+init = "true"
+
+[compaction]
+context_window = 800
+threshold_ratio = 0.5
+retain_ratio = 0.1
+chars_per_token = 4
+prune_threshold_chars = 1000000
+prune_head_chars = 1000
+prune_tail_chars = 500
+
+[agent]
+max_steps = 10
+"#,
+    );
+
+    let session = env.session_file();
+    let before = std::fs::read_to_string(&session).unwrap();
+    let output = env.run(&["第二问"]);
+    assert!(output.status.success(), "压缩运行失败：{}", stderr_of(&output));
+
+    // 恰好一次摘要 + 一次主调用，顺序为「摘要 → 主」。
+    let requests = second_state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "应恰好一次摘要 + 一次主调用：{requests:?}");
+    let instruction = requests[0]["messages"]
+        .as_array()
+        .unwrap()
+        .last()
+        .unwrap()["content"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        instruction.contains("compaction engine"),
+        "首个请求末条应为压缩指令：{instruction}"
+    );
+    let main_body = serde_json::to_string(&requests[1]["messages"]).unwrap();
+    assert!(
+        main_body.contains("<compacted-summary>"),
+        "主请求应携带摘要检查点"
+    );
+    // 第一轮（`seq 1 4000`）被遮蔽，第二轮（`seq 9000 13000`）逐字保留。
+    assert!(
+        main_body.contains("9000") && !main_body.contains("4000"),
+        "被遮蔽区间应替换为摘要、保留区应逐字保留；roles={:?}",
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|message| {
+                let content = message["content"].as_str().unwrap_or("");
+                (
+                    message["role"].as_str().unwrap_or("").to_string(),
+                    content.len(),
+                    content.contains("4000"),
+                    content.contains("9000"),
+                )
+            })
+            .collect::<Vec<_>>()
+    );
+
+    // 侧车摘要落盘；`default.jsonl` 的原历史逐字保留（只追加本次记录）。
+    let summaries = session.parent().unwrap().join("summaries");
+    let files: Vec<_> = std::fs::read_dir(&summaries)
+        .unwrap()
+        .filter_map(|item| item.ok())
+        .map(|item| item.path())
+        .collect();
+    assert_eq!(files.len(), 1, "应生成 1 条侧车摘要：{files:?}");
+    let after = std::fs::read_to_string(&session).unwrap();
+    assert!(
+        after.starts_with(&before),
+        "`default.jsonl` 的原历史必须逐字保留"
+    );
+
+    // 展示：stderr 出现一条压缩条目。
+    assert!(
+        stderr_of(&output).contains("已压缩早期历史"),
+        "stderr 应展示压缩条目：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(stdout_of(&output).trim(), "最终答复");
+}
+
+/// 阶段 3 验收 10：`--json` 把展示事件输出为带 `type` 的 JSONL，最终回复也在其中。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn json_outputs_jsonl_event_stream() {
+    let (addr, _state) = start_server(vec![text_response("结构化答复")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let output = env.run(&["--json", "你好"]);
+    assert!(output.status.success(), "stderr={}", stderr_of(&output));
+
+    let stdout = stdout_of(&output);
+    let events: Vec<Value> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("每行必须是合法 JSON"))
+        .collect();
+    assert!(!events.is_empty(), "JSONL 不应为空：{stdout:?}");
+    assert!(
+        events.iter().all(|event| event.get("type").is_some()),
+        "每个事件都应带 type 标签：{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["type"] == "text"
+                && event["final_step"] == true
+                && event["content"] == "结构化答复"
+        }),
+        "应含最终回复的 text 事件：{events:?}"
+    );
+    assert!(
+        stderr_of(&output).trim().is_empty(),
+        "`--json` 下诊断也走 stdout，stderr 应为空：{}",
+        stderr_of(&output)
+    );
+}
+
+/// 阶段 3 验收 11：`--no-store` 用临时会话运行，不读写既有会话，退出即淘。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_store_uses_temporary_session_without_touching_existing() {
+    let (addr, state) = start_server(vec![text_response("首次答复")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    // 先用普通运行创建一个既有会话。
+    let first = env.run(&["首次提问"]);
+    assert!(first.status.success(), "stderr={}", stderr_of(&first));
+    let session = env.session_file();
+    assert!(session.exists(), "普通运行应创建会话文件");
+    let before = std::fs::read_to_string(&session).unwrap();
+
+    // 复用同一服务端，追加一个响应给临时运行。
+    state
+        .responses
+        .lock()
+        .unwrap()
+        .push_back(text_response("临时答复"));
+
+    let output = env.run(&["--no-store", "临时提问"]);
+    assert!(output.status.success(), "stderr={}", stderr_of(&output));
+    assert_eq!(stdout_of(&output).trim(), "临时答复");
+
+    // 既有会话逐字未变；数据根只保留普通运行创建的会话目录。
+    assert_eq!(
+        std::fs::read_to_string(&session).unwrap(),
+        before,
+        "`--no-store` 不得改动既有会话"
+    );
+    let session_dirs: Vec<_> = std::fs::read_dir(env.data_home.join("sessions"))
+        .unwrap()
+        .filter_map(|item| item.ok())
+        .map(|item| item.file_name())
+        .collect();
+    assert_eq!(
+        session_dirs.len(),
+        1,
+        "只应有普通运行创建的会话目录：{session_dirs:?}"
+    );
+    let session_dir = session.parent().unwrap();
+    assert!(
+        !session_dir.join("summaries").exists() && !session_dir.join("outputs").exists(),
+        "临时运行不得在既有会话目录留下 summaries/outputs"
+    );
+}

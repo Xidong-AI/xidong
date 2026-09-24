@@ -1,7 +1,8 @@
 //! 命令行参数定义。
 //!
 //! 阶段 1 的表面见 `docs/plan.md` 的「CLI（阶段 1）」；阶段 2 新增 `--approve`/
-//! `--auto`；`--json`、`--no-store`、`--notify` 的 `--to` 等后移到阶段 3 及以后。
+//! `--auto`；阶段 3 新增 `--json` 与 `--no-store`（D57/D58）；`--notify` 的 `--to`
+//! 与跨会话解析后移到阶段 5。
 
 use std::path::PathBuf;
 
@@ -26,6 +27,10 @@ pub struct Cli {
     /// 指定会话文件。
     #[arg(long, value_name = "PATH")]
     pub session: Option<PathBuf>,
+
+    /// 本次运行使用临时会话，退出即淘（不读写既有会话）。
+    #[arg(long, conflicts_with_all = ["session", "clear", "status", "notify", "approve"])]
+    pub no_store: bool,
 
     /// 打印内置提示词（`system`）后退出。
     #[arg(long, value_name = "NAME")]
@@ -62,6 +67,10 @@ pub struct Cli {
     /// 自动放行命中 `ask` 的命令（显式 `deny` 仍强制）。
     #[arg(long, conflicts_with_all = ["notify", "get_prompt"])]
     pub auto: bool,
+
+    /// 以 JSONL 输出展示事件（含最终回复与诊断）；与 `--quiet`/`--verbose` 互斥。
+    #[arg(long, conflicts_with_all = ["quiet", "verbose"])]
+    pub json: bool,
 
     /// 把钩子、工具等事件打到 stderr。
     #[arg(long, conflicts_with = "quiet")]
@@ -151,6 +160,34 @@ mod tests {
         for args in [
             ["yaa", "--approve", "--get-prompt", "system"],
             ["yaa", "--auto", "--get-prompt", "system"],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "应为参数冲突（{args:?}）"
+            );
+        }
+    }
+
+    #[test]
+    fn no_store_parses_alone() {
+        // `--no-store` 可单独使用（可带位置提示词）。
+        let cli = Cli::parse_from(["yaa", "--no-store", "你好"]);
+        assert!(cli.no_store);
+        assert_eq!(cli.prompt, vec!["你好".to_string()]);
+    }
+
+    #[test]
+    fn json_parses_alone_and_conflicts_with_verbosity_flags() {
+        let cli = Cli::parse_from(["yaa", "--json", "你好"]);
+        assert!(cli.json);
+        assert_eq!(cli.prompt, vec!["你好".to_string()]);
+
+        // `--json` 已是稳定的机器接口，不再与人类可读的冗长度开关叠加。
+        for args in [
+            ["yaa", "--json", "--quiet"],
+            ["yaa", "--json", "--verbose"],
         ] {
             let err = Cli::try_parse_from(args).unwrap_err();
             assert_eq!(
