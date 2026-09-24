@@ -82,6 +82,11 @@ pub trait Model: Send + Sync + compaction::Summarizer {
     fn name(&self) -> &str {
         ""
     }
+
+    /// 模型上下文窗口（token）；默认 `None`（测试替身无需实现），此时渲染期压缩静默禁用。
+    fn context_window(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// 真实的 OpenAI 兼容模型。
@@ -106,6 +111,10 @@ impl Model for OpenAiModel {
 
     fn name(&self) -> &str {
         &self.cfg.model
+    }
+
+    fn context_window(&self) -> Option<u32> {
+        self.cfg.context_window
     }
 }
 
@@ -395,7 +404,7 @@ impl Runner<'_> {
         state: &mut Option<compaction::cache::SummaryEntry>,
     ) -> compaction::Plan {
         let cfg = &self.config.compaction;
-        let Some(budgets) = compaction::Budgets::from_config(cfg) else {
+        let Some(budgets) = compaction::Budgets::from_config(cfg, model.context_window()) else {
             return compaction::Plan {
                 messages: render::render(records),
                 applied: None,

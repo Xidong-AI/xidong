@@ -51,6 +51,10 @@ pub struct LlmConfig {
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
+    /// 模型上下文窗口（token）；`None` 时渲染期压缩静默禁用。
+    ///
+    /// 属供应侧：与 `model` 同源，换模型只改本配置一处（D49）。
+    pub context_window: Option<u32>,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -62,6 +66,7 @@ impl std::fmt::Debug for LlmConfig {
             .field("model", &self.model)
             .field("temperature", &self.temperature)
             .field("max_tokens", &self.max_tokens)
+            .field("context_window", &self.context_window)
             .finish()
     }
 }
@@ -77,6 +82,8 @@ struct RawLlmConfig {
     temperature: f32,
     #[serde(default = "default_max_tokens")]
     max_tokens: u32,
+    #[serde(default)]
+    context_window: Option<u32>,
 }
 
 fn default_temperature() -> f32 {
@@ -95,6 +102,11 @@ impl LlmConfig {
     pub fn from_toml(text: &str) -> Result<Self> {
         let raw: RawLlmConfig =
             toml::from_str(text).context("解析 llm 钩子输出失败（应为 TOML）")?;
+        if let Some(window) = raw.context_window
+            && window < 1
+        {
+            anyhow::bail!("llm 配置非法：context_window 必须 >= 1，当前为 {window}。");
+        }
         Ok(Self {
             endpoint_format: raw.endpoint_format,
             base_url: raw.base_url,
@@ -102,6 +114,7 @@ impl LlmConfig {
             model: raw.model,
             temperature: raw.temperature,
             max_tokens: raw.max_tokens,
+            context_window: raw.context_window,
         })
     }
 }
@@ -348,6 +361,7 @@ mod tests {
             model: "gpt-test".to_string(),
             temperature: 0.7,
             max_tokens: 4096,
+            context_window: None,
         }
     }
 
@@ -409,6 +423,31 @@ max_tokens = 1024
         assert_eq!(cfg.model, "deepseek-chat");
         assert_eq!(cfg.temperature, 0.2);
         assert_eq!(cfg.max_tokens, 1024);
+    }
+
+    #[test]
+    fn context_window_is_optional_and_validated() {
+        // 未提供窗口时保持 `None`（压缩静默禁用）。
+        let cfg = LlmConfig::from_toml(
+            "base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.context_window, None);
+
+        let cfg =
+            LlmConfig::from_toml("base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\ncontext_window = 128000")
+                .unwrap();
+        assert_eq!(cfg.context_window, Some(128000));
+
+        // `0` 不是合法窗口，必须显式报错而非静默禁用。
+        let err = LlmConfig::from_toml(
+            "base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\ncontext_window = 0",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("context_window"),
+            "错误应指明字段：{err}"
+        );
     }
 
     #[test]

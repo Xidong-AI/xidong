@@ -2628,14 +2628,17 @@ max_steps = 10
         text_response("最终答复"),
     ])
     .await;
-    env.write_llm(&llm_toml_with(second_addr.port(), "openai"));
+    // 窗口随 llm 供应配置提供；config.toml 只留压缩策略。
+    env.write_llm(&format!(
+        "{}context_window = 800\n",
+        llm_toml_with(second_addr.port(), "openai")
+    ));
     env.write_config(
         r#"
 [hooks]
 init = "true"
 
 [compaction]
-context_window = 800
 threshold_ratio = 0.5
 retain_ratio = 0.1
 chars_per_token = 4

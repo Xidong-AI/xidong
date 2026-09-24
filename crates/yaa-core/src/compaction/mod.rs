@@ -52,13 +52,13 @@ pub struct Budgets {
 }
 
 impl Budgets {
-    /// 由窗口与配置派生；`enabled = false` 或 `context_window` 缺失时返回 `None`
-    /// （压缩静默禁用，D49）。
-    pub fn from_config(cfg: &CompactionConfig) -> Option<Self> {
+    /// 由策略与模型窗口派生；`enabled = false` 或窗口缺失时返回 `None`（压缩静默禁用，
+    /// D49）。窗口来自 [`crate::llm::LlmConfig::context_window`]（供应侧）。
+    pub fn from_config(cfg: &CompactionConfig, context_window: Option<u32>) -> Option<Self> {
         if !cfg.enabled {
             return None;
         }
-        let window = cfg.context_window? as usize;
+        let window = context_window? as usize;
         let threshold_tokens = (window as f64 * cfg.threshold_ratio).floor() as usize;
         let retain_tokens = (window as f64 * cfg.retain_ratio).floor() as usize;
         Some(Self {

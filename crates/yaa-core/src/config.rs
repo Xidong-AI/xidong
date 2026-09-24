@@ -117,16 +117,14 @@ impl Default for AgentConfig {
     }
 }
 
-/// 渲染期压缩配置（阶段 3，D48–D58）。
+/// 渲染期压缩的策略与预算（阶段 3，D48–D58）。
 ///
-/// `context_window` 缺失即「无从计算阈值」，压缩静默禁用（D49）；`enabled = false`
-/// 同样禁用，且优先级最高。
+/// 模型上下文窗口属供应侧，见 [`crate::llm::LlmConfig::context_window`]；窗口缺失或
+/// `enabled = false` 时压缩静默禁用（D49）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionConfig {
     /// 是否启用压缩。
     pub enabled: bool,
-    /// 模型上下文窗口（token）；`None` 时压缩静默禁用。
-    pub context_window: Option<u32>,
     /// 触发阈值占窗口的比例：投影 token ≥ `floor(context_window × 该值)` 即压缩。
     pub threshold_ratio: f64,
     /// 逐字保留的近期尾部占窗口的比例；必须小于 `threshold_ratio`。
@@ -149,7 +147,6 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: DEFAULT_COMPACTION_ENABLED,
-            context_window: None,
             threshold_ratio: DEFAULT_THRESHOLD_RATIO,
             retain_ratio: DEFAULT_RETAIN_RATIO,
             chars_per_token: DEFAULT_CHARS_PER_TOKEN,
@@ -212,7 +209,6 @@ struct RawApproval {
 #[derive(Debug, Deserialize)]
 struct RawCompaction {
     enabled: Option<bool>,
-    context_window: Option<u32>,
     threshold_ratio: Option<f64>,
     retain_ratio: Option<f64>,
     chars_per_token: Option<u32>,
@@ -302,9 +298,6 @@ fn merge(raw: RawConfig) -> anyhow::Result<Config> {
     if let Some(compaction) = raw.compaction {
         if let Some(value) = compaction.enabled {
             config.compaction.enabled = value;
-        }
-        if let Some(value) = compaction.context_window {
-            config.compaction.context_window = Some(value);
         }
         if let Some(value) = compaction.threshold_ratio {
             config.compaction.threshold_ratio = value;
@@ -429,11 +422,6 @@ fn validate(config: &Config) -> anyhow::Result<()> {
             "配置非法：compaction.max_tokens 必须 >= 1，当前为 {}。",
             config.compaction.max_tokens
         );
-    }
-    if let Some(window) = config.compaction.context_window
-        && window < 1
-    {
-        anyhow::bail!("配置非法：compaction.context_window 必须 >= 1，当前为 {window}。");
     }
     let prune_kept = config
         .compaction
@@ -744,7 +732,6 @@ rules = [
             config.compaction,
             CompactionConfig {
                 enabled: true,
-                context_window: None,
                 threshold_ratio: 0.8,
                 retain_ratio: 0.16,
                 chars_per_token: 4,
@@ -763,7 +750,6 @@ rules = [
             r#"
 [compaction]
 enabled = true
-context_window = 64000
 threshold_ratio = 0.75
 retain_ratio = 0.2
 chars_per_token = 3
@@ -775,7 +761,6 @@ retries = 2
 "#,
         );
         let config = Config::load(file.path()).unwrap();
-        assert_eq!(config.compaction.context_window, Some(64000));
         assert_eq!(config.compaction.threshold_ratio, 0.75);
         assert_eq!(config.compaction.retain_ratio, 0.2);
         assert_eq!(config.compaction.chars_per_token, 3);
@@ -787,14 +772,10 @@ retries = 2
     }
 
     #[test]
-    fn missing_compaction_section_keeps_defaults_and_disables() {
+    fn missing_compaction_section_keeps_defaults() {
         let file = write_config("[agent]\nmax_steps = 3\n");
         let config = Config::load(file.path()).unwrap();
         assert_eq!(config.compaction, CompactionConfig::default());
-        assert_eq!(
-            config.compaction.context_window, None,
-            "未配置窗口时无从计算阈值，应保持 None",
-        );
     }
 
     #[test]
@@ -843,16 +824,6 @@ retries = 2
     }
 
     #[test]
-    fn compaction_zero_context_window_is_rejected() {
-        let file = write_config("[compaction]\ncontext_window = 0\n");
-        let err = Config::load(file.path()).unwrap_err();
-        assert!(
-            err.to_string().contains("context_window"),
-            "错误应指明字段：{err}"
-        );
-    }
-
-    #[test]
     fn compaction_zero_chars_per_token_is_rejected() {
         let file = write_config("[compaction]\nchars_per_token = 0\n");
         let err = Config::load(file.path()).unwrap_err();
@@ -879,8 +850,8 @@ retries = 2
             .join("../../configs/config.example.toml");
         let config = Config::load(&path)
             .unwrap_or_else(|err| panic!("示例配置应可加载：{err:#}"));
-        assert_eq!(config.compaction.context_window, Some(128000));
         assert!(config.compaction.enabled);
+        assert_eq!(config.compaction.threshold_ratio, 0.8);
         assert_eq!(config.agent.max_steps, 30);
     }
 }
