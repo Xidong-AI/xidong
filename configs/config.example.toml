@@ -37,3 +37,26 @@ tail_chars = 2048
 max_steps = 30
 # 单次模型请求超时（秒），覆盖连接与响应体读取；超时不重试，按模型错误（退出码 4）失败。
 request_timeout_secs = 300
+
+[compaction]
+# 渲染期压缩：历史超阈值时先修剪工具正文，仍超阈值再调模型生成摘要；摘要写入会话目录
+# 的 summaries/，原始 default.jsonl 不变。`context_window` 缺失即整段禁用压缩（其余字段
+# 随之无效），因此不填该字段就能关闭压缩。
+enabled = true
+# 模型上下文窗口（token）；按所用模型填写，缺失即禁用压缩。
+context_window = 128000
+# 投影超过「窗口 × threshold_ratio」即触发压缩。
+threshold_ratio = 0.8
+# 逐字保留的近期尾部占窗口比例；须小于 threshold_ratio。
+retain_ratio = 0.16
+# token 估算密度（已知低估 CJK）。
+chars_per_token = 4
+# 摘要调用的输出上限。
+max_tokens = 8192
+# 工具消息正文超过此码点数才修剪。
+prune_threshold_chars = 8192
+# 修剪保留的头部与尾部码点数；两者与修剪标记之和须不超过 prune_threshold_chars。
+prune_head_chars = 4096
+prune_tail_chars = 1024
+# 摘要后仍超阈值的额外压缩尝试次数。
+retries = 1
