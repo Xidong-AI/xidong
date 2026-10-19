@@ -402,7 +402,10 @@ fn validate(config: &Config) -> anyhow::Result<()> {
             config.shell.max_stream_chars
         );
     }
-    validate_ratio("compaction.threshold_ratio", config.compaction.threshold_ratio)?;
+    validate_ratio(
+        "compaction.threshold_ratio",
+        config.compaction.threshold_ratio,
+    )?;
     validate_ratio("compaction.retain_ratio", config.compaction.retain_ratio)?;
     if config.compaction.retain_ratio >= config.compaction.threshold_ratio {
         anyhow::bail!(
@@ -848,8 +851,7 @@ retries = 2
         // 示例配置是使用者的第一入口，必须始终与 schema 一致。
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../configs/config.example.toml");
-        let config = Config::load(&path)
-            .unwrap_or_else(|err| panic!("示例配置应可加载：{err:#}"));
+        let config = Config::load(&path).unwrap_or_else(|err| panic!("示例配置应可加载：{err:#}"));
         assert!(config.compaction.enabled);
         assert_eq!(config.compaction.threshold_ratio, 0.8);
         assert_eq!(config.agent.max_steps, 30);

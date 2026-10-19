@@ -165,7 +165,8 @@ pub async fn compact<S: Summarizer>(
         view_boundaries.push(region::is_step_boundary(record));
     }
 
-    let Some((start, end)) = region::select_range(&view_tokens, &view_boundaries, 0, budgets.retain_tokens)
+    let Some((start, end)) =
+        region::select_range(&view_tokens, &view_boundaries, 0, budgets.retain_tokens)
     else {
         return Plan {
             messages: pruned,
@@ -304,9 +305,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
             self.calls.lock().unwrap().push(messages.to_vec());
             let reply = self.reply.lock().unwrap().clone();
-            Box::pin(async move {
-                reply.ok_or_else(|| anyhow::anyhow!("摘要调用失败"))
-            })
+            Box::pin(async move { reply.ok_or_else(|| anyhow::anyhow!("摘要调用失败")) })
         }
     }
 
@@ -447,7 +446,9 @@ mod tests {
         .await;
         assert!(plan.applied.is_none() && plan.entry.is_none());
         assert!(
-            plan.warning.as_deref().is_some_and(|text| text.contains("失败")),
+            plan.warning
+                .as_deref()
+                .is_some_and(|text| text.contains("失败")),
             "失败应给出警告：{:?}",
             plan.warning
         );
@@ -540,9 +541,9 @@ mod tests {
         }
         let input = &summarizer.calls()[0];
         assert!(
-            !input.iter().any(|message| {
-                message.content.as_deref() == Some("旧摘要")
-            }),
+            !input
+                .iter()
+                .any(|message| { message.content.as_deref() == Some("旧摘要") }),
             "失效前驱的摘要文本不应进入输入"
         );
     }

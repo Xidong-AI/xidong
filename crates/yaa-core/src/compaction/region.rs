@@ -12,10 +12,7 @@ use yaa_msg::{Record, ToolOrigin};
 /// - `tool_call` / `tool_result` / 审批记录：**否**（依附于其助手步骤，若作为保留区
 ///   起点会让保留区以孤儿工具消息开头）。
 pub fn is_step_boundary(record: &Record) -> bool {
-    matches!(
-        record,
-        Record::User(_) | Record::Ai(_) | Record::System(_)
-    )
+    matches!(record, Record::User(_) | Record::Ai(_) | Record::System(_))
 }
 
 /// 选择可遮蔽的记录下标区间（含端点）。
@@ -81,7 +78,12 @@ pub fn select_range(
 }
 
 /// 便捷包装：由记录切片构造 `boundaries` 并调用 [`select_range`]。
-pub fn select_range_for(records: &[Record], tokens: &[usize], first_idx: usize, retain_tokens: usize) -> Option<(usize, usize)> {
+pub fn select_range_for(
+    records: &[Record],
+    tokens: &[usize],
+    first_idx: usize,
+    retain_tokens: usize,
+) -> Option<(usize, usize)> {
     let boundaries: Vec<bool> = records.iter().map(is_step_boundary).collect();
     select_range(tokens, &boundaries, first_idx, retain_tokens)
 }
@@ -109,11 +111,7 @@ mod tests {
 
     #[test]
     fn select_range_rejects_empty_or_out_of_bounds_first_idx() {
-        assert_eq!(
-            select_range(&[], &[], 0, 0),
-            None,
-            "空历史应返回 None"
-        );
+        assert_eq!(select_range(&[], &[], 0, 0), None, "空历史应返回 None");
         let tokens = [1usize, 2];
         let boundaries = [true, true];
         assert_eq!(
@@ -204,7 +202,10 @@ mod tests {
         let pending = Record::approval_pending("call_1", "rm -rf /", "rm *");
         let resolved = Record::approval_resolved("call_1", ApprovalDecision::Approve);
         assert!(!is_step_boundary(&tool_call), "tool_call 不应为步骤边界");
-        assert!(!is_step_boundary(&tool_result), "tool_result 不应为步骤边界");
+        assert!(
+            !is_step_boundary(&tool_result),
+            "tool_result 不应为步骤边界"
+        );
         assert!(
             !is_step_boundary(&pending),
             "approval_pending 不应为步骤边界"

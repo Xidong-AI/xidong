@@ -71,18 +71,26 @@ impl Estimator {
             Record::User(user) => user.content.chars().count(),
             Record::Ai(ai) => {
                 ai.content.chars().count()
-                    + ai.reasoning.as_deref().map_or(0, |text| text.chars().count())
+                    + ai.reasoning
+                        .as_deref()
+                        .map_or(0, |text| text.chars().count())
             }
             Record::ToolCall(call) => {
                 call.command.chars().count()
-                    + call.description.as_deref().map_or(0, |text| text.chars().count())
+                    + call
+                        .description
+                        .as_deref()
+                        .map_or(0, |text| text.chars().count())
             }
             Record::ToolResult(result) => {
                 result.stdout.chars().count() + result.stderr.chars().count()
             }
             Record::System(system) => {
                 system.content.chars().count()
-                    + system.command.as_deref().map_or(0, |text| text.chars().count())
+                    + system
+                        .command
+                        .as_deref()
+                        .map_or(0, |text| text.chars().count())
             }
             Record::ApprovalPending(_) | Record::ApprovalResolved(_) => 0,
         };

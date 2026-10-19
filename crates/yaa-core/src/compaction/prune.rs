@@ -110,10 +110,7 @@ mod tests {
         let pruned = prune_text(text, &budget).expect("超阈值应修剪");
         assert!(pruned.starts_with("abc"), "应以保留的头部开始");
         assert!(pruned.ends_with("ij"), "应以保留的尾部结束");
-        assert!(
-            pruned.contains(PRUNE_MARKER),
-            "头尾之间应插入修剪标记"
-        );
+        assert!(pruned.contains(PRUNE_MARKER), "头尾之间应插入修剪标记");
     }
 
     #[test]
@@ -174,10 +171,7 @@ mod tests {
         assert_eq!(pruned, 1, "只应修剪 1 条 tool 消息");
         assert_eq!(messages[0], system_before, "system 消息必须逐字不变");
         assert_eq!(messages[1], user_before, "user 消息必须逐字不变");
-        assert_eq!(
-            messages[3], assistant_before,
-            "assistant 消息必须逐字不变"
-        );
+        assert_eq!(messages[3], assistant_before, "assistant 消息必须逐字不变");
         let tool_content = messages[2].content.as_ref().expect("tool 正文仍在");
         assert!(
             tool_content.contains(PRUNE_MARKER),
@@ -192,7 +186,10 @@ mod tests {
 
     #[test]
     fn prune_messages_skips_tool_below_threshold() {
-        let mut messages = vec![ChatMessage::tool_result("call-1".to_string(), "短".to_string())];
+        let mut messages = vec![ChatMessage::tool_result(
+            "call-1".to_string(),
+            "短".to_string(),
+        )];
         let before = messages[0].clone();
         let pruned = prune_messages(&mut messages, &budgets(10, 5, 2));
         assert_eq!(pruned, 0, "未超预算的 tool 消息不应计数");

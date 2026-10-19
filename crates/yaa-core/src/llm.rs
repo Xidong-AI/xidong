@@ -428,22 +428,19 @@ max_tokens = 1024
     #[test]
     fn context_window_is_optional_and_validated() {
         // 未提供窗口时保持 `None`（压缩静默禁用）。
-        let cfg = LlmConfig::from_toml(
-            "base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"",
-        )
-        .unwrap();
+        let cfg = LlmConfig::from_toml("base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"").unwrap();
         assert_eq!(cfg.context_window, None);
 
-        let cfg =
-            LlmConfig::from_toml("base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\ncontext_window = 128000")
-                .unwrap();
+        let cfg = LlmConfig::from_toml(
+            "base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\ncontext_window = 128000",
+        )
+        .unwrap();
         assert_eq!(cfg.context_window, Some(128000));
 
         // `0` 不是合法窗口，必须显式报错而非静默禁用。
-        let err = LlmConfig::from_toml(
-            "base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\ncontext_window = 0",
-        )
-        .unwrap_err();
+        let err =
+            LlmConfig::from_toml("base_url=\"u\"\napi_key=\"k\"\nmodel=\"m\"\ncontext_window = 0")
+                .unwrap_err();
         assert!(
             err.to_string().contains("context_window"),
             "错误应指明字段：{err}"
