@@ -78,7 +78,7 @@
 | D70 | `--notify` **只发布**：普通调用写 `pending/`，init 钩子内（`YAA_INBOX_PHASE=init`）写 `init/`；不抢 `runner.lock`、不跟随、不跑 `init`/`llm`、不执行 agent loop，发布带 generation 守卫 | 通知是外部副作用，不应因顺手调用而启动模型或阻塞；由运行中的 runner 在安全点落库，未运行时留给下一次 `run` |
 | D71 | follower 用 `read_after_with_generation` + 20→250 ms 退避 + `DisplayProjector` 增量展示；抢到锁后复检 generation，接管**只尝试一次**；`PendingPolicy` 区分新 `User`（Abandon）与纯 notify（Keep） | 避免每轮全量重投影与重复展示；只接管一次防止失败后无限抢锁；纯 notify 不应替用户作废旧待批 |
 | D72 | 原子水位与 generation 守卫发布：`watermark()` 在同一读快照返回 `(generation, last_seq)`，`publish_with_generation` 在 `clear.lock` 共享锁内校验；`0→1` 视为首次建库、不算归档 | 防止「旧 generation 的行 + 新 generation 值」拼接与归档后写入新库；建库窗口不应让 follower 误报「会话已归档」 |
-| D73 | artifact 路径按**完整数据库文件名**唯一化：非 `session.db` 以安全化文件名作前缀，锁与 inbox 各自独立；`outputs/`、`summaries/` 仍按会话根共享 | 同目录多个显式 `--session` 不能共享 `runner.lock` 或 inbox；用完整文件名而非 `file_stem`，使 `a.db` 与 `a.sqlite` 不碰撞 |
+| D73 | artifact 路径按**完整数据库文件名**唯一化：非 `session.db` 以安全化文件名作前缀，锁与 inbox 各自独立；`outputs/`、`summaries/` 仍按会话根共享 | 同目录多个显式 `--session` 不能共享 `runner.lock` 或 inbox；用完整文件名而非 `file_stem`，使 `a.db` 与 `a.sqlite` 不碰撞；阶段 6 由 D88 扩展至 `outputs/`、`summaries/` 与归档目录 |
 | D74 | `--clear` 持 `runner.lock` + `clear.lock` 后检查 `pending/`/`init/`，有消息即拒绝归档；库不存在但 inbox 非空同样拒绝 | 归档会清空历史并 bump generation，若连同待处理消息一起归档会静默丢消息；持锁检查与发布互斥 |
 | D75 | `max_steps` 计**模型调用次数**，按含 `User` 的 inbox 批次重置；纯 notify 不重置 | 一轮多用户合并时每个 user 批次都应有完整预算；通知不是新任务，不应无限延长步数 |
 | D76 | 会话环境链收敛为 `yaa-core::session::yaa_env` 纯函数，钩子 `hook_env`、shell 工具 `extra_env` 与 `--approve` 执行路径共用；注入 `YAA_SESSION`（无条件自己）、`YAA_NOTIFY`（继承非空且 ≠ 自身时保留）、`YAA_PARENT`（优先继承中间层，否则取孵化者的 `YAA_SESSION`）、`YAA_NOTIFY_CALL_ID`（仅 shell 工具） | 原实现把会话变量与限额变量分散拼接，两处漂移会直接把通知写错会话；纯函数让环境链可单测且只有一处事实源 |
@@ -91,8 +91,13 @@
 | D83 | 后台范式必须关闭/重定向 stdout/stderr（`{ ...; } >/dev/null 2>&1 &`）或 `setsid` 脱离工具进程组；`yaa-exec` 在直接子进程退出后读取管道，宽限期（2 秒）后对整组 `SIGKILL` | 原 `... \| yaa --notify=... &` 让后台进程继续持有工具管道，工具在 2 秒后整组击杀，内层通知永远不到达；重定向后管道立即 EOF，工具 <1s 返回，后台作业存活并投递 |
 | D84 | spool 写入新增 generation/archived 守卫：持 `clear.lock` SH，与 `publish_with_generation` 同锁序（先 clear 后 init），复查 generation/archived；notify 预检 BUSY/IO 也降级 spool；可重试读取失败时仍写 spool（clear SH 已排除并发 `--clear`） | 避免 spool 落在已归档/新 generation 下绕过 `--clear` 的非空 spool 拒绝检查，同时不因目标库短暂 BUSY 丢通知 |
 | D85 | CLI 冲突：`--notify` 与 `--clear`/`--status`/`--get-prompt` 由 clap 冲突拒绝；与位置提示词由解析后 `validate_combinations` 拒绝（clap 的 `conflicts_with` 会抵消 `--to` 的 `requires`）；`publisher_origin` 改为 best-effort，解析失败省略可选 `origin` | 短路写入路径不得静默忽略用户意图；可选归因不应成为合法 `--to` 发布的硬失败点；显式校验同时保住 `--to` 必须搭配 `--notify` |
+| D86 | 新增 `yaa-core::test_support::{check_consistency, check_converged}` 纯查询检查器，复用 `agent` 的 `orphan_tool_calls`/`unresolved_pending`；`crates/yaa-cli/tests/crash.rs` 以 B 状态注入为主、A 随机 `kill -9` 烟雾为辅，每格结束调用检查器 | 崩溃恢复的正确性此前只靠分散断言与人工审查；把不变量集中成可复用谓词，既让崩溃矩阵有统一判据，也避免配对语义在 e2e 与单测间漂移 |
+| D87 | 展示水位由 `usize` 记录下标机械迁至 `seq`：`History` 平行保存记录与 `seq`，`last_seq()`/`start_after()`（`partition_point`）按 `seq` 定界，`load` 仍全量读取 | 归档清空后 `seq` 从 1 重算，「记录下标 == seq」的隐含假设在跨 generation 时失效，会让展示误回放或重复；按 `seq` 定界消除该耦合 |
+| D88 | artifact 路径唯一化：非默认会话以安全化的完整数据库文件名作 `artifact_name`，`outputs/`、`summaries/` 与归档目录 `history/<sid>/` 均在其下再嵌一层；默认会话 `artifact_name` 为空串 | 同目录多个显式 `--session` 会共用 `outputs`/`summaries` 并混放归档；统一 artifact 前缀让默认会话零变化、兼容既有路径 |
+| D89 | env 入口绝对化：`YAA_SESSION` 输出前绝对化；`--to` 与继承的 `YAA_NOTIFY`/`YAA_PARENT` 的相对值在解析目标时按 cwd 绝对化 | 相对值会随后续子进程 cwd 漂移，指向错误会话；在入口处一次性绝对化，规则单一且不改变已绝对值的语义 |
+| D90 | 断电保障分级：承诺「进程崩溃级 + fsync 约束下的断电级」，不承诺未 fsync 窗口与未落盘发布，真机器断电需 dm-log-writes；限定项（edges 表、daemon、向量检索、真断电、保留策略）明确为升级判据 | 避免把「SQLite 事务 + 原子 rename」误读为任意断电无损；把不可验证的承诺写成限制与升级条件，既诚实又给出何时引入重武器的判据 |
 
-> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认，D68–D75 为阶段 4 单 runner 与多客户端注入确认，D76–D82 为阶段 5 notify 与后台任务确认，D83–D85 为阶段 5 终审修复确认。
+> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认，D68–D75 为阶段 4 单 runner 与多客户端注入确认，D76–D82 为阶段 5 notify 与后台任务确认，D83–D85 为阶段 5 终审修复确认，D86–D90 为阶段 6 断电恢复与不变量收口确认。
 
 ## 对 design.md 的更正
 
@@ -104,7 +109,7 @@
 4. **`turn_end` 记录**：`design.md:342` 出现但不在记录清单内。约定：**无 `tool_call` 的 `ai` 记录即为回合结束**，不引入独立类型。
 5. **记录缺 `id`**：`design.md:31,32,37` 的 `user`/`ai`/`system` 无 `id`，无法支撑阶段 4 的幂等去重（`design.md:361,366`）。更正为**所有记录都有 `id`**，工具结果另用 `call_id` 关联。
 6. **截断产物无载体**：`design.md:50` 未定义完整输出的路径字段。更正为 `tool_result` 增加可选 `output_files`（stdout/stderr 分两个文件）与 `truncated`。
-7. **`client_id`/`turn_id`**（`design.md:301`）预留进 schema，阶段 4 使用。
+7. **`client_id`/`turn_id`**（`design.md:301`）预留进 schema；阶段 6 判定其无运行时消费者，生产路径恒为 `None`（见「已知限制」第 35 条）。
 8. **钩子不经 `shell` 工具执行**（`design.md:12`）。design 说系统生命周期钩子「触发 Shell 工具调用」实现。更正为：`init`/`llm` 钩子由 `yaa-core` 的独立执行器（`crates/yaa-core/src/hook.rs`）以 `sh -c` 运行，与 `shell` 工具**不共用策略**——钩子单流超过 1 MiB 直接报错退出，不截断、不产生 `output_files`；「钩子就是同一个 Shell 工具」的表述不成立。
 9. **初始化注入排在 `user` 之前**（`design.md:27-31`）。design 的记录顺序在新设计下成立：`init` 只在无 `system(source=init)` 簿记时于写入 `user` 之前执行，注入内容由命令内的 `yaa --notify` 写入，因而物理上位于 `user` 之前。`init` 失败时仍写入 `user` 并按配置错误退出。
 10. **注入不再有专用文案**。旧设计「钩子 `tool_call` 不写 `description`、由展示层现算文案」随 D19 一并移除：注入内容现在是 `system(source=notify)` 事件，展示用与工具调用一致的块样式，标题即信封中的注释。
@@ -337,11 +342,11 @@ async fn main_flow(cfg) -> Result<ExitCode> {
 
 async fn run_agent_loop(session, cfg, guard) -> Result<ExitCode> {
     let llm = resolve_llm_hook(cfg)?;              // 每次运行一次，不写事件
-    let watermark = store::len(session)?;          // 展示增量水位
+    let mut watermark = store::last_seq(session)?;  // 展示增量水位：末条记录的 seq
     for step in 0..cfg.agent.max_steps {
         let records = store::load(session)?;       // 每步重读（design.md:59）
         let messages = render(&records);           // 事件日志 → ChatMessage（纯函数）
-        sink.push(display::items(&records[watermark..]));  // 同源展示条目，cli 只决定样式
+        sink.push(display::items_after(&records, watermark));  // 按 seq 定界展示新增记录，cli 只决定样式
         let resp = chat_with_retry(&llm, &messages, &[tools::shell::schema()]).await?;
         store::append(session, &ai_step_records(resp))?;   // ai + 其 tool_calls 原子一批
         if resp.tool_calls.is_empty() { return Ok(ExitCode::Success); }
@@ -355,7 +360,7 @@ async fn run_agent_loop(session, cfg, guard) -> Result<ExitCode> {
 ```
 
 - `yaa-store` 保持**同步 API**（批量追加、按 `seq` 增量读、归档）。在 core 调用点用 `spawn_blocking` 包装，不做成假 async。
-- `read_after(&session, after_seq) -> (Vec<(seq, Record)>, new_seq)` 为跟随/增量展示预留；当前 core 仍以 `load` 全量读取并按记录下标推进水位。`load` 按 `seq` 顺序读取全部事件。存储层只认 `Path`，不依赖配置类型。
+- `read_after(&session, after_seq) -> (Vec<(seq, Record)>, new_seq)` 为跟随/增量展示预留；当前 core 以 `load` 全量读取，展示水位按记录 `seq` 用 `partition_point` 定界（不再是记录下标）；归档重置后 `seq` 从 1 重算。`load` 按 `seq` 顺序读取全部事件。存储层只认 `Path`，不依赖配置类型。
 - `load` 每步重读，阶段 4 的 inbox 插入与 `yaa --notify` 追加才能在下一轮被看到。
 - **无初始化簿记才初始化**：会话中不存在 `system(source=init)` 记录时执行 `init` 钩子（D20）；钩子内经由 `yaa --notify` 写入的通知先落盘，随后才是 `init` 簿记与 `user` 记录。`init` 失败仍写入 `user`，再按配置错误退出；因不写簿记，下次运行自动重试。
 - **`llm` 不写事件**：只解析配置供进程使用；解析失败按配置错误退出（见 D19）。
@@ -532,9 +537,39 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 验收覆盖（关键测试，概括范围）：I1 环境链（含嵌套 `YAA_PARENT`）；I2 优先级矩阵；I3 严格拒绝且不创建目标；I4 子→父通知落库带 `origin`/`call_id`；I5 无 runner 时 pending 滞留 + status 计数 + 零模型请求；I6 spool 降级与补投幂等；I7 spool 非空拒绝 clear；I8 旧 JSON 兼容 + 非法 `call_id` 忽略；I9 display/render 谓词一致；I10 请求期间通知不丢不重；I11 双投幂等；I12 kill -9 后 append/删除窗口去重。
 
-### 阶段 6：断电恢复与不变量
+### 阶段 6：断电恢复与不变量（已实现）
 
-SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pending 已由 core 的恢复逻辑实现；文件 inbox 的发布/消费崩溃语义（`rename` 原子、append 后删除前重现靠 id 去重）已在阶段 4 落地；阶段 5 的 spool 复用同一原子发布原语，补投同样以 `append_idempotent` + 删除保证不重不丢；按 `id` 去重；不变量测试。
+行为（D86–D90）：
+
+- **不变量检查器**：`yaa-core::test_support::{check_consistency, check_converged}` 供 e2e/harness 与单测共用，复用 `agent` 的 `orphan_tool_calls`/`unresolved_pending` 谓词，避免配对语义漂移。
+- **崩溃注入矩阵**：`crates/yaa-cli/tests/crash.rs` 以 B 状态注入为主、A 随机 `kill -9` 烟雾为辅，覆盖 append 事务、工具结果补写、inbox 幂等重放、归档 `VACUUM`/`rename`/清空事务、`init` 建库自愈、模型请求中 kill、两次接管；每格结束调用检查器。
+- **水位迁 `seq`**：`History` 平行保存记录与 `seq`，`emit_new` 用 `partition_point` 按 `seq` 定界；归档重置后 `seq` 从 1 重算，旧水位超前时按新历史重新展示。
+- **artifact 唯一化**：`outputs/`、`summaries/` 与归档目录按安全化的完整数据库文件名（`artifact_name`）嵌套，同目录多个显式会话互不混放；默认会话路径不变。
+- **env 入口绝对化**：`YAA_SESSION` 输出前绝对化；`--to` 与继承的 `YAA_NOTIFY`/`YAA_PARENT` 的相对值在解析目标时按 cwd 绝对化。
+- **保障分级**：承诺「进程崩溃级 + fsync 约束下的断电级」，不承诺未 fsync 窗口与未落盘发布，真机器断电需 dm-log-writes（见「升级判据」）。
+
+验收覆盖（关键测试，概括范围）：12 项崩溃矩阵全部通过并调用检查器；不变量检查器单测与 e2e 冒烟（`converged_run_passes_invariant_checks`）；水位跨归档重置单测（`emit_watermark_uses_seq_across_archive_reset`）；双显式会话 `outputs/`、`summaries/` 与归档互不混放 e2e（`explicit_sessions_keep_outputs_and_archives_separate`、`explicit_sessions_keep_summaries_separate`）；相对 env 落 cwd 会话 e2e（`relative_notify_env_lands_in_cwd_session`）。机械判据：`rg "watermark: &mut usize" crates` 为空；非默认会话的 `outputs`/`summaries` 路径带 `artifact_name` 前缀。
+
+注入点 → 测试名映射：
+
+| # | 注入点 | 手法 | 测试名 |
+| - | ------ | ---- | ------ |
+| 1 | append 事务中 | A | `kill_during_append_never_leaves_half_batch` |
+| 2 | `ai`+`tool_call` 批后、工具执行中 | A | `restart_after_sigkill_recovers_interrupted_tool_call` |
+| 3 | 工具执行中、结果前 | A | 同 #2（`restart_after_sigkill_recovers_interrupted_tool_call`） |
+| 4 | `tool_result` 后、轮末 `ai` 前 | B | `existing_tool_result_is_not_duplicated_on_resume` |
+| 5 | notify 发布中（tmp 后 rename 前） | A+B | `notify_cleans_stale_inbox_tmp` |
+| 6 | inbox 消费 append 后、删除前 | B | `replayed_consumed_inbox_file_is_idempotent` |
+| 7 | spool 写入/补投删除前 | A+B | `notify_falls_back_to_spool_and_next_run_replays_once` |
+| 8 | 归档 `VACUUM` 中 | A | `kill_during_archive_vacuum_keeps_primary_readable` |
+| 9 | 归档 `rename` 后、清空前 | B | `crash_after_archive_rename_before_clear_can_retry` |
+| 10 | 归档清空事务中 | A | `kill_during_archive_clear_transaction_is_atomic` |
+| 11 | `init` 建库中 | B+A | `zero_byte_database_self_heals`、`partial_database_reports_clear_error_then_retry`、`concurrent_first_runs_on_zero_byte_database` |
+| 12 | 接管释放锁瞬间 | A | `follower_takes_over_after_leader_killed`、`second_takeover_after_two_kills_converges` |
+| 13 | 模型请求中 kill（run） | A | `kill_during_model_request_loses_no_message` |
+| 14 | 发布者写 `tmp` 前 `SIGKILL` | 文档格 | 不承诺（见「保障分级」） |
+
+14 格均有归属：#2/#3、#7 复用既有 e2e 并在尾部追加收敛检查；#5 复用既有 e2e 的 tmp 清理断言；#14 为不承诺的文档格，列入「已知限制」与「升级判据」。INV7（发布者 kill 不影响已发布消息）另由 `publisher_killed_after_publish_is_consumed_exactly_once` 覆盖。
 
 ## 测试与验证策略
 
@@ -559,7 +594,7 @@ SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pendin
 3. **归档崩溃残留**：可能留下 0 字节归档占位与 `.tmp.<pid>` 临时文件；超过 1 小时的临时文件由下次归档尽力清理，占位需人工确认后删除。
 4. **`append` 每次调用约 1 ms 固定开销**：打开连接、设置 PRAGMA 与事务提交的成本，不适合逐条高频写入；批量追加可摊薄。
 5. 仅 POSIX（`sh -c`、`killpg`）；Windows 不在阶段 1 范围。
-6. `outputs/` 无保留策略，磁盘可能无界增长。
+6. **（永久限制）`outputs/` 无保留策略**：截断落盘的完整输出只增不减，磁盘可能无界增长；阶段 6 明确不做自动保留策略，用户报告磁盘问题时先用 `du`/`find` 手动查看占用再 prune（见「升级判据」）。
 7. 会话不承诺跨机迁移。
 8. token 估算按固定密度（`chars_per_token`，默认 4），仍低估 CJK（D52）。
 9. `reasoning` 落盘：思考内容进入会话文件，增大存储与隐私面（D23）。
@@ -570,21 +605,39 @@ SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pendin
 14. **审批不是安全边界**（阶段 2）：命令资源为 best-effort 文本拆分，包装器（`xargs`/`find -exec`/`sudo`）、重定向目标、变量展开等仍可绕过；收紧应使用窄 `allow` + 精准 `deny`，不要指望审批流拦截一切（D42）。
 15. **压缩使 KV cache 部分失效**：摘要替换稳定前缀之后的早期消息，provider 从第一个被替换 token 起的复用失效（压缩的本质代价，DSH 同样如此）。
 16. **摘要会再次发送被遮蔽内容**：摘要调用把被遮蔽消息发给模型，隐私面与主调用相同，不新增泄露面，但敏感历史会被多送一次。
-17. **`outputs/` 仍无保留策略**：磁盘可能无界增长（D48 顺延）。
+17. **（永久限制）`outputs/` 仍无保留策略**：与第 6 条同源；D48 顺延后于阶段 6 定为永久限制，理由见第 6 条。
 18. **`--notify` 不立即落库**：它只发布到 inbox，通知要等运行中的 runner 在安全点消费，或下一次 `run` 才进入历史；`--status` 能看到待处理计数，但 `--notify` 返回后立刻读取历史不会包含该通知。发布失败且可重试时会先落 spool，更要等下一次非跟随运行补投。
 19. **纯 follower 遇未决审批只等待**：不会自动接管或拒绝，会提示 `--approve` 并继续跟随；需要用户显式放行，或发布新的 `User` 触发 `PendingPolicy::Abandon`。
-20. **inbox/spool 顺序是 ULID 近似序**：按文件名字典序消费，同一毫秒内的 ULID 不保证单调；同毫秒到达的多条消息只保证大致按时间，不保证严格因果。spool 补投只消费 spool 自身、不再与 inbox 合并（见第 25 条）。
-21. **follower 每轮全量 `load`**：判断 own 是否落库、历史是否空闲、有无未决审批都需要全量历史，长会话为 O(n)；增量读取本身是 O(增量)，实测空轮询约 0.5 ms，暂不做增量视图。
-22. **显式会话的 `history/<sid>` 仍可能混放**：锁、inbox 与 spool 已按完整数据库文件名唯一化，但归档目录仍以父目录名作 sid；同目录多个显式会话会归档到同一 `history/<sid>/`，同名时依赖时间戳与 `-<n>` 后缀避免覆盖，语义上仍混放。`outputs/` 与 `summaries/` 也按会话根共享，同目录显式会话会共用这两个目录。完整唯一化留待阶段 6。
+20. **（永久限制）inbox/spool 顺序是 ULID 近似序**：按文件名字典序消费，同一毫秒内的 ULID 不保证单调；同毫秒到达的多条消息只保证大致按时间，不保证严格因果。阶段 6 明确不做 ULID 严格同毫秒序，需严格顺序时应串行发布或改用更高精度 id。spool 补投只消费 spool 自身、不再与 inbox 合并（见第 25 条）。
+21. **（永久限制）follower 每轮全量 `load`**：判断 own 是否落库、历史是否空闲、有无未决审批都需要全量历史，长会话为 O(n)；实测空轮询约 0.5 ms，增量读取本身是 O(增量)。阶段 6 明确不引入增量视图以保持配对与投影语义简单，故永久记录。
+22. **（阶段 6 已修复）显式会话 artifact 唯一化**：锁、inbox、spool 已按完整数据库文件名唯一化；阶段 6 起 `outputs/`、`summaries/` 与归档目录 `history/<sid>/` 也在安全化后的完整文件名（`artifact_name`）下再嵌一层，同目录多个显式会话互不混放。默认会话 `artifact_name` 为空串，路径与旧行为一致。
 23. **run 竞态 e2e 是烟雾测试**：真实进程同时启动、慢模型、`kill -9` 等覆盖主路径，不证明所有调度交错；inbox 并发与幂等由 store 单测覆盖，follow 的时序正确性仍依赖不变量测试与代码审查。
-24. **spool 只兜发布失败/预检 BUSY**：若发布者进程在通知成功发布到 inbox/spool 之前被 `SIGKILL`，该条通知仍会丢失；spool 不覆盖「进程没来得及写任何文件」的窗口。预检 BUSY/IO 会降级 spool，但发布者被杀仍不在保障范围内。
+24. **（永久限制）发布者在落盘前 `SIGKILL` 会丢通知**：spool 只兜发布失败/预检 BUSY；若发布者进程在通知成功发布到 inbox/spool 之前被 `SIGKILL`，该条通知仍会丢失，且不留下脏状态。这是「进程崩溃级」保障的边界，需外部重试或改用可靠队列，阶段 6 明确不做。
 25. **spool 补投只消费 spool 自身**：补投发生在崩溃恢复之后、`init` 之前，只扫描并消费 spool，不合并、不提前消费 inbox，因此不会打乱 `init/` 与 `pending/` 的既有消费顺序（F11）。代价是 spool 中的通知会先于本轮 `init/` 落库，与旧 spec 的「与 inbox 按 id 合并」不同。
 26. **跨数据根时 `output_files` 基准按发布者**：通知记录的相对路径以发布者数据根解析；目标会话在另一数据根时，接收方可能无法按自己的数据根解析该路径。
-27. **ULID 同毫秒排序只是近似**：inbox/spool 的合并与消费都以 ULID 字典序近似时间顺序，同毫秒内不保证严格因果；需要严格顺序时应串行发布或使用更高精度 id。
-28. **`YAA_NOTIFY`/`YAA_PARENT` 保留原字符串**：`yaa_env` 只把 `YAA_SESSION` 绝对化；继承的 `YAA_NOTIFY`/`YAA_PARENT` 按原值保留。阶段 6 若允许外部注入相对路径，需要在入口处绝对化，否则目标解析会相对当前 cwd。
+27. **（永久限制）ULID 同毫秒排序只是近似**：inbox/spool 的合并与消费都以 ULID 字典序近似时间顺序，同毫秒内不保证严格因果；阶段 6 明确不做 ULID 严格同毫秒序，需要严格顺序时应串行发布或使用更高精度 id。
+28. **（阶段 6 已修复）env 入口绝对化**：`YAA_SESSION` 在输出前绝对化；`--to` 与继承的 `YAA_NOTIFY`/`YAA_PARENT` 的相对值在解析通知目标时按当前 cwd 绝对化，不再随后续子进程的 cwd 漂移。
 29. **非 UTF-8 会话路径会被 lossy 化**：`YAA_SESSION`/`origin` 是字符串，`to_string_lossy` 会把无法解码的字节替换为 U+FFFD；非 UTF-8 路径仍可用于本地文件操作，但环境变量与归因字段不再逐字节可逆。
 30. **`--to` 的非普通文件被拒绝**：显式目标必须是普通文件；FIFO/设备等按「不是 yaa 会话数据库」退出 1，不会打开或阻塞。
 31. **大库 `--clear` 期间 notify 预检/发布会等待**：`--clear` 持 `clear.lock` EX 并在归档时执行 `VACUUM INTO`；notify 的预检与发布持 SH，可能等待数秒（受 busy_timeout 约束），期间命令尚未开始执行。
+32. **保障分级：进程崩溃 vs 机器断电**：承诺覆盖「进程崩溃级（`kill -9`）」与「fsync 约束下的断电级」，不承诺未 `fsync` 窗口（提交前、`rename` 前、写 spool 前）内的记录与发布，也不承诺真机器断电——后者需 dm-log-writes 验证，列为升级项（见「升级判据」）。
+33. **跨会话归因 `origin` 是弱引用**：`System.origin` 保存发布者会话库绝对路径（字符串），归档后可能指向已清空的主库或旧 generation，不能反查历史；阶段 6 明确不做跨会话归因解析，跨会话因果/树查询若成为需求再评估 edges 表（见「升级判据」）。
+34. **接管至少一次、单工具非 exactly-once**：follower 只在旧 runner 退出后尝试接管一次，失败即退出并保留 inbox 消息，由后续 `run` 处理（至少一次投递）；被中断的 `shell` 工具恢复时补中断结果，重试可能再次执行命令，单工具调用不保证 exactly-once，结果幂等靠 `call_id` 与同批事务约束。
+35. **`User.client_id`/`turn_id` 恒为 `None`**：schema 保留这两个可选字段但无运行时消费者，阶段 6 明确不填充；旧记录缺字段解析为 `None`。
+
+## 升级判据
+
+以下能力在阶段 6 定为「不做/不承诺」，出现对应信号时再评估，避免过度设计：
+
+| 能力 | 触发条件 | 备注 |
+| ---- | -------- | ---- |
+| edges 表 | 出现跨会话因果/树查询或自动路由需求，且 `origin`/`call_id` 字符串无法支撑 | `origin` 现为弱引用（见「已知限制」第 33 条） |
+| 常驻 daemon | 需要无人值守定时执行，或「通知必须即时消费且无人开 `yaa`」 | 现为排空式单进程模型（D68） |
+| 向量检索 | 历史搜索成为主要用法 | 优先做独立工具，不塞进 runner |
+| 真机器断电保障 | 数据重要且环境真断电 | 先补 dm-log-writes 测试 |
+| `outputs/` 保留策略 | 用户报告磁盘问题 | 先用 `du`/`find` 手动查看占用，再 prune |
+| ULID 严格同毫秒序 | 同毫秒因果顺序确有必要 | 现为近似序（见「已知限制」第 20、27 条） |
+| 单工具 exactly-once | 命令重复执行不可接受 | 现为至少一次投递（见「已知限制」第 34 条） |
 
 ## 已确认项与默认假设
 
@@ -595,3 +648,5 @@ SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pendin
 阶段 3 已确认（D48–D58）：压缩策略与默认值（`threshold_ratio=0.8`、`retain_ratio=0.16`、`chars_per_token=4`、`max_tokens=8192`、pruner `8192/4096/1024`、`retries=1`）、模型窗口 `context_window` 随 llm 配置（缺失即禁用）、渲染期压缩与侧车缓存、链式摘要、展示豁免、`--json` 与 `--no-store`。
 
 阶段 5 已确认（D76–D85）：`yaa_env` 环境链、`--to` 优先级与严格校验、`System.origin`/`call_id` 归因与统一谓词、spool 降级与补投、后台回注范式与 `call_id` 继承、`--approve` 不认 `--to`、归档拒绝非空 spool；终审补充提示词后台范式（D83）、spool 锁序与 generation 复查（D84）、CLI 冲突与 best-effort origin（D85）。
+
+阶段 6 已确认（D86–D90）：不变量检查器与崩溃矩阵、水位迁 `seq`、artifact 路径唯一化、env 入口绝对化、断电保障分级与升级判据。
