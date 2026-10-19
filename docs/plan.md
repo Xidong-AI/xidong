@@ -81,8 +81,18 @@
 | D73 | artifact 路径按**完整数据库文件名**唯一化：非 `session.db` 以安全化文件名作前缀，锁与 inbox 各自独立；`outputs/`、`summaries/` 仍按会话根共享 | 同目录多个显式 `--session` 不能共享 `runner.lock` 或 inbox；用完整文件名而非 `file_stem`，使 `a.db` 与 `a.sqlite` 不碰撞 |
 | D74 | `--clear` 持 `runner.lock` + `clear.lock` 后检查 `pending/`/`init/`，有消息即拒绝归档；库不存在但 inbox 非空同样拒绝 | 归档会清空历史并 bump generation，若连同待处理消息一起归档会静默丢消息；持锁检查与发布互斥 |
 | D75 | `max_steps` 计**模型调用次数**，按含 `User` 的 inbox 批次重置；纯 notify 不重置 | 一轮多用户合并时每个 user 批次都应有完整预算；通知不是新任务，不应无限延长步数 |
+| D76 | 会话环境链收敛为 `yaa-core::session::yaa_env` 纯函数，钩子 `hook_env`、shell 工具 `extra_env` 与 `--approve` 执行路径共用；注入 `YAA_SESSION`（无条件自己）、`YAA_NOTIFY`（继承非空且 ≠ 自身时保留）、`YAA_PARENT`（优先继承中间层，否则取孵化者的 `YAA_SESSION`）、`YAA_NOTIFY_CALL_ID`（仅 shell 工具） | 原实现把会话变量与限额变量分散拼接，两处漂移会直接把通知写错会话；纯函数让环境链可单测且只有一处事实源 |
+| D77 | `--to` 优先级 `--to` > `--session` > `YAA_NOTIFY` > `YAA_SESSION` > cwd；显式 `--to` 走严格校验阶梯（存在 → 目录内 `session.db` → 旧 `.jsonl` → yaa 库 → 未归档 → IO），不存在**拒绝且不创建**；普通 `--notify` 仍警告并创建；`--to` 与 `--session` 指向不同库、与 `--no-store` 同用、空串均为用法错误 | 显式目标写错会话的代价远高于「首次自动建库」的便利；严格模式让拼写错误立即暴露，普通路径保留阶段 1 的便利语义 |
+| D78 | 通知归因写入 `System.origin`（发布者会话库绝对路径，总写）与可选 `System.call_id`（继承 `YAA_NOTIFY_CALL_ID` 合法才写）；`Option` + `skip_serializing_if`，旧记录兼容、无 SQLite 迁移；新增 `is_injectable_system` 统一 display/render/inbox 白名单 | 父子血缘需要可审计的事件字段，而不是额外的 edges 表；单一谓词修复 F12 的三处判定漂移，且不引入新 `source` |
+| D79 | 通知发布失败且属于可重试类别（BUSY/IO）时降级写 `<会话根>/<artifact 前缀>spool/`；命令退出码不变、stderr 提示；`run_queued_inner` 在崩溃恢复后、`init` 前只消费 spool 自身（不合并、不提前消费 inbox），`append_idempotent` 后删除；follower 只提示滞留数 | 后台任务不能因为目标库短暂 BUSY 就丢结果；spool 复用 inbox 的原子发布原语，崩溃语义与幂等去重全部沿用，不需要 job 表或 watcher；只消费 spool 避免打乱 `init/` 与 `pending/` 的既有顺序 |
+| D80 | 后台回注范式：整条后台作业必须重定向 stdout/stderr（或 `setsid` 脱离工具进程组），如 `{ ... \| yaa --notify="..." --to "$YAA_SESSION"; } >/dev/null 2>&1 &`；子回父用 `--to "$YAA_PARENT"`；`call_id` 沿环境链继承父的工具调用 id，子内部再 spawn 时覆盖为最近调用点 | `yaa-exec` 在直接子进程退出后读取输出管道，后台进程若继续持有管道会在宽限期（2 秒）后被整组 `SIGKILL`，原 `... \| yaa --notify=... &` 范式在 shell 工具内必然失败；重定向/`setsid` 让工具立即返回且后台通知能到达 |
+| D81 | `--approve` 不认 `--to`：其解析链仍为 `--session` → `YAA_SESSION` → cwd；`--to` 与 `--approve` 组合因 `--to` 要求 `--notify` 而被 clap 拒绝；显式 `--to`/`YAA_NOTIFY` 目标一律按跨会话写 `pending/`，不写 `init/` | 审批是对本会话未决调用的恢复，不应被通知目标改写；跨会话通知也不应继承发起者的 init 相位 |
+| D82 | `--clear` 除 pending/init 外还拒绝非空 spool；`--status` 只读显示 spool 计数；`spool/tmp/` 沿用 1 小时残留清理 | 归档会清空历史并 bump generation，若把尚未补投的 spool 一起归档就是静默丢通知；计数让滞留可见但不产生副作用 |
+| D83 | 后台范式必须关闭/重定向 stdout/stderr（`{ ...; } >/dev/null 2>&1 &`）或 `setsid` 脱离工具进程组；`yaa-exec` 在直接子进程退出后读取管道，宽限期（2 秒）后对整组 `SIGKILL` | 原 `... \| yaa --notify=... &` 让后台进程继续持有工具管道，工具在 2 秒后整组击杀，内层通知永远不到达；重定向后管道立即 EOF，工具 <1s 返回，后台作业存活并投递 |
+| D84 | spool 写入新增 generation/archived 守卫：持 `clear.lock` SH，与 `publish_with_generation` 同锁序（先 clear 后 init），复查 generation/archived；notify 预检 BUSY/IO 也降级 spool；可重试读取失败时仍写 spool（clear SH 已排除并发 `--clear`） | 避免 spool 落在已归档/新 generation 下绕过 `--clear` 的非空 spool 拒绝检查，同时不因目标库短暂 BUSY 丢通知 |
+| D85 | CLI 冲突：`--notify` 与 `--clear`/`--status`/`--get-prompt` 由 clap 冲突拒绝；与位置提示词由解析后 `validate_combinations` 拒绝（clap 的 `conflicts_with` 会抵消 `--to` 的 `requires`）；`publisher_origin` 改为 best-effort，解析失败省略可选 `origin` | 短路写入路径不得静默忽略用户意图；可选归因不应成为合法 `--to` 发布的硬失败点；显式校验同时保住 `--to` 必须搭配 `--notify` |
 
-> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认，D68–D75 为阶段 4 单 runner 与多客户端注入确认。
+> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认，D68–D75 为阶段 4 单 runner 与多客户端注入确认，D76–D82 为阶段 5 notify 与后台任务确认，D83–D85 为阶段 5 终审修复确认。
 
 ## 对 design.md 的更正
 
@@ -203,7 +213,7 @@ context_window = 128000
 
 规则与不变量：
 
-1. 钩子以 `sh -c "<命令>"` 执行，cwd 为进程工作目录，环境含 `GLB_CFG`、`YAA_CONFIG_HOME`、`YAA_DATA_HOME`、`YAA_SESSION`（本会话数据库绝对路径）与 `YAA_BIN`（当前 `yaa` 可执行文件路径，使默认钩子不依赖 `PATH`）。
+1. 钩子以 `sh -c "<命令>"` 执行，cwd 为进程工作目录，环境含 `GLB_CFG`、`YAA_CONFIG_HOME`、`YAA_DATA_HOME`、`YAA_SESSION`（本会话数据库绝对路径）、`YAA_NOTIFY`（默认通知目标）与 `YAA_PARENT`（有父会话时）以及 `YAA_BIN`（当前 `yaa` 可执行文件路径，使默认钩子不依赖 `PATH`）。会话变量统一由 `yaa_env` 构造；钩子不注入 `YAA_NOTIFY_CALL_ID`（那是 shell 工具专有，见 D76）。
 2. **`init` 钩子只做副作用**：yaa 运行它并忽略 stdout；写入上下文的唯一方式是在命令里调用 `yaa --notify`。默认配置用三条 notify 拼出「系统提示词 / 用户总提示词 / 当前环境」；内置模板的「工具 section」由 `yaa-core::tools::shell` 提供（见 D14、D17）。
 3. **`llm` 钩子不落历史、不渲染、不展示**：其 stdout 含密钥，且每次运行都需执行以取得配置；结果只留在进程内，不写任何事件（见 D19）。
 4. **`init` 幂等由簿记保证**：触发条件是「会话中不存在 `system(source=init)` 记录」，成功后追加一条 `system(source=init, content="")` 簿记；即使钩子不产出内容，下次也不会重跑。失败时不写簿记、仍写入 `user` 并按配置错误退出，已写入的 `notify` 记录保留；因此下次运行会自动重试。
@@ -213,7 +223,7 @@ context_window = 128000
 8. **`yaa --notify` 写入协议**：`yaa --notify="注释" -- cmd` 把 argv 逐个作 POSIX 单引号转义（简单 token 不加引号，含特殊字符/空格/单引号者用单引号并转义内部单引号）后经 `yaa-exec` 执行，**复用 Shell 的截断与完整输出落盘**：正文 `body` 取被截断的 stdout，stderr 原样透传到 yaa 的 stderr，退出码沿用 cmd 的退出码（被信号杀死或超时按 1）；超限时 `output_files` 记录相对数据根的完整输出路径。`command` 记为上述**转义后可重放**的命令串；`cmd | yaa --notify="注释"` 从 stdin 读取并**复用同一套截断/落盘策略**（`yaa-exec::capture_reader`）：未超限为全量正文，超限时正文为头尾拼接并带 `... [truncated] ...` 标记、完整输入落盘并记入 `output_files.stdout`，无 `command`；注释缺省「由用户执行」。写入一条 `system { source: "notify", command?, output_files?, content: "<注释>\n<内容>\n</注释>" }`，原子追加到目标会话。
    - **限额解析优先级**（高→低）：`--notify-timeout`（仅超时）→ 环境变量 `YAA_NOTIFY_TIMEOUT_SECS` / `YAA_NOTIFY_MAX_STREAM_CHARS` / `YAA_NOTIFY_HEAD_CHARS` / `YAA_NOTIFY_TAIL_CHARS`（能解析为数字才生效）→ 配置文件 `[shell]`（路径同 `--config`/默认；读取或解析失败只打警告到 stderr 并用默认值，**绝不让 notify 失败**）→ 内置默认。
    - `shell` 工具执行时把本次调用的限额以这 4 个 `YAA_NOTIFY_*` 变量注入子进程，使工具内嵌的 `yaa --notify` 采用同一套参数（调用者透传）。
-   - 目标解析顺序 `--session` → `YAA_SESSION` → 当前 cwd 默认会话（跨会话显式 `--to` 见阶段 5）。
+    - 目标解析顺序 `--to` → `--session` → `YAA_NOTIFY`（非空且 ≠ 自身）→ `YAA_SESSION`（非空）→ 当前 cwd 默认会话（阶段 5，见 D77）。
    - `--notify` 是短路写入路径：不进入 agent loop、不触发 `init`；仅为解析限额按需读取配置，且失败不影响写入。
 
 ## 记录 schema（阶段 1 冻结）
@@ -226,7 +236,7 @@ ai          { type, id, ts, model, tool_schema_hash, content, reasoning? }
 tool_call   { type, id, ts, origin: ai|user, call_id, command, description? }
 tool_result { type, id, ts, call_id, stdout, stderr, code, timed_out,
               truncated, output_files?: { stdout?, stderr? } }
-system      { type, id, ts, source, command?, output_files?, content }
+system      { type, id, ts, source, origin?, call_id?, command?, output_files?, content }
 approval_pending  { type, id, ts, call_id, command, matched_rule }
 approval_resolved { type, id, ts, call_id, decision: approve|deny }
 ```
@@ -235,6 +245,7 @@ approval_resolved { type, id, ts, call_id, decision: approve|deny }
 - `call_id` 为模型返回的工具调用 id，`tool_result` 靠它配对。
 - `ai` 与其后紧跟的 `tool_call(origin=ai)` 记录构成一个助手步骤，**两者以单次缓冲原子追加**（见下）。
 - `system.source` 目前有 `notify`（`yaa --notify` 写入的通知，正文内联 `<注释>` 信封）与 `init`（初始化簿记，空内容不渲染）。
+- `system.origin`/`system.call_id` 为阶段 5 归因字段（D78）：`origin` 是发布者会话库绝对路径，`--notify` 总是写；`call_id` 是产生通知的工具调用 id，仅 `YAA_NOTIFY_CALL_ID` 合法时写。二者 `Option` + `skip_serializing_if`，旧记录缺字段解析为 `None`，无需 SQLite 迁移，也不参与渲染分组。`is_injectable_system` 是 display/render/inbox 共用的唯一 `system` 白名单谓词。
 - 可选 `command` 是产生该通知的 **shell 转义后可重放命令**（`sh -c` 重放等价原 argv；简单 token 不加引号，含特殊字符者用单引号并转义内部单引号）。展示层以 `% 命令` 呈现，投影时以 `[执行命令] <command>` 前缀进入上下文（D31）；stdin 形态与簿记无此字段。
 - 可选 `output_files` 与 `tool_result` 同构（相对数据根），承载 `--notify`（命令或 stdin）超限截断后落盘的完整输出；正文自身只含 `yaa-exec` 的头尾截断标记，截断提示与相对路径由投影层 `display::system_text` 追加（D32）。旧记录缺该字段解析为 `None`。
 - `ai.reasoning` 为可选思考内容，落盘、可由 `--verbose` 展示，并按 `endpoint_format` 决定是否回传（D23/D24）。
@@ -404,6 +415,7 @@ yaa --session <path>         # 指定会话文件
 yaa --get-prompt system      # 打印内置系统提示词后退出
 yaa --notify="注释" -- cmd   # 把命令输出作为通知写入当前会话后退出
 cmd | yaa --notify="注释"    # 从 stdin 读并写入通知后退出
+yaa --notify="注释" --to <path> -- cmd  # 写入显式目标会话（必须已存在，不创建）
 yaa --config <path>
 yaa --cwd <path>             # 改变进程工作目录
 yaa --verbose                # 追加思考内容与命令输出
@@ -414,11 +426,11 @@ yaa --json                   # 以 JSONL 输出展示事件（与 --quiet/--verb
 yaa --no-store               # 本次运行使用临时会话，退出即淘
 ```
 
-- `--notify` 是短路路径：不加载 `llm` 配置、不进入 agent loop，只解析会话、执行命令或读 stdin、原子追加一条 `system(source=notify)`。
+- `--notify` 是短路路径：不加载 `llm` 配置、不进入 agent loop，只解析目标、执行命令或读 stdin、发布一条 `system(source=notify)` 到 inbox（发布失败可重试时降级 spool）。
 - 过程记录默认打到 stderr（见 D13、D15、D16）：注入与通知用与工具调用一致的块样式（`# 注释` + 内容），工具调用用 `# 描述` + `% 命令`；块间以 `---` 分隔；非末步的模型正文也在此打印，末步回复只走 stdout。
 - 展示条目与模型消息同源，由 `yaa-core` 的投影产出；`--quiet` 抑制全部过程输出。
 
-后移到阶段 5：`--notify` 的 `--to` 与跨会话解析。`--json` 与 `--no-store` 已于阶段 3 落地（D57/D58）。
+`--json` 与 `--no-store` 已于阶段 3 落地（D57/D58）；`--notify` 的 `--to` 与跨会话解析已于阶段 5 落地（D77）。
 
 ## 阶段划分与验收
 
@@ -508,20 +520,29 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 验收覆盖（关键测试，概括范围）：inbox 并发发布、幂等消费、非法载荷与超限隔离、路径唯一化；两进程同时 run 仅一个成为 leader；注入后 kill -9 重启不丢不重；注入不打断工具配对；init 顺序与展示恰好一次；follower 不回放历史、增量投影等价全量；接管不重放；`--notify` 不启动 agent；`--clear` 遇 pending 拒绝；generation 变化退出；最终回复归属；建库 `0→1` 不误判归档；`--status` 只读不 reject。
 
-### 阶段 5：notify 与后台任务
+### 阶段 5：notify 与后台任务（已实现）
 
-`YAA_SESSION`/`YAA_PARENT`/`YAA_NOTIFY` 解析链、`--notify="注释" --to <path>`、后台结果作为 `system(source=notify)` 事件回注，复用阶段 3 的截断与压缩。
+行为（D76–D85）：
+
+- **环境链**：`yaa_env` 纯函数统一钩子、shell 工具与 `--approve` 执行路径；`YAA_SESSION` 总是自己，`YAA_NOTIFY` 只继承指向别处的值，`YAA_PARENT` 保留中间层或孵化者，`YAA_NOTIFY_CALL_ID` 仅 shell 工具注入。
+- **`--to` 与优先级**：`--to` > `--session` > `YAA_NOTIFY` > `YAA_SESSION` > cwd；显式 `--to` 严格校验且绝不创建，普通 `--notify` 警告并创建；`--to` 空串、与 `--session` 指向不同库、与 `--no-store` 同用为用法错误；`--approve` 不认 `--to`。
+- **归因**：`System.origin` 总写、`System.call_id` 合法才写；旧记录兼容、无 SQLite 迁移；`is_injectable_system` 统一 display/render/inbox 谓词。
+- **spool**：可重试发布失败/预检 BUSY（BUSY/IO）降级暂存，命令退出码不变；runner 在崩溃恢复后、`init` 前只消费 spool 自身（不合并 inbox）；follower 只提示滞留；`--status` 显示计数；`--clear` 拒绝非空 spool。
+- **后台回注**：shell 提示词给出 `{ ... | yaa --notify="..." --to "$YAA_SESSION"; } >/dev/null 2>&1 &` 与 `setsid ... >/dev/null 2>&1 &` 范式（后台作业必须重定向输出或脱离工具进程组），以及 `--to "$YAA_PARENT"`；`call_id` 沿环境链继承父的工具调用 id。
+
+验收覆盖（关键测试，概括范围）：I1 环境链（含嵌套 `YAA_PARENT`）；I2 优先级矩阵；I3 严格拒绝且不创建目标；I4 子→父通知落库带 `origin`/`call_id`；I5 无 runner 时 pending 滞留 + status 计数 + 零模型请求；I6 spool 降级与补投幂等；I7 spool 非空拒绝 clear；I8 旧 JSON 兼容 + 非法 `call_id` 忽略；I9 display/render 谓词一致；I10 请求期间通知不丢不重；I11 双投幂等；I12 kill -9 后 append/删除窗口去重。
 
 ### 阶段 6：断电恢复与不变量
 
-SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pending 已由 core 的恢复逻辑实现；文件 inbox 的发布/消费崩溃语义（`rename` 原子、append 后删除前重现靠 id 去重）已在阶段 4 落地；按 `id` 去重；不变量测试。
+SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pending 已由 core 的恢复逻辑实现；文件 inbox 的发布/消费崩溃语义（`rename` 原子、append 后删除前重现靠 id 去重）已在阶段 4 落地；阶段 5 的 spool 复用同一原子发布原语，补投同样以 `append_idempotent` + 删除保证不重不丢；按 `id` 去重；不变量测试。
 
 ## 测试与验证策略
 
 - 单元测试：记录序列化往返与 golden JSON（含 `system.output_files` 与旧记录缺字段的兼容）；渲染分层（稳定前缀合并、双向最大连续段并入 `user`、失配兜底、`origin=user`、`system` 的 `[执行命令]` 前缀与截断提示）；`ai.reasoning` 与 `endpoint_format` 的出站序列化；store 追加/加载/`read_after`/归档（含同 ts 序号与 `archived` 只读）/损坏 payload 报错/并发追加与 BUSY 重试；Shell 进程组、超时、流式截断、逃逸进程组放弃输出但不误报超时。
 - 思考回传测试：`endpoint_format` 为 `deepseek` 等时 assistant 消息含 `reasoning_content`（带 `tool_calls` 且思考为空时为 `""`），为 `openai` 时不含。
 - 通知测试：`--notify` 两种形态写入 `system(source=notify)` 与信封正文；`--` 形态记**转义后可重放**的 `command`、stdin 形态不记；注释缺省「由用户执行」；stderr 透传与退出码沿用；两种形态超限截断与 `output_files` 落盘（命令流与 stdin 同一 `Sink`）；`--notify-timeout` 与环境变量/`[shell]` 限额解析链；`shell_quote` 重放等价；`tools::shell` 注入 `YAA_NOTIFY_*`。
-- 会话目标测试：hook 环境注入 `YAA_SESSION`；`--notify` 解析顺序 `--session` → `YAA_SESSION` → cwd 默认。
+- 会话目标测试：`yaa_env` 环境链（`YAA_SESSION`/`YAA_NOTIFY`/`YAA_PARENT`/`YAA_NOTIFY_CALL_ID`）；`--notify` 解析顺序 `--to` → `--session` → `YAA_NOTIFY` → `YAA_SESSION` → cwd 默认；显式 `--to` 的严格校验与「不创建目标」；`origin` 总写与非法 `call_id` 忽略。
+- 阶段 5 保底测试：可重试发布失败降级 spool、补投幂等与消费后删除、spool 非空拒绝 `--clear`、`--status` 只读计数、follower 只提示不补投。
 - 初始化测试：无 `system(source=init)` 簿记时执行 `init` 并写簿记（含已有 `notify` 记录的会话）；已写簿记的会话不重跑；`init` 失败仍写 `user`、不写簿记且退出码为配置错误，改好后下次运行能重试成功。
 - 展示测试：展示条目 golden；首轮注入展示一次；默认摘要与 `--verbose` 全文两种形态；`--quiet` 抑制；`llm` 不产生记录。
 - 模型请求超时测试：无响应端点（accept 后不读不写）在配置超时内返回错误；`request_timeout_secs = 0` 被拒绝、缺省 300、可解析。
@@ -543,19 +564,27 @@ SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pendin
 8. token 估算按固定密度（`chars_per_token`，默认 4），仍低估 CJK（D52）。
 9. `reasoning` 落盘：思考内容进入会话文件，增大存储与隐私面（D23）。
 10. 思考回传仅覆盖 `reasoning_content` 系端点（DeepSeek/Kimi/Qwen/GLM）；Anthropic/Responses/Gemini 的签名类结构化 metadata 不支持（D24）。
-11. **（F12）展示与渲染对 `system` 的谓词不对称**：展示只看 `source == "notify"`，渲染看「非 `init` 且（`content` 非空或 `output_files` 存在）」。将来出现新 `source`（如阶段 5 的后台结果）时必须统一谓词；阶段 1 暂不修，以免在只有两种 `source` 时引入无消费者的抽象。
+11. **（F12，阶段 5 已修复）展示与渲染对 `system` 的谓词已统一**：display、render 与 inbox 载荷校验都调用 `is_injectable_system`（当前仅 `source == "notify"`），不再各自判断 `source` 与 `content`/`output_files`。
 12. **逃逸进程组攥管道时输出仍可能被放弃**：后台进程若 `setsid` 脱离工具进程组并继续持有 stdout/stderr 管道，读取会在宽限后被放弃，输出以占位提示自解释；但这**不再误报**为 `timed_out`（D35）。长任务应用 `nohup <cmd> >/dev/null 2>&1 &` 主动脱离工具管道，而不是依赖读取宽限。
 13. **SIGINT 只清理 `shell` 工具进程组**：`init`/`llm` 钩子的进程组未纳入信号转发；钩子自身有硬超时兜底。
 14. **审批不是安全边界**（阶段 2）：命令资源为 best-effort 文本拆分，包装器（`xargs`/`find -exec`/`sudo`）、重定向目标、变量展开等仍可绕过；收紧应使用窄 `allow` + 精准 `deny`，不要指望审批流拦截一切（D42）。
 15. **压缩使 KV cache 部分失效**：摘要替换稳定前缀之后的早期消息，provider 从第一个被替换 token 起的复用失效（压缩的本质代价，DSH 同样如此）。
 16. **摘要会再次发送被遮蔽内容**：摘要调用把被遮蔽消息发给模型，隐私面与主调用相同，不新增泄露面，但敏感历史会被多送一次。
 17. **`outputs/` 仍无保留策略**：磁盘可能无界增长（D48 顺延）。
-18. **`--notify` 不立即落库**：它只发布到 inbox，通知要等运行中的 runner 在安全点消费，或下一次 `run` 才进入历史；`--status` 能看到待处理计数，但 `--notify` 返回后立刻读取历史不会包含该通知。
+18. **`--notify` 不立即落库**：它只发布到 inbox，通知要等运行中的 runner 在安全点消费，或下一次 `run` 才进入历史；`--status` 能看到待处理计数，但 `--notify` 返回后立刻读取历史不会包含该通知。发布失败且可重试时会先落 spool，更要等下一次非跟随运行补投。
 19. **纯 follower 遇未决审批只等待**：不会自动接管或拒绝，会提示 `--approve` 并继续跟随；需要用户显式放行，或发布新的 `User` 触发 `PendingPolicy::Abandon`。
-20. **inbox 顺序是 ULID 近似序**：按文件名字典序消费，同一毫秒内的 ULID 不保证单调；同毫秒到达的多条消息只保证大致按时间，不保证严格因果。
+20. **inbox/spool 顺序是 ULID 近似序**：按文件名字典序消费，同一毫秒内的 ULID 不保证单调；同毫秒到达的多条消息只保证大致按时间，不保证严格因果。spool 补投只消费 spool 自身、不再与 inbox 合并（见第 25 条）。
 21. **follower 每轮全量 `load`**：判断 own 是否落库、历史是否空闲、有无未决审批都需要全量历史，长会话为 O(n)；增量读取本身是 O(增量)，实测空轮询约 0.5 ms，暂不做增量视图。
-22. **显式会话的 `history/<sid>` 仍可能混放**：锁与 inbox 已按完整数据库文件名唯一化，但归档目录仍以父目录名作 sid；同目录多个显式会话会归档到同一 `history/<sid>/`，同名时依赖时间戳与 `-<n>` 后缀避免覆盖，语义上仍混放。`outputs/` 与 `summaries/` 也按会话根共享，同目录显式会话会共用这两个目录。完整唯一化留待阶段 6。
+22. **显式会话的 `history/<sid>` 仍可能混放**：锁、inbox 与 spool 已按完整数据库文件名唯一化，但归档目录仍以父目录名作 sid；同目录多个显式会话会归档到同一 `history/<sid>/`，同名时依赖时间戳与 `-<n>` 后缀避免覆盖，语义上仍混放。`outputs/` 与 `summaries/` 也按会话根共享，同目录显式会话会共用这两个目录。完整唯一化留待阶段 6。
 23. **run 竞态 e2e 是烟雾测试**：真实进程同时启动、慢模型、`kill -9` 等覆盖主路径，不证明所有调度交错；inbox 并发与幂等由 store 单测覆盖，follow 的时序正确性仍依赖不变量测试与代码审查。
+24. **spool 只兜发布失败/预检 BUSY**：若发布者进程在通知成功发布到 inbox/spool 之前被 `SIGKILL`，该条通知仍会丢失；spool 不覆盖「进程没来得及写任何文件」的窗口。预检 BUSY/IO 会降级 spool，但发布者被杀仍不在保障范围内。
+25. **spool 补投只消费 spool 自身**：补投发生在崩溃恢复之后、`init` 之前，只扫描并消费 spool，不合并、不提前消费 inbox，因此不会打乱 `init/` 与 `pending/` 的既有消费顺序（F11）。代价是 spool 中的通知会先于本轮 `init/` 落库，与旧 spec 的「与 inbox 按 id 合并」不同。
+26. **跨数据根时 `output_files` 基准按发布者**：通知记录的相对路径以发布者数据根解析；目标会话在另一数据根时，接收方可能无法按自己的数据根解析该路径。
+27. **ULID 同毫秒排序只是近似**：inbox/spool 的合并与消费都以 ULID 字典序近似时间顺序，同毫秒内不保证严格因果；需要严格顺序时应串行发布或使用更高精度 id。
+28. **`YAA_NOTIFY`/`YAA_PARENT` 保留原字符串**：`yaa_env` 只把 `YAA_SESSION` 绝对化；继承的 `YAA_NOTIFY`/`YAA_PARENT` 按原值保留。阶段 6 若允许外部注入相对路径，需要在入口处绝对化，否则目标解析会相对当前 cwd。
+29. **非 UTF-8 会话路径会被 lossy 化**：`YAA_SESSION`/`origin` 是字符串，`to_string_lossy` 会把无法解码的字节替换为 U+FFFD；非 UTF-8 路径仍可用于本地文件操作，但环境变量与归因字段不再逐字节可逆。
+30. **`--to` 的非普通文件被拒绝**：显式目标必须是普通文件；FIFO/设备等按「不是 yaa 会话数据库」退出 1，不会打开或阻塞。
+31. **大库 `--clear` 期间 notify 预检/发布会等待**：`--clear` 持 `clear.lock` EX 并在归档时执行 `VACUUM INTO`；notify 的预检与发布持 SH，可能等待数秒（受 busy_timeout 约束），期间命令尚未开始执行。
 
 ## 已确认项与默认假设
 
@@ -564,3 +593,5 @@ SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pendin
 默认假设（未特别反对即执行）：截断阈值 `max_stream_chars=32768`、`head_chars=8192`、`tail_chars=2048`；`endpoint_format` 默认 `"openai"`；注入合并用空行分隔；包 `yaa-cli` 产出二进制 `yaa`；`request_timeout_secs` 默认 300；workspace 版本从 `0.1.0` 起。
 
 阶段 3 已确认（D48–D58）：压缩策略与默认值（`threshold_ratio=0.8`、`retain_ratio=0.16`、`chars_per_token=4`、`max_tokens=8192`、pruner `8192/4096/1024`、`retries=1`）、模型窗口 `context_window` 随 llm 配置（缺失即禁用）、渲染期压缩与侧车缓存、链式摘要、展示豁免、`--json` 与 `--no-store`。
+
+阶段 5 已确认（D76–D85）：`yaa_env` 环境链、`--to` 优先级与严格校验、`System.origin`/`call_id` 归因与统一谓词、spool 降级与补投、后台回注范式与 `call_id` 继承、`--approve` 不认 `--to`、归档拒绝非空 spool；终审补充提示词后台范式（D83）、spool 锁序与 generation 复查（D84）、CLI 冲突与 best-effort origin（D85）。

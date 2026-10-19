@@ -22,7 +22,7 @@ git config core.hooksPath .githooks
 crates/
   yaa-cli/    二进制 yaa：参数解析、入口、展示渲染、stdout/stderr 策略
   yaa-core/   配置与路径、工具定义、模型调用、渲染与展示投影、agent loop
-  yaa-store/  会话 SQLite 事件库读写、归档、文件锁与文件 inbox
+  yaa-store/  会话 SQLite 事件库读写、归档、文件锁、文件 inbox/spool（含 `file_queue` 原子发布原语）
   yaa-exec/   Shell 执行机制：进程组、超时、流式截断、完整输出落盘
   yaa-msg/    记录类型与序列化
 ```
@@ -49,7 +49,7 @@ cargo fmt --all -- --check
 cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
 cargo test
-autocorrect --lint crates docs
+autocorrect --lint crates docs README.md README.en.md CONTRIBUTING.md
 ```
 
 仓库的提交钩子会拒绝包含警告或排版问题的代码。

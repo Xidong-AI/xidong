@@ -58,6 +58,7 @@ yaa --status                      # print a session summary
 yaa --get-prompt system           # print the built-in system prompt template
 yaa --notify="comment" -- cmd      # run cmd and write its stdout as a notification
 cmd | yaa --notify="comment"       # read stdin and write it as a notification
+yaa --notify="comment" --to "$YAA_PARENT" -- cmd  # write to an explicit target (must exist)
 yaa --notify-timeout 30 --notify="comment" -- cmd  # override the notification command timeout (seconds)
 yaa --cwd /path/to/project 你好    # set the working directory
 yaa --session /path/to/session.db 你好
@@ -80,6 +81,7 @@ Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook 
 5. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded. Both `--notify` forms (command and stdin) reuse the same truncation and dump path. Limit precedence: `--notify-timeout` → `YAA_NOTIFY_*` env vars → `[shell]` → defaults.
 6. **Command visibility**: a notification's replayable command enters the model context with an `[执行命令]` prefix, telling the model which command produced it.
 7. **Concurrency and injection**: each session has at most one runner at a time; a second `yaa "..."` publishes its message to the session inbox and follows the running runner's output. `--notify` also only writes to the inbox and never starts the model; a running `yaa` consumes it at a safe point, or the next `yaa` run does. `--clear` refuses to archive while messages are pending.
+8. **Multi-agent and background tasks**: the environment chain carries `YAA_SESSION` (this session), `YAA_NOTIFY` (default notification target), and `YAA_PARENT` (parent session). Use `... | yaa --notify="comment" --to "$YAA_SESSION" &` to run a long task in the background and inject its result back into this session; a child agent reports to its parent with `--to "$YAA_PARENT"`. An explicit `--to` only writes to an existing session and never creates one; if publishing fails, the notification is kept in the spool and replayed on the next run.
 
 ## Layout
 
@@ -87,7 +89,7 @@ Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook 
 | ----------- | --------------------------------------------------------------- |
 | `yaa-cli`   | `yaa` binary: argument parsing, entry point, stdout/stderr policy |
 | `yaa-core`  | Config and paths, tool definition, model calls, rendering and display projection, agent loop |
-| `yaa-store` | Session SQLite event database read/write, reads by sequence, archiving, file locks, file inbox publish/scan |
+| `yaa-store` | Session SQLite event database read/write, reads by sequence, archiving, file locks, file inbox/spool publish/scan |
 | `yaa-exec`  | Shell execution mechanism: process group, timeout, streaming truncation, full-output files |
 | `yaa-msg`   | Record types and serialization                                   |
 

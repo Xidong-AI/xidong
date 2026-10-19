@@ -58,6 +58,7 @@ yaa --status                      # 打印会话摘要
 yaa --get-prompt system           # 打印内置系统提示词模板
 yaa --notify="注释" -- cmd         # 执行 cmd，把 stdout 作为通知写入当前会话
 cmd | yaa --notify="注释"          # 从 stdin 读内容并写入通知
+yaa --notify="注释" --to "$YAA_PARENT" -- cmd  # 写入显式目标会话（必须已存在）
 yaa --notify-timeout 30 --notify="注释" -- cmd  # 覆盖该通知命令的超时（秒）
 yaa --cwd /path/to/project 你好    # 指定工作目录
 yaa --session /path/to/session.db 你好
@@ -80,6 +81,7 @@ yaa --quiet                       # 只打印最终回复
 5. **截断**：工具单流输出超过上限时中间截去，完整输出写入 `sessions/<sid>/outputs/`，记录中给出路径；`--notify` 的命令与 stdin 形态复用同一套截断与落盘。限额解析优先级为 `--notify-timeout` → `YAA_NOTIFY_*` 环境变量 → `[shell]` → 默认。
 6. **命令可见**：通知记录的可重放命令会以 `[执行命令]` 前缀进入模型上下文，让模型知道通知由哪条命令产生。
 7. **并发与注入**：同一会话同时只有一个 runner；另一个 `yaa "内容"` 会先把消息发布到会话的 inbox，再跟随已有 runner 的输出。`--notify` 也只写入 inbox，不启动模型，由运行中的 yaa 在安全点消费；没有 runner 时留待下次 `yaa` 处理。`--clear` 遇到待处理消息会拒绝归档。
+8. **多智能体与后台任务**：环境链自动带上 `YAA_SESSION`（本会话）、`YAA_NOTIFY`（默认通知目标）与 `YAA_PARENT`（父会话）。用 `... | yaa --notify="注释" --to "$YAA_SESSION" &` 把耗时任务放后台，结束后把结果回注本会话；子智能体回父用 `--to "$YAA_PARENT"`。显式 `--to` 只写已存在的会话、绝不创建；发布失败时通知先落到 spool，下次运行补投。
 
 ## 目录结构
 
@@ -87,7 +89,7 @@ yaa --quiet                       # 只打印最终回复
 | ----------- | ---------------------------------------------------------- |
 | `yaa-cli`   | 二进制 `yaa`：参数解析、入口、stdout/stderr 策略           |
 | `yaa-core`  | 配置与路径、工具定义、模型调用、渲染与展示投影、agent loop |
-| `yaa-store` | 会话 SQLite 事件库读写、按序号读、归档、文件锁、文件 inbox 发布与扫描 |
+| `yaa-store` | 会话 SQLite 事件库读写、按序号读、归档、文件锁、文件 inbox/spool 发布与扫描 |
 | `yaa-exec`  | Shell 执行机制：进程组、超时、流式截断、完整输出落盘       |
 | `yaa-msg`   | 记录类型与序列化                                            |
 
