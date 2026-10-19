@@ -156,6 +156,182 @@ pub fn items_from(records: &[Record], start: usize) -> Vec<DisplayItem> {
     items
 }
 
+/// `final_step` 待定的 `ai`：真正判定取决于其后**紧跟**的记录，须等下一批到达。
+struct PendingText {
+    reasoning: Option<String>,
+    content: String,
+}
+
+/// 增量展示投影器：把**逐批**到达的记录投影为展示条目，行为等价于全量 [`items_from`]。
+///
+/// [`items_from`] 需要全量记录：它预扫命令表（供审批决策回填 `command`），并按
+/// 「下一条记录」判定 `ai` 的 `final_step`。跟随者只有增量，不能每批全量重投影，故本
+/// 结构跨批维护这两项状态：
+///
+/// - **命令表**：每条 `ToolCall` 到达时更新（`call_id → command`）；
+/// - **待定正文**：到达的 `ai` 不立即产出 [`DisplayItem::Text`]，而是挂起，待下一条记录
+///   到达时按「是否为 `origin=ai` 的 `ToolCall`」判定 `final_step` 再产出。流结束时用
+///   [`DisplayProjector::flush`] 产出末尾挂起的正文（此时其后无记录，`final_step=true`）。
+///
+/// 等价性：对任意历史 `H` 与切分点 `k`，把 `H` 分两批推送（先 `H[..k]` 后 `H[k..]`）
+/// 并最终 `flush()`，其条目拼接 == `items_from(H, 0)`。
+/// 前提是 `H` 中引用 `call_id` 的审批记录出现在产生该 `call_id` 的 `ToolCall` 之后
+/// （真实历史始终如此）。
+#[derive(Default)]
+pub struct DisplayProjector {
+    commands: BTreeMap<String, String>,
+    pending: Option<PendingText>,
+}
+
+impl DisplayProjector {
+    /// 空投影器，用于从某一水位开始跟随。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 用已有历史初始化状态（接管时回填命令表）。
+    ///
+    /// 传入的历史须**已展示完毕**：本方法只累积命令表，不产出任何条目，并清空末尾待定
+    /// 正文，避免接管后重复展示前缀最后一条 `ai`。
+    pub fn from_records(records: &[Record]) -> Self {
+        let mut projector = Self::new();
+        let mut discard = Vec::new();
+        for record in records {
+            projector.feed(record, &mut discard);
+            discard.clear();
+        }
+        projector.pending = None;
+        projector
+    }
+
+    /// 推入一批增量记录，返回本批应展示的条目（不含末尾待定的 `ai` 正文）。
+    pub fn push(&mut self, rows: &[Record]) -> Vec<DisplayItem> {
+        let mut items = Vec::new();
+        for record in rows {
+            self.feed(record, &mut items);
+        }
+        items
+    }
+
+    /// 产出末尾挂起的 `ai` 正文（其后无记录，按轮末处理）。流结束时调用一次。
+    pub fn flush(&mut self) -> Vec<DisplayItem> {
+        match self.pending.take() {
+            Some(pending) => vec![DisplayItem::Text {
+                reasoning: pending.reasoning,
+                content: pending.content,
+                final_step: true,
+            }],
+            None => Vec::new(),
+        }
+    }
+
+    /// 处理单条记录：先按本记录判定并产出上一条挂起的 `ai`，再产出本记录的条目。
+    fn feed(&mut self, record: &Record, items: &mut Vec<DisplayItem>) {
+        if let Some(pending) = self.pending.take() {
+            let final_step = !matches!(
+                record,
+                Record::ToolCall(call) if call.origin == ToolOrigin::Ai
+            );
+            items.push(DisplayItem::Text {
+                reasoning: pending.reasoning,
+                content: pending.content,
+                final_step,
+            });
+        }
+        match record {
+            Record::ToolCall(call) => {
+                self.commands
+                    .insert(call.call_id.clone(), call.command.clone());
+            }
+            Record::Ai(ai) => {
+                self.pending = Some(PendingText {
+                    reasoning: ai.reasoning.clone(),
+                    content: ai.content.clone(),
+                });
+            }
+            _ => {}
+        }
+        match record {
+            Record::System(system) => {
+                if system.source == "notify" && has_visible_text(system) {
+                    items.push(DisplayItem::Injection {
+                        comment: envelope_comment(&system.content)
+                            .unwrap_or("通知")
+                            .to_string(),
+                        command: system.command.clone(),
+                        content: system_text(system),
+                    });
+                }
+            }
+            Record::ToolCall(call) if call.origin == ToolOrigin::Ai => {
+                items.push(DisplayItem::ToolCall {
+                    description: call.description.clone(),
+                    command: call.command.clone(),
+                });
+            }
+            Record::ToolResult(result) => items.push(DisplayItem::ToolOutput {
+                stdout: result.stdout.clone(),
+                stderr: result.stderr.clone(),
+            }),
+            Record::ApprovalPending(pending) => items.push(DisplayItem::ApprovalPending {
+                call_id: pending.call_id.clone(),
+                command: pending.command.clone(),
+                matched_rule: pending.matched_rule.clone(),
+            }),
+            Record::ApprovalResolved(resolved) => items.push(DisplayItem::ApprovalResolved {
+                call_id: resolved.call_id.clone(),
+                command: self
+                    .commands
+                    .get(resolved.call_id.as_str())
+                    .cloned()
+                    .unwrap_or_default(),
+                approved: resolved.decision == yaa_msg::ApprovalDecision::Approve,
+            }),
+            // `ai`（已挂起）与 `tool_call(origin=user)` 不产出条目。
+            _ => {}
+        }
+    }
+}
+
+/// `own_id` 之后**第一条轮末 `ai`** 的正文；找不到则 `None`。
+///
+/// 「轮末」指其后（全量历史中）紧跟的不是 `origin=ai` 的 `ToolCall`。用于把最终回复
+/// 归位到自己的 user 记录：多客户端合并一轮时，各自打印自己 id 之后的那条答案。
+pub fn final_ai_for_own<'a>(records: &'a [Record], own_id: &str) -> Option<&'a str> {
+    let start = records.iter().position(|record| record.id() == own_id)?;
+    for (offset, record) in records[start + 1..].iter().enumerate() {
+        if let Record::Ai(ai) = record {
+            let index = start + 1 + offset;
+            let final_step = !matches!(
+                records.get(index + 1),
+                Some(Record::ToolCall(call)) if call.origin == ToolOrigin::Ai
+            );
+            if final_step {
+                return Some(&ai.content);
+            }
+        }
+    }
+    None
+}
+
+/// 历史是否「空闲」（无未完成回合）：空、末条为轮末 `ai`、或仅含 init 簿记/空 `system`。
+///
+/// 末条为 `user` / `tool_result` / `tool_call` / 审批记录都视为未完成（需继续跑）；含正文的
+/// `notify` 也已消费却尚未得到模型回应，同样视为未完成。
+pub fn is_idle(records: &[Record]) -> bool {
+    match records.last() {
+        None => true,
+        Some(Record::Ai(_)) => true,
+        Some(Record::System(_)) => records.iter().all(|record| {
+            matches!(
+                record,
+                Record::System(system) if system.source == "init" || system.content.is_empty()
+            )
+        }),
+        _ => false,
+    }
+}
+
 /// 统一截断提示：正文被截断时说明仅保留头尾，并给出完整输出相对路径。
 ///
 /// [`crate::render`] 的工具消息与 [`system_text`] 都调用本函数，避免两处文案漂移。
@@ -484,5 +660,165 @@ mod tests {
         assert_eq!(envelope_comment("没有信封"), None);
         assert_eq!(envelope_comment("<注释>\n正文"), None);
         assert_eq!(envelope_comment("<注释>\n正文\n</不匹配>"), None);
+    }
+
+    /// 构造一份覆盖各记录类型的代表性历史。
+    fn sample_history() -> Vec<Record> {
+        vec![
+            notify("<系统>\n提示\n</系统>", Some("yaa --get-prompt system")),
+            Record::system("init", "", None, None),
+            Record::user("你好"),
+            Record::ai("m", "h", "中途", Some("想".into())),
+            Record::tool_call(ToolOrigin::Ai, "c1", "echo hi", Some("打招呼".into())),
+            Record::tool_result("c1", "hi\n", "", 0, false, false, None),
+            Record::ai("m", "h", "最终", None),
+        ]
+    }
+
+    /// 任意切分点下，分两批推送（含末尾 flush）拼接 == 全量 `items_from`。
+    #[test]
+    fn projector_matches_full_projection_for_every_split() {
+        let history = sample_history();
+        let full = items_from(&history, 0);
+        for split in 0..=history.len() {
+            let mut projector = DisplayProjector::new();
+            let mut got = projector.push(&history[..split]);
+            got.extend(projector.push(&history[split..]));
+            got.extend(projector.flush());
+            assert_eq!(got, full, "切分点 {split} 的增量投影应与全量一致");
+        }
+    }
+
+    /// 多批推送（含末尾 flush）与全量一致；`final_step` 跨批正确解析。
+    #[test]
+    fn projector_matches_full_projection_across_many_pushes() {
+        let history = sample_history();
+        let full = items_from(&history, 0);
+        let mut projector = DisplayProjector::new();
+        let mut got = Vec::new();
+        for record in &history {
+            got.extend(projector.push(std::slice::from_ref(record)));
+        }
+        got.extend(projector.flush());
+        assert_eq!(got, full, "逐条推送应与全量一致");
+    }
+
+    /// `ai` 与紧随的 `tool_call` 分处两批时，`final_step` 仍应为 false。
+    #[test]
+    fn projector_resolves_final_step_across_batches() {
+        let ai = Record::ai("m", "h", "中途", None);
+        let call = Record::tool_call(ToolOrigin::Ai, "c1", "ls", None);
+        let mut projector = DisplayProjector::new();
+        assert!(
+            projector.push(std::slice::from_ref(&ai)).is_empty(),
+            "末尾的 ai 应挂起，待下一条判定 final_step"
+        );
+        let items = projector.push(std::slice::from_ref(&call));
+        assert_eq!(
+            items,
+            vec![
+                DisplayItem::Text {
+                    reasoning: None,
+                    content: "中途".to_string(),
+                    final_step: false,
+                },
+                DisplayItem::ToolCall {
+                    description: None,
+                    command: "ls".to_string(),
+                },
+            ]
+        );
+        assert!(projector.flush().is_empty(), "已无挂起正文");
+    }
+
+    /// 审批决策的 `command` 由更早批次的 `tool_call` 回填（跨批命令表）。
+    #[test]
+    fn projector_backfills_approval_command_from_earlier_batch() {
+        let mut projector = DisplayProjector::new();
+        projector.push(&[Record::tool_call(ToolOrigin::Ai, "c1", "echo hi", None)]);
+        let items = projector.push(&[
+            Record::approval_pending("c1", "echo hi", "echo *"),
+            Record::approval_resolved("c1", yaa_msg::ApprovalDecision::Approve),
+        ]);
+        assert_eq!(
+            items,
+            vec![
+                DisplayItem::ApprovalPending {
+                    call_id: "c1".to_string(),
+                    command: "echo hi".to_string(),
+                    matched_rule: "echo *".to_string(),
+                },
+                DisplayItem::ApprovalResolved {
+                    call_id: "c1".to_string(),
+                    command: "echo hi".to_string(),
+                    approved: true,
+                },
+            ]
+        );
+    }
+
+    /// `from_records` 初始化（前缀视作已展示）后可继续跨批投影且命令表齐全。
+    #[test]
+    fn projector_from_records_carries_state_into_push() {
+        let history = sample_history();
+        let mut projector = DisplayProjector::from_records(&history);
+        let extra = vec![Record::approval_resolved(
+            "c1",
+            yaa_msg::ApprovalDecision::Deny,
+        )];
+        let items = projector.push(&extra);
+        assert_eq!(
+            items,
+            vec![DisplayItem::ApprovalResolved {
+                call_id: "c1".to_string(),
+                command: "echo hi".to_string(),
+                approved: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn final_ai_for_own_returns_first_final_step_after_own() {
+        let own = Record::user("问");
+        let own_id = own.id().to_string();
+        let history = vec![
+            own,
+            Record::ai("m", "h", "中途", None),
+            Record::tool_call(ToolOrigin::Ai, "c1", "ls", None),
+            Record::tool_result("c1", "out", "", 0, false, false, None),
+            Record::ai("m", "h", "答案", None),
+        ];
+        assert_eq!(final_ai_for_own(&history, &own_id), Some("答案"));
+    }
+
+    #[test]
+    fn final_ai_for_own_is_none_when_own_missing_or_no_ai() {
+        let history = vec![Record::user("问"), Record::ai("m", "h", "答", None)];
+        assert_eq!(final_ai_for_own(&history, "不存在"), None);
+        assert_eq!(
+            final_ai_for_own(&[history[0].clone()], history[0].id()),
+            None
+        );
+    }
+
+    #[test]
+    fn is_idle_covers_empty_ai_last_and_system_only() {
+        assert!(is_idle(&[]));
+        assert!(is_idle(&[Record::system("init", "", None, None)]));
+        assert!(is_idle(&[
+            Record::user("问"),
+            Record::ai("m", "h", "答", None),
+        ]));
+        assert!(
+            !is_idle(&[notify("正文", None)]),
+            "含正文的 notify 尚未得到回应，不应判为空闲"
+        );
+        assert!(!is_idle(&[Record::user("问")]));
+        assert!(!is_idle(&[
+            Record::user("问"),
+            Record::ai("m", "h", "", None),
+            Record::tool_call(ToolOrigin::Ai, "c1", "ls", None),
+        ]));
+        assert!(!is_idle(&[Record::approval_pending("c1", "ls", "ls *")]));
     }
 }

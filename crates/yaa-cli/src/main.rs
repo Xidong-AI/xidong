@@ -160,18 +160,23 @@ async fn notify(
     }
     // clear.lock 需要父目录存在；写入本来也会创建会话目录。
     std::fs::create_dir_all(&session.root)?;
+    // 尽力清理崩溃残留的发布临时文件（1 小时阈值，与 run 路径一致）。
+    yaa_store::cleanup_inbox_tmp(&session, std::time::Duration::from_secs(3600));
     // 归档预检：短暂持 clear.lock 共享锁并串行 init，取出即放，绝不覆盖命令执行。
     // 这样 notify 命令内嵌 `yaa --clear` 时不会形成「子等父释放 SH、父等子结束」的死锁。
-    {
+    // 同时捕获发布时用于校验的 generation：命令执行期间若发生真归档，发布会失败。
+    let expected_generation = {
         let _clear_guard = yaa_store::FileLock::shared(&session.clear_lock_path())?;
         let init_guard = yaa_store::FileLock::exclusive(&session.init_lock_path())?;
         let archived = yaa_store::is_archived(&session)?;
+        let generation = yaa_store::generation(&session)?;
         drop(init_guard);
         if archived {
             eprintln!("错误：会话已归档，不可写入：{}", session.db.display());
             return Ok(1);
         }
-    }
+        generation
+    };
     // 缺注释或注释为空串时统一用「由用户执行」。
     let comment = match cli.notify.as_deref() {
         Some(text) if !text.is_empty() => text,
@@ -190,11 +195,8 @@ async fn notify(
             stderr: None,
         });
         let content = envelope(comment, &captured.text);
-        append_with_retry(
-            &session,
-            &[Record::system("notify", content, None, output_files)],
-        )
-        .await?;
+        let record = Record::system("notify", content, None, output_files);
+        publish_notify(&session, env, &record, expected_generation)?;
         return Ok(0);
     }
 
@@ -224,39 +226,35 @@ async fn notify(
 
     let output_files = notify_output_files(&output, data_root);
     let content = envelope(comment, &output.stdout);
-    append_with_retry(
-        &session,
-        &[Record::system(
-            "notify",
-            content,
-            Some(command),
-            output_files,
-        )],
-    )
-    .await?;
+    let record = Record::system("notify", content, Some(command), output_files);
+    publish_notify(&session, env, &record, expected_generation)?;
     Ok(exit)
 }
 
-/// 写入通知：对 `Busy` 做外层退避重试，约 30 秒预算；最终失败必须向上报错。
+/// 把通知发布到文件 inbox（阶段 4 刀 2）。不再直接写 events：消息由 runner 在安全点消费落库。
 ///
-/// 只重试写入本身，不重放命令执行，避免副作用重复。clear.lock 共享锁只包住每次
-/// 写入尝试，命令执行阶段不持锁。
-async fn append_with_retry(session: &yaa_store::Session, records: &[Record]) -> anyhow::Result<()> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let mut delay = std::time::Duration::from_millis(100);
-    loop {
-        let result = {
-            let _clear_guard = yaa_store::FileLock::shared(&session.clear_lock_path())?;
-            yaa_store::append(session, records)
-        };
-        match result {
-            Ok(()) => return Ok(()),
-            Err(yaa_store::StoreError::Busy { .. }) if std::time::Instant::now() < deadline => {
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(std::time::Duration::from_secs(2));
-            }
-            Err(err) => return Err(err.into()),
+/// phase 由 `YAA_INBOX_PHASE == "init"` 决定（init 钩子内注入），否则为普通 `Pending`。
+/// 发布走 [`yaa_store::publish_with_generation`]：内部持 `clear.lock` 共享锁并与
+/// `--clear` 的排他锁互斥，原子校验预检时捕获的 `expected` generation。命令执行期间
+/// 发生真归档（generation 变化且非 0→1 建库）时拒绝发布，避免把通知写进新 generation。
+/// 命令执行阶段不持锁（`notify` 内嵌 `yaa --clear` 不会死锁）。
+fn publish_notify(
+    session: &yaa_store::Session,
+    env: &impl Fn(&str) -> Option<String>,
+    record: &Record,
+    expected_generation: i64,
+) -> anyhow::Result<()> {
+    let phase = if env("YAA_INBOX_PHASE").as_deref() == Some("init") {
+        yaa_store::InboxPhase::Init
+    } else {
+        yaa_store::InboxPhase::Pending
+    };
+    match yaa_store::publish_with_generation(session, phase, record, Some(expected_generation)) {
+        Ok(()) => Ok(()),
+        Err(yaa_store::StoreError::GenerationChanged { .. }) => {
+            anyhow::bail!("会话已归档，通知未写入。")
         }
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -423,6 +421,12 @@ fn clear(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
     if !resolved.session.db.exists() {
+        // 库不存在也要检查 inbox：仅剩待处理消息时归档会静默丢消息，必须拒绝。
+        let (pending, init) = inbox_counts(&resolved.session)?;
+        if pending + init > 0 {
+            report_pending_inbox(pending, init);
+            return Ok(1);
+        }
         eprintln!(
             "提示：会话文件不存在，无需归档：{}",
             resolved.session.db.display()
@@ -447,9 +451,41 @@ fn clear(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
             yaa_store::FileLock::exclusive(&clear_path)?
         }
     };
+    // 持两把锁后检查待处理消息：notify 发布持 clear.lock SH，clear 取 EX，
+    // 因此检查期间不会有新发布插入；有消息则拒绝归档并保留 inbox。
+    let (pending, init) = inbox_counts(&resolved.session)?;
+    if pending + init > 0 {
+        report_pending_inbox(pending, init);
+        return Ok(1);
+    }
     let target = yaa_store::archive(&resolved.session, &history_root, now_ms())?;
     println!("{}", target.display());
     Ok(0)
+}
+
+/// 统计 `pending/` 与 `init/` 中的待处理消息数（只读：目录不存在视为 0）。
+fn inbox_counts(session: &yaa_store::Session) -> anyhow::Result<(usize, usize)> {
+    // 只读计数：不解析、不移动文件。malformed/超限文件同样阻止归档（与 --status 一致），
+    // 且 clear 在拒绝路径上不得产生 rejected/ 等副作用。
+    let pending = yaa_store::count_inbox(session, yaa_store::InboxPhase::Pending)?;
+    let init = yaa_store::count_inbox(session, yaa_store::InboxPhase::Init)?;
+    Ok((pending, init))
+}
+
+/// 报告待处理消息并提示处理方式（调用方负责返回退出码 1）。
+fn report_pending_inbox(pending: usize, init: usize) {
+    eprintln!(
+        "错误：会话有待处理消息（{} 条），请先运行 yaa 处理或手动移除 inbox。",
+        pending + init
+    );
+}
+
+/// 打印待处理消息计数（`--status` 摘要的一行）。
+fn print_pending_inbox(pending: usize, init: usize) {
+    println!(
+        "待处理消息：{} 条（pending {pending} / init {init}）",
+        pending + init
+    );
 }
 
 /// 路径是否以 `.jsonl` 结尾（旧版会话格式）。
@@ -465,7 +501,14 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
     if !resolved.session.db.exists() {
+        // 只读计数：不解析、不 reject、不创建目录（B8）。
+        let pending = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Pending)?;
+        let init = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Init)?;
         eprintln!("提示：会话文件不存在：{}", resolved.session.db.display());
+        // 库缺失但 inbox 有消息时仍显示计数，避免待处理消息完全不可见。
+        if pending + init > 0 {
+            print_pending_inbox(pending, init);
+        }
         return Ok(0);
     }
 
@@ -497,6 +540,9 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
         println!("最近 ai：{}", snippet(text, 80));
     }
     println!("最近时间戳：{last_ts}");
+    let pending = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Pending)?;
+    let init = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Init)?;
+    print_pending_inbox(pending, init);
     Ok(0)
 }
 
@@ -528,22 +574,11 @@ async fn run_agent(
 
     let resolved = resolve_run_session(&cli, env, data_root)?;
 
-    // 逻辑单 runner：`run`/`--approve` 持 runner.lock 直到进程结束。锁文件需要会话
-    // 目录存在；首次运行时创建目录无副作用（写入本来也会创建）。
+    // 会话目录必须先存在：发布 inbox、取锁都需要它。
     std::fs::create_dir_all(&resolved.session.root)?;
-    let Some(_runner_lock) =
-        yaa_store::FileLock::try_exclusive(&resolved.session.runner_lock_path())
-            .map_err(anyhow::Error::from)?
-    else {
-        eprintln!(
-            "错误：会话正在运行，另一次 yaa 已持有该会话：{}",
-            resolved.session.db.display()
-        );
-        return Ok(ExitCode::Error.code());
-    };
 
+    // 提示词需在发布 own 之前读定（发布即写入消息内容）；`--approve` 不读提示词。
     let prompt = if cli.approve {
-        // `--approve` 不读提示词、不写 stdin 提示。
         String::new()
     } else if cli.prompt.is_empty() {
         read_stdin().await?
@@ -561,45 +596,126 @@ async fn run_agent(
         auto: cli.auto,
         sink,
     };
-    // Ctrl-C：向当前工具进程组转发 SIGINT，宽限内仍存活则 SIGKILL 兜底，再以 130 退出。
-    // 无工具在运行时（模型请求中）直接退出；`--notify` 短路路径不启动该任务。
+
+    let request_timeout = std::time::Duration::from_secs(config.agent.request_timeout_secs);
+    // 客户端构造一次、经 clone 共享连接池（`Client` 内部为 Arc，克隆廉价）。
+    let client = yaa_core::llm::build_client(request_timeout)?;
+
+    // `--approve`：不发布 user、不跟随；抢锁失败仍报错退出 1（保持阶段 2 语义）。
+    if cli.approve {
+        let Some(_runner_lock) =
+            yaa_store::FileLock::try_exclusive(&resolved.session.runner_lock_path())
+                .map_err(anyhow::Error::from)?
+        else {
+            eprintln!(
+                "错误：会话正在运行，另一次 yaa 已持有该会话：{}",
+                resolved.session.db.display()
+            );
+            return Ok(ExitCode::Error.code());
+        };
+        spawn_interrupt_handler();
+        // 运行前的水位：`--approve` 无 own，保持水位语义，只打印本次新产生的最末 `ai`。
+        let watermark = yaa_store::load(&resolved.session)
+            .map_err(anyhow::Error::from)?
+            .len();
+        let client = client.clone();
+        let exit = runner
+            .approve_pending(move |cfg| yaa_core::agent::OpenAiModel { cfg, client })
+            .await?;
+        print_outcome(exit, &cli, &stderr_sink, sink, &config, || {
+            print_final_ai(&resolved.session, watermark)
+        })?;
+        return Ok(exit.code());
+    }
+
+    // 普通 run：在 clear.lock SH 临界区内做归档预检并捕获 `(generation, last_seq)` 原子
+    // 水位，再发布 own；随后**释放 SH** 才抢 runner.lock（避免与 `--clear` 的 EX 死锁）。
+    // 这样 follower 的基线不会与 clear 的归档交错，也不会把首次建库误判为归档（B1/B2）。
+    yaa_store::cleanup_inbox_tmp(&resolved.session, std::time::Duration::from_secs(3600));
+    let own = Record::user(prompt);
+    let own_id = own.id().to_owned();
+    let watermark = {
+        let _clear_guard = yaa_store::FileLock::shared(&resolved.session.clear_lock_path())
+            .map_err(anyhow::Error::from)?;
+        if yaa_store::is_archived(&resolved.session).map_err(anyhow::Error::from)? {
+            eprintln!(
+                "错误：会话已归档，不可写入：{}",
+                resolved.session.db.display()
+            );
+            return Ok(ExitCode::Error.code());
+        }
+        let watermark = yaa_store::watermark(&resolved.session).map_err(anyhow::Error::from)?;
+        // 同一 SH 临界区内的发布再带一次 generation 守卫：即使将来有代码把发布挪出
+        // 临界区，也不会把 own 写进已归档的新 generation（与 notify 共用同一语义）。
+        yaa_store::publish_with_generation(
+            &resolved.session,
+            yaa_store::InboxPhase::Pending,
+            &own,
+            Some(watermark.generation),
+        )
+        .map_err(anyhow::Error::from)?;
+        watermark
+    };
+
+    spawn_interrupt_handler();
+    let exit = match yaa_store::FileLock::try_exclusive(&resolved.session.runner_lock_path())
+        .map_err(anyhow::Error::from)?
+    {
+        Some(_runner_lock) => {
+            let client = client.clone();
+            runner
+                .run_queued(own, yaa_core::agent::PendingPolicy::Abandon, move |cfg| {
+                    yaa_core::agent::OpenAiModel { cfg, client }
+                })
+                .await?
+        }
+        None => {
+            let client = client.clone();
+            runner
+                .follow(own, watermark.last_seq, watermark.generation, move |cfg| {
+                    yaa_core::agent::OpenAiModel { cfg, client }
+                })
+                .await?
+        }
+    };
+
+    // stdout 只承载「成功的最终助手文本」：失败回合（模型/配置/用法错误）的原因已由
+    // stderr 报告，若再打印上一条历史回复会把过期答案伪装成本次结果。
+    // `--json` 下最终回复已作为 `text` 事件进入 JSONL，不再单独打印。
+    print_outcome(exit, &cli, &stderr_sink, sink, &config, || {
+        print_final_ai_for_own(&resolved.session, &own_id)
+    })?;
+
+    Ok(exit.code())
+}
+
+/// 启动 Ctrl-C 处理任务：向当前工具进程组转发 SIGINT，宽限内仍存活则 SIGKILL 兜底，
+/// 再以 130 退出。无工具在运行时（模型请求中）直接退出。
+fn spawn_interrupt_handler() {
     tokio::spawn(async {
         if tokio::signal::ctrl_c().await.is_ok() {
             yaa_exec::interrupt_current_group(std::time::Duration::from_secs(2)).await;
             std::process::exit(130);
         }
     });
-    // 运行前的水位：只允许打印本次运行新产生、且非空的最末 `ai` 正文，避免在空回复
-    // 或不完整回合里把上一条历史回复误当成本次结果。
-    let watermark = yaa_store::load(&resolved.session)
-        .map_err(anyhow::Error::from)?
-        .len();
-    let request_timeout = std::time::Duration::from_secs(config.agent.request_timeout_secs);
-    // 客户端构造一次、经 clone 共享连接池（`Client` 内部为 Arc，克隆廉价）。
-    let client = yaa_core::llm::build_client(request_timeout)?;
-    let exit = if cli.approve {
-        let client = client.clone();
-        runner
-            .approve_pending(move |cfg| yaa_core::agent::OpenAiModel { cfg, client })
-            .await?
-    } else {
-        let client = client.clone();
-        runner
-            .run(&prompt, move |cfg| yaa_core::agent::OpenAiModel {
-                cfg,
-                client,
-            })
-            .await?
-    };
+}
 
-    // stdout 只承载「成功的最终助手文本」：失败回合（模型/配置/用法错误）的原因已由
-    // stderr 报告，若再打印上一条历史回复会把过期答案伪装成本次结果。
-    // `--json` 下最终回复已作为 `text` 事件进入 JSONL，不再单独打印。
+/// 按退出码决定是否打印最终回复（`Success`/`MaxSteps` 且非 `--json`）。
+///
+/// `print_final` 在需要打印时被调用一次；失败回合不打印，避免用历史回复冒充本次结果。
+fn print_outcome(
+    exit: ExitCode,
+    cli: &Cli,
+    stderr_sink: &StderrSink,
+    sink: &dyn Sink,
+    config: &yaa_core::config::Config,
+    print_final: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     match exit {
         ExitCode::Success => {
             if !cli.json {
                 stderr_sink.finish_transcript();
-                print_final_ai(&resolved.session, watermark)?;
+                print_final()?;
             }
         }
         ExitCode::MaxSteps => {
@@ -609,14 +725,13 @@ async fn run_agent(
             )));
             if !cli.json {
                 stderr_sink.finish_transcript();
-                print_final_ai(&resolved.session, watermark)?;
+                print_final()?;
             }
         }
         // 其他退出码：stdout 保持干净。
         _ => {}
     }
-
-    Ok(exit.code())
+    Ok(())
 }
 
 /// 打印 `records[watermark..]` 中**最后一条** `ai` 记录的内容；为空则不打印。
@@ -633,6 +748,20 @@ fn print_final_ai(session: &yaa_store::Session, watermark: usize) -> anyhow::Res
         && !ai.content.is_empty()
     {
         println!("{}", ai.content);
+    }
+    Ok(())
+}
+
+/// 打印 `own_id` 之后**第一条轮末 `ai`** 的内容；为空或未落库则不打印。
+///
+/// 最终回复归属：多客户端合并一轮时，按自己的 user record id 定位答案，避免打印他人
+/// 或历史答案（A5）。leader 与 follower 共用。
+fn print_final_ai_for_own(session: &yaa_store::Session, own_id: &str) -> anyhow::Result<()> {
+    let records = yaa_store::load(session)?;
+    if let Some(content) = yaa_core::display::final_ai_for_own(&records, own_id)
+        && !content.is_empty()
+    {
+        println!("{content}");
     }
     Ok(())
 }

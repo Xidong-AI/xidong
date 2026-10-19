@@ -11,11 +11,18 @@ use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use yaa_msg::Record;
+
+mod inbox;
+
+pub use inbox::{
+    InboxMessage, InboxPhase, cleanup_inbox_tmp, count_inbox, publish_inbox, remove_inbox,
+    scan_inbox,
+};
 
 /// `application_id` 取 `"YAA1"` 的 ASCII 字节。
 const APPLICATION_ID: i32 = 0x5941_4131;
@@ -29,6 +36,12 @@ const DEFAULT_BUSY_TIMEOUT_MS: u64 = 5_000;
 const APPEND_BUSY_TIMEOUT_MS: u64 = 5_000;
 /// BUSY 重试的退避序列：最多 3 次额外尝试。
 const RETRY_DELAYS_MS: [u64; 3] = [50, 100, 200];
+/// 读路径撞见「文件非空但 schema 尚未提交」时的重试次数。
+const INIT_WINDOW_READ_ATTEMPTS: usize = 8;
+/// 每次读重试的等待时间。
+const INIT_WINDOW_READ_DELAY: Duration = Duration::from_millis(15);
+/// 最后在 `init.lock` 下复查的最长等待时间。
+const INIT_WINDOW_LOCK_WAIT: Duration = Duration::from_millis(500);
 
 /// 归档快照临时文件的“陈旧”阈值：超过此时长的 `.tmp.*` 视为崩溃残留并清理。
 const STALE_ARCHIVE_TEMP_AGE: Duration = Duration::from_secs(3600);
@@ -79,19 +92,43 @@ impl Session {
         Self { db, root, sid }
     }
 
+    /// 会话 artifact 文件名前缀：默认会话 `session.db` 为空，其余为 `<安全文件名>.`。
+    ///
+    /// 把显式 `--session` 的锁与文件 inbox 唯一化到各自会话，避免同一目录下的多个
+    /// 显式会话共享 `runner.lock` / `inbox/`。前缀由**完整数据库文件名**派生（而非
+    /// `file_stem`），因此 `a.db` 与 `a.sqlite` 不会碰撞；非 [`A-Za-z0-9._-`] 字符
+    /// 替换为 `_`，超长名追加短 hash。前缀不额外存字段，因此 [`Session`] 的公开结构
+    /// 与相等性保持不变。
+    fn artifact_prefix(&self) -> String {
+        match self.db.file_name() {
+            Some(name) if name != std::ffi::OsStr::new("session.db") => {
+                format!("{}.", sanitize_artifact_name(name))
+            }
+            _ => String::new(),
+        }
+    }
+
     /// 逻辑 runner 选举锁。
     pub fn runner_lock_path(&self) -> PathBuf {
-        self.root.join("runner.lock")
+        self.root
+            .join(format!("{}runner.lock", self.artifact_prefix()))
     }
 
     /// clear EX / append SH 锁。
     pub fn clear_lock_path(&self) -> PathBuf {
-        self.root.join("clear.lock")
+        self.root
+            .join(format!("{}clear.lock", self.artifact_prefix()))
     }
 
     /// 首次建库串行化锁。
     pub fn init_lock_path(&self) -> PathBuf {
-        self.root.join("init.lock")
+        self.root
+            .join(format!("{}init.lock", self.artifact_prefix()))
+    }
+
+    /// 文件 inbox 根目录（详见 [`crate::inbox`]）。
+    pub fn inbox_dir(&self) -> PathBuf {
+        self.root.join(format!("{}inbox", self.artifact_prefix()))
     }
 }
 
@@ -121,81 +158,155 @@ pub enum StoreError {
     Busy { operation: &'static str },
     #[error("会话布局非法：{0}")]
     Layout(String),
+    #[error("inbox 错误：{0}")]
+    Inbox(String),
+    #[error("会话已归档：发布世代已变化（期望 {expected}，当前 {current}）")]
+    GenerationChanged { expected: i64, current: i64 },
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
 
 /// 加载整个会话。文件不存在或为 0 字节时视为空且不创建任何文件。
 pub fn load(session: &Session) -> Result<Vec<Record>> {
-    let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
-        return Ok(Vec::new());
-    };
-    validate_yaa(&conn, &session.db)?;
+    retry_init_window(session, || {
+        let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
+            return Ok(Vec::new());
+        };
+        validate_yaa(&conn, &session.db)?;
 
-    let mut stmt = conn.prepare("SELECT seq, id, payload FROM events ORDER BY seq")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    let mut records = Vec::new();
-    for row in rows {
-        let (seq, id, payload) = row?;
-        records.push(parse_payload(seq, id, &payload)?);
-    }
-    Ok(records)
+        let mut stmt = conn.prepare("SELECT seq, id, payload FROM events ORDER BY seq")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (seq, id, payload) = row?;
+            records.push(parse_payload(seq, id, &payload)?);
+        }
+        Ok(records)
+    })
 }
 
 /// 读取 `seq > after_seq` 的记录，返回记录及其 `seq` 与新的水位。
 ///
 /// 不存在时返回 `(vec![], 0)`；没有新记录时水位保持 `after_seq`。
 pub fn read_after(session: &Session, after_seq: i64) -> Result<(Vec<(i64, Record)>, i64)> {
-    let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
-        return Ok((Vec::new(), 0));
-    };
-    validate_yaa(&conn, &session.db)?;
+    let (rows, new_seq, _generation) = read_after_with_generation(session, after_seq)?;
+    Ok((rows, new_seq))
+}
 
-    let mut stmt =
-        conn.prepare("SELECT seq, id, payload FROM events WHERE seq > ?1 ORDER BY seq")?;
-    let rows = stmt.query_map([after_seq], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    let mut records = Vec::new();
-    let mut watermark = after_seq;
-    for row in rows {
-        let (seq, id, payload) = row?;
-        let record = parse_payload(seq, id, &payload)?;
-        watermark = seq;
-        records.push((seq, record));
-    }
-    Ok((records, watermark))
+/// 同一读快照内的会话水位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionWatermark {
+    /// 归档代数；会话不存在时为 0。
+    pub generation: i64,
+    /// 当前最大 `seq`；空会话为 0。
+    pub last_seq: i64,
+}
+
+/// [`read_after_with_generation`] 的返回值：`(rows, new_seq, generation)`。
+pub type ReadAfterWithGeneration = (Vec<(i64, Record)>, i64, i64);
+
+/// 原子读取会话水位（同一读快照）。
+///
+/// 会话不存在（或文件为 0 字节）时返回 `generation = 0, last_seq = 0`，不创建文件。
+/// `generation` 与 `MAX(seq)` 在同一 `BEGIN` 读事务内读取，故不会与并发 clear 拼接出
+/// 「跨 generation」的值。
+pub fn watermark(session: &Session) -> Result<SessionWatermark> {
+    retry_init_window(session, || {
+        let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
+            return Ok(SessionWatermark {
+                generation: 0,
+                last_seq: 0,
+            });
+        };
+        validate_yaa(&conn, &session.db)?;
+        read_watermark(&conn)
+    })
+}
+
+/// 读取 `seq > after_seq` 的记录，并返回读取时的 generation。
+///
+/// 返回 `(rows, new_seq, generation)`：`rows` 与 `generation` 来自同一个读快照，
+/// 并发 `clear` 不会产生「旧 generation 的行 + 新 generation 值」的拼接结果。
+/// 会话不存在时返回 `(vec![], 0, 0)`；没有新记录时 `new_seq` 保持 `after_seq`。
+pub fn read_after_with_generation(
+    session: &Session,
+    after_seq: i64,
+) -> Result<ReadAfterWithGeneration> {
+    retry_init_window(session, || {
+        let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
+            return Ok((Vec::new(), 0, 0));
+        };
+        validate_yaa(&conn, &session.db)?;
+
+        let tx = conn.unchecked_transaction()?;
+        let result = (|| {
+            let generation = read_generation(&tx)?;
+            let mut stmt =
+                tx.prepare("SELECT seq, id, payload FROM events WHERE seq > ?1 ORDER BY seq")?;
+            let rows = stmt.query_map([after_seq], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut records = Vec::new();
+            let mut new_seq = after_seq;
+            for row in rows {
+                let (seq, id, payload) = row?;
+                records.push((seq, parse_payload(seq, id, &payload)?));
+                new_seq = seq;
+            }
+            Ok((records, new_seq, generation))
+        })();
+        tx.commit()?;
+        result
+    })
 }
 
 /// 当前最大 `seq`；空会话为 0。
 pub fn last_seq(session: &Session) -> Result<i64> {
-    let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
-        return Ok(0);
-    };
-    validate_yaa(&conn, &session.db)?;
-    let seq = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| {
-        row.get(0)
-    })?;
-    Ok(seq)
+    Ok(watermark(session)?.last_seq)
 }
 
 /// 当前 generation；会话不存在为 0。
 pub fn generation(session: &Session) -> Result<i64> {
-    let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
-        return Ok(0);
-    };
-    validate_yaa(&conn, &session.db)?;
-    read_generation(&conn)
+    retry_init_window(session, || {
+        let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
+            return Ok(0);
+        };
+        validate_yaa(&conn, &session.db)?;
+        read_generation(&conn)
+    })
+}
+
+/// 带 generation 守卫地发布一条 inbox 记录。
+///
+/// 内部持 `clear.lock` SH（与 `--clear` 的 EX 互斥），在临界区内读取当前 generation
+/// 并校验，然后发布。`expected = None` 不校验；否则要求当前 generation 等于
+/// `expected`，或 `expected == 0 && 当前 == 1`（允许首次建库）。校验失败时不发布。
+pub fn publish_with_generation(
+    session: &Session,
+    phase: inbox::InboxPhase,
+    record: &Record,
+    expected: Option<i64>,
+) -> Result<()> {
+    ensure_root(session)?;
+    let _clear = FileLock::shared(&session.clear_lock_path())?;
+    let current = generation(session)?;
+    if let Some(expected) = expected {
+        let first_init = expected == 0 && current == 1;
+        if current != expected && !first_init {
+            return Err(StoreError::GenerationChanged { expected, current });
+        }
+    }
+    inbox::publish_inbox(session, phase, record)
 }
 
 /// 严格追加一批记录。
@@ -388,11 +499,13 @@ pub fn set_archived(session: &Session) -> Result<()> {
 
 /// 会话是否已归档。会话不存在时返回 `false`。
 pub fn is_archived(session: &Session) -> Result<bool> {
-    let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
-        return Ok(false);
-    };
-    validate_yaa(&conn, &session.db)?;
-    read_archived(&conn)
+    retry_init_window(session, || {
+        let Some(conn) = open_existing(session, DEFAULT_BUSY_TIMEOUT_MS)? else {
+            return Ok(false);
+        };
+        validate_yaa(&conn, &session.db)?;
+        read_archived(&conn)
+    })
 }
 
 /// 基于 `flock` 的文件锁。锁随 [`FileLock`] 的 `File` 关闭而释放。
@@ -505,6 +618,34 @@ fn open_existing_required(session: &Session, busy_timeout_ms: u64) -> Result<Con
             format!("会话数据库不存在：{}", session.db.display()),
         ))
     })
+}
+
+/// 在读路径上容忍「数据库文件已非空、schema 尚未提交」的初始化窗口。
+///
+/// 数据库初始化先在 0 字节文件上写 SQLite 头，再在事务中提交 schema；两者之间打开
+/// 并校验会得到 [`StoreError::NotYaaSession`]。此时绝不能把它当成普通非 yaa 库：
+/// 先短暂重试，仍失败则尝试在 `init.lock` 下复查一次（初始化者持排他锁，等它完成）。
+/// 使用 `try_exclusive` 而非阻塞 `exclusive`，避免调用方已持有该锁时自死锁。
+fn retry_init_window<T>(session: &Session, mut read: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..INIT_WINDOW_READ_ATTEMPTS {
+        match read() {
+            Err(StoreError::NotYaaSession { .. }) if !is_missing_or_empty(&session.db)? => {
+                thread::sleep(INIT_WINDOW_READ_DELAY);
+            }
+            other => return other,
+        }
+    }
+
+    let deadline = Instant::now() + INIT_WINDOW_LOCK_WAIT;
+    loop {
+        if let Some(_init) = FileLock::try_exclusive(&session.init_lock_path())? {
+            return read();
+        }
+        if Instant::now() >= deadline {
+            return read();
+        }
+        thread::sleep(INIT_WINDOW_READ_DELAY);
+    }
 }
 
 /// 打开（必要时初始化）用于追加的数据库。
@@ -658,6 +799,20 @@ fn read_generation(conn: &Connection) -> Result<i64> {
     Ok(generation)
 }
 
+/// 在同一读事务内读取 generation 与 `MAX(seq)`。
+fn read_watermark(conn: &Connection) -> Result<SessionWatermark> {
+    let tx = conn.unchecked_transaction()?;
+    let generation = read_generation(&tx)?;
+    let last_seq = tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |row| {
+        row.get(0)
+    })?;
+    tx.commit()?;
+    Ok(SessionWatermark {
+        generation,
+        last_seq,
+    })
+}
+
 fn count_events(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
 }
@@ -804,6 +959,44 @@ fn path_sid(db: &Path) -> String {
     hasher.update(absolute.as_os_str().as_encoded_bytes());
     let digest = format!("{:x}", hasher.finalize());
     digest[..32].to_string()
+}
+
+/// 把数据库文件名安全化为 artifact 前缀。
+///
+/// 只保留 `[A-Za-z0-9._-]`，其余字符替换为 `_`。非 UTF-8 文件名（lossy 转换会丢信息）
+/// 或安全化后超过 64 字符时，截断到 64 字符并追加原始文件名字节 sha256 的前 8 位，
+/// 避免不同文件名映射到同一前缀。
+fn sanitize_artifact_name(name: &std::ffi::OsStr) -> String {
+    let lossy = name.to_string_lossy();
+    let mut replaced = false;
+    let mut sanitized: String = lossy
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                replaced = true;
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        sanitized.push('_');
+    }
+
+    let truncated = sanitized.chars().count() > 64;
+    if truncated {
+        sanitized = sanitized.chars().take(64).collect();
+    }
+    // 只要发生过字符替换（如 `a b` → `a_b`），就必须追加原文件名的短 hash：
+    // 否则 `a b.db` 与真正的 `a_b.db` 会共享锁与 inbox。超长与非 UTF-8 同理。
+    if replaced || truncated || name.to_str().is_none() {
+        let mut hasher = Sha256::new();
+        hasher.update(name.as_encoded_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        sanitized.push_str(&digest[..8]);
+    }
+    sanitized
 }
 
 #[cfg(test)]
@@ -967,6 +1160,274 @@ mod tests {
     }
 
     #[test]
+    fn watermark_is_atomic_and_tracks_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+
+        assert_eq!(
+            watermark(&session).unwrap(),
+            SessionWatermark {
+                generation: 0,
+                last_seq: 0
+            }
+        );
+
+        let records = vec![user("一"), user("二"), user("三")];
+        append(&session, &records).unwrap();
+        assert_eq!(
+            watermark(&session).unwrap(),
+            SessionWatermark {
+                generation: 1,
+                last_seq: 3
+            }
+        );
+
+        let history = dir.path().join("history");
+        archive(&session, &history, 1).unwrap();
+        assert_eq!(
+            watermark(&session).unwrap(),
+            SessionWatermark {
+                generation: 2,
+                last_seq: 0
+            }
+        );
+    }
+
+    #[test]
+    fn read_after_with_generation_pairs_rows_with_snapshot_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        let pre = vec![user("前"), user("前二")];
+        append(&session, &pre).unwrap();
+
+        let (rows, new_seq, generation) = read_after_with_generation(&session, 0).unwrap();
+        assert_eq!(
+            rows.iter().map(|(_, record)| record).collect::<Vec<_>>(),
+            pre.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(new_seq, 2);
+        assert_eq!(generation, 1);
+
+        let history = dir.path().join("history");
+        archive(&session, &history, 1).unwrap();
+        let (rows, new_seq, generation) = read_after_with_generation(&session, 0).unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(new_seq, 0);
+        assert_eq!(generation, 2);
+
+        let post = vec![user("后")];
+        append(&session, &post).unwrap();
+        let (rows, new_seq, generation) = read_after_with_generation(&session, 0).unwrap();
+        assert_eq!(
+            rows.iter().map(|(_, record)| record).collect::<Vec<_>>(),
+            post.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(new_seq, 1);
+        assert_eq!(generation, 2);
+    }
+
+    #[test]
+    fn read_after_with_generation_never_mixes_generations() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        let pre: Vec<_> = (0..4).map(|index| user(&format!("pre-{index}"))).collect();
+        append(&session, &pre).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(Barrier::new(2));
+        let writer_session = session.clone();
+        let writer_stop = Arc::clone(&stop);
+        let writer_start = Arc::clone(&start);
+        let writer = std::thread::spawn(move || {
+            let conn = Connection::open(&writer_session.db).unwrap();
+            conn.busy_timeout(Duration::from_secs(5)).unwrap();
+            writer_start.wait();
+            for index in 0..30 {
+                conn.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     DELETE FROM events;
+                     UPDATE session SET generation = generation + 1 WHERE id = 1;
+                     COMMIT;",
+                )
+                .unwrap();
+                if index + 1 < 30 {
+                    append(&writer_session, &[user(&format!("post-{index}"))]).unwrap();
+                }
+                // 给读线程留出观察新 generation 的窗口，避免它完全被写线程饿死。
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            writer_stop.store(true, Ordering::SeqCst);
+        });
+
+        start.wait();
+        let mut saw_new_generation_rows = false;
+        while !stop.load(Ordering::SeqCst) {
+            let (rows, _new_seq, generation) = read_after_with_generation(&session, 0).unwrap();
+            for (_, record) in rows {
+                let Record::User(user) = &record else {
+                    panic!("测试只写入 user 记录");
+                };
+                let id = record.id();
+                let consistent = if generation == 1 {
+                    user.content.starts_with("pre-")
+                } else {
+                    user.content.starts_with("post-")
+                };
+                assert!(
+                    consistent,
+                    "跨 generation 拼接：generation={generation} id={id} content={}",
+                    user.content
+                );
+                if generation > 1 {
+                    saw_new_generation_rows = true;
+                }
+            }
+        }
+        writer.join().unwrap();
+        assert!(
+            saw_new_generation_rows,
+            "应至少观察到一次新 generation 的行"
+        );
+    }
+
+    #[test]
+    fn publish_with_generation_checks_expected_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        append(&session, &[user("一")]).unwrap();
+
+        publish_with_generation(&session, InboxPhase::Pending, &user("不校验"), None).unwrap();
+        publish_with_generation(&session, InboxPhase::Pending, &user("匹配"), Some(1)).unwrap();
+        let before = count_inbox(&session, InboxPhase::Pending).unwrap();
+
+        let err = publish_with_generation(&session, InboxPhase::Pending, &user("过期"), Some(2))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::GenerationChanged {
+                    expected: 2,
+                    current: 1
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            count_inbox(&session, InboxPhase::Pending).unwrap(),
+            before,
+            "校验失败不得发布"
+        );
+
+        let history = dir.path().join("history");
+        archive(&session, &history, 1).unwrap();
+        let err =
+            publish_with_generation(&session, InboxPhase::Pending, &user("归档后过期"), Some(1))
+                .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::GenerationChanged {
+                    expected: 1,
+                    current: 2
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            count_inbox(&session, InboxPhase::Pending).unwrap(),
+            before,
+            "归档后旧 generation 不得发布"
+        );
+
+        publish_with_generation(&session, InboxPhase::Pending, &user("新代"), Some(2)).unwrap();
+        assert_eq!(
+            count_inbox(&session, InboxPhase::Pending).unwrap(),
+            before + 1
+        );
+    }
+
+    #[test]
+    fn captured_generation_archived_before_publish_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        append(&session, &[user("既有")]).unwrap();
+        let captured = watermark(&session).unwrap();
+        assert_eq!(captured.generation, 1);
+
+        // 模拟 `--clear`：在调用方捕获 generation 之后持 EX 归档。
+        let clear = FileLock::exclusive(&session.clear_lock_path()).unwrap();
+        let history = dir.path().join("history");
+        archive(&session, &history, 1).unwrap();
+        drop(clear);
+        assert_eq!(generation(&session).unwrap(), 2);
+
+        let err = publish_with_generation(
+            &session,
+            InboxPhase::Pending,
+            &user("迟到"),
+            Some(captured.generation),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                StoreError::GenerationChanged {
+                    expected: 1,
+                    current: 2
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            count_inbox(&session, InboxPhase::Pending).unwrap(),
+            0,
+            "归档后不得发布过期通知"
+        );
+    }
+
+    #[test]
+    fn publish_with_generation_allows_first_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+
+        // 会话尚不存在（generation 0）。
+        publish_with_generation(&session, InboxPhase::Pending, &user("建库前"), Some(0)).unwrap();
+
+        append(&session, &[user("建库")]).unwrap();
+        assert_eq!(generation(&session).unwrap(), 1);
+        publish_with_generation(&session, InboxPhase::Pending, &user("建库中"), Some(0)).unwrap();
+
+        assert_eq!(count_inbox(&session, InboxPhase::Pending).unwrap(), 2);
+    }
+
+    #[test]
+    fn publish_with_generation_waits_for_clear_exclusive_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        let held = FileLock::exclusive(&session.clear_lock_path()).unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let publisher = session.clone();
+        let handle = std::thread::spawn(move || {
+            publish_with_generation(&publisher, InboxPhase::Pending, &user("等待"), Some(0))
+                .unwrap();
+            done_tx.send(()).unwrap();
+        });
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "clear EX 持有时发布应阻塞在 SH"
+        );
+        drop(held);
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("clear EX 释放后发布应完成");
+        handle.join().unwrap();
+    }
+
+    #[test]
     fn duplicate_id_strict_append_rolls_back_whole_batch() {
         let dir = tempfile::tempdir().unwrap();
         let session = session_in(dir.path());
@@ -999,6 +1460,38 @@ mod tests {
 
         assert_eq!(load(&session).unwrap(), vec![first, second, third]);
         assert_eq!(last_seq(&session).unwrap(), 3);
+    }
+
+    #[test]
+    fn read_paths_tolerate_concurrent_initialization() {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..50 {
+            let root = dir.path().join(format!("round-{round}"));
+            fs::create_dir_all(&root).unwrap();
+            let session = session_in(&root);
+            let start = Arc::new(Barrier::new(2));
+
+            let writer_session = session.clone();
+            let writer_start = Arc::clone(&start);
+            let writer = thread::spawn(move || {
+                writer_start.wait();
+                append(&writer_session, &[user("并发")]).unwrap();
+            });
+
+            start.wait();
+            // 读可能发生在建库前、建库中（schema 尚未提交）或建库后。
+            // 前两者都必须被当作空/构建中，而不是「非 yaa 会话」。
+            let loaded = load(&session).unwrap();
+            assert!(loaded.len() <= 1, "第 {round} 轮读到了未来记录");
+            let watermark = watermark(&session).unwrap();
+            assert!(watermark.last_seq <= 1, "第 {round} 轮水位越界");
+            let (_, _, generation) = read_after_with_generation(&session, 0).unwrap();
+            assert!(generation <= 1, "第 {round} 轮 generation 越界");
+            assert!(!is_archived(&session).unwrap());
+
+            writer.join().unwrap();
+            assert_eq!(load(&session).unwrap().len(), 1);
+        }
     }
 
     #[test]
@@ -1288,6 +1781,128 @@ mod tests {
         assert_eq!(session.runner_lock_path(), root.join("runner.lock"));
         assert_eq!(session.clear_lock_path(), root.join("clear.lock"));
         assert_eq!(session.init_lock_path(), root.join("init.lock"));
+    }
+
+    #[test]
+    fn default_session_inbox_dir_has_no_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions").join("sid");
+        let session = Session::new(root.join("session.db"));
+
+        assert_eq!(session.inbox_dir(), root.join("inbox"));
+    }
+
+    #[test]
+    fn explicit_session_artifacts_are_unique_per_full_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Session::new(dir.path().join("a.db"));
+        let second = Session::new(dir.path().join("b.db"));
+
+        assert_eq!(
+            first.runner_lock_path(),
+            dir.path().join("a.db.runner.lock")
+        );
+        assert_eq!(first.clear_lock_path(), dir.path().join("a.db.clear.lock"));
+        assert_eq!(first.init_lock_path(), dir.path().join("a.db.init.lock"));
+        assert_eq!(first.inbox_dir(), dir.path().join("a.db.inbox"));
+
+        assert_eq!(
+            second.runner_lock_path(),
+            dir.path().join("b.db.runner.lock")
+        );
+        assert_eq!(second.clear_lock_path(), dir.path().join("b.db.clear.lock"));
+        assert_eq!(second.init_lock_path(), dir.path().join("b.db.init.lock"));
+        assert_eq!(second.inbox_dir(), dir.path().join("b.db.inbox"));
+
+        assert_ne!(first.runner_lock_path(), second.runner_lock_path());
+        assert_ne!(first.clear_lock_path(), second.clear_lock_path());
+        assert_ne!(first.init_lock_path(), second.init_lock_path());
+        assert_ne!(first.inbox_dir(), second.inbox_dir());
+    }
+
+    #[test]
+    fn explicit_session_names_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let a_db = Session::new(dir.path().join("a.db"));
+        let a_sqlite = Session::new(dir.path().join("a.sqlite"));
+        let upper = Session::new(dir.path().join("A.db"));
+
+        let sessions = [a_db, a_sqlite, upper];
+        let path_sets = vec![
+            sessions
+                .iter()
+                .map(Session::runner_lock_path)
+                .collect::<Vec<_>>(),
+            sessions
+                .iter()
+                .map(Session::clear_lock_path)
+                .collect::<Vec<_>>(),
+            sessions
+                .iter()
+                .map(Session::init_lock_path)
+                .collect::<Vec<_>>(),
+            sessions.iter().map(Session::inbox_dir).collect::<Vec<_>>(),
+        ];
+        for paths in path_sets {
+            let unique: HashSet<_> = paths.iter().collect();
+            assert_eq!(
+                unique.len(),
+                3,
+                "不同会话名不得共享 artifact 路径：{paths:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitized_artifact_names_do_not_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = Session::new(dir.path().join("a b.db"));
+        let underscored = Session::new(dir.path().join("a_b.db"));
+
+        assert_ne!(spaced.runner_lock_path(), underscored.runner_lock_path());
+        assert_ne!(spaced.clear_lock_path(), underscored.clear_lock_path());
+        assert_ne!(spaced.init_lock_path(), underscored.init_lock_path());
+        assert_ne!(spaced.inbox_dir(), underscored.inbox_dir());
+        // 发生替换的名字必须带短 hash，不能与「本来就是下划线」的名字相同。
+        assert!(
+            spaced
+                .runner_lock_path()
+                .file_name()
+                .is_some_and(|name| name.len() > "a_b.db.runner.lock".len()),
+            "替换后的 artifact 名应追加短 hash：{:?}",
+            spaced.runner_lock_path()
+        );
+    }
+
+    #[test]
+    fn non_utf8_session_names_are_distinct() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let first = Session::new(dir.path().join(OsString::from_vec(b"a\xff.db".to_vec())));
+        let second = Session::new(dir.path().join(OsString::from_vec(b"a\xfe.db".to_vec())));
+
+        assert_ne!(first.runner_lock_path(), second.runner_lock_path());
+        assert_ne!(first.inbox_dir(), second.inbox_dir());
+    }
+
+    #[test]
+    fn explicit_sessions_hold_independent_runner_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Session::new(dir.path().join("a.db"));
+        let second = Session::new(dir.path().join("b.db"));
+
+        let held = FileLock::try_exclusive(&first.runner_lock_path())
+            .unwrap()
+            .expect("首个会话应能取得自己的 runner 锁");
+        assert!(
+            FileLock::try_exclusive(&second.runner_lock_path())
+                .unwrap()
+                .is_some(),
+            "不同显式会话的 runner 锁不得互相阻塞"
+        );
+        drop(held);
     }
 
     #[test]

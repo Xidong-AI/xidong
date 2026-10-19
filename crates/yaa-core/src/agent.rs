@@ -17,13 +17,15 @@ use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use yaa_msg::{ApprovalDecision, Record, ToolOrigin};
+use yaa_store::InboxPhase;
 
 use crate::approval::{self, Action};
 use crate::compaction::{self, cache::SummaryCache};
 use crate::config::Config;
-use crate::display::{self, DisplayItem, Sink};
+use crate::display::{self, DisplayItem, DisplayProjector, Sink};
 use crate::llm::{self, ChatResponse, LlmConfig};
 use crate::message::ChatMessage;
 use crate::render;
@@ -62,6 +64,18 @@ impl ExitCode {
             ExitCode::Error => 1,
         }
     }
+}
+
+/// 接管理应对既有未决待批的策略。
+///
+/// 区分「有新提示词」与「只有 notify」：前者按 D45 作废旧待批；后者不替用户作废，
+/// 只提示 `--approve` 并继续跟随（阶段 4 P0-5）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingPolicy {
+    /// 作废既有未决待批（补 `approval_resolved: deny` 与失败结果）。
+    Abandon,
+    /// 保留既有未决待批，等待用户 `--approve`。
+    Keep,
 }
 
 /// 普通 run 作废旧待批时补写的失败 `tool_result` 文案。
@@ -152,7 +166,10 @@ pub struct Runner<'a> {
 }
 
 impl Runner<'_> {
-    /// 运行一个回合。
+    /// 运行一个回合：把新提示词发布到 inbox 后交给 [`Runner::run_queued`] 消费。
+    ///
+    /// CLI 走 [`Runner::run_queued`]（先发布 own 再抢锁）；此包装保留给库调用与测试，
+    /// 语义等价：自己发布再自己消费，最终历史与阶段 1 一致。
     ///
     /// `make_model` 在 `llm` 钩子解析成功后恰好被调用一次，模型由本次循环独占，
     /// 从而保证 `llm` 钩子每次 `run` 只执行一次。
@@ -161,11 +178,66 @@ impl Runner<'_> {
         F: FnOnce(LlmConfig) -> M,
         M: Model,
     {
-        self.warn_cwd();
+        let own = Record::user(prompt_text);
+        // 与 CLI 的 own 发布保持同一语义：捕获当前 generation 后带守卫发布，
+        // 避免并发归档把消息写进新 generation（0→1 建库仍允许）。
+        let generation = yaa_store::generation(&self.session)?;
+        yaa_store::publish_with_generation(
+            &self.session,
+            InboxPhase::Pending,
+            &own,
+            Some(generation),
+        )?;
+        self.run_queued(own, PendingPolicy::Abandon, make_model)
+            .await
+    }
+
+    /// 运行一个已排队的回合：`own` 是调用方**先行发布**到 inbox 的用户记录。
+    ///
+    /// 消费顺序（阶段 4 刀 3）：
+    /// 1. 作废旧待批、崩溃恢复（与阶段 1 的 `run` 一致）；
+    /// 2. 无 `system(source=init)` 簿记则执行 `init` 钩子（钩子内 `--notify` 发到
+    ///    `inbox/init/`），随后消费 `init/`、写簿记；init 失败仍消费 `init/` 并落 `own`；
+    /// 3. 消费文件名（ULID）小于 `own.id()` 的 `pending/` 注入；
+    /// 4. 消费 `own`；
+    /// 5. `llm` 钩子后进入 [`Runner::run_loop`]（每轮开头安全点继续消费 inbox）。
+    ///
+    /// `make_model` 在 `llm` 钩子解析成功后恰好被调用一次。
+    ///
+    /// `policy` 决定是否作废既有未决待批：普通 run / 含新 `User` 的接管传
+    /// [`PendingPolicy::Abandon`]，纯 follower 的 notify 接管传 [`PendingPolicy::Keep`]。
+    pub async fn run_queued<M, F>(
+        &self,
+        own: Record,
+        policy: PendingPolicy,
+        make_model: F,
+    ) -> anyhow::Result<ExitCode>
+    where
+        F: FnOnce(LlmConfig) -> M,
+        M: Model,
+    {
+        self.run_queued_inner(own, policy, true, make_model).await
+    }
+
+    /// [`Runner::run_queued`] 的实现；`warn_cwd` 为假时跳过工作目录回退告警（接管已发过）。
+    async fn run_queued_inner<M, F>(
+        &self,
+        own: Record,
+        policy: PendingPolicy,
+        warn_cwd: bool,
+        make_model: F,
+    ) -> anyhow::Result<ExitCode>
+    where
+        F: FnOnce(LlmConfig) -> M,
+        M: Model,
+    {
+        if warn_cwd {
+            self.warn_cwd();
+        }
 
         // 1. 写入前的水位：之后只展示水位之后的新记录。是否初始化改由「簿记」判定：
-        //    只要历史里没有 `system(source=init)` 记录（含 `--notify` 先行写入的场景），
-        //    就执行一次 `init`；因此上轮 init 失败的会话下次运行会自动重试。
+        //    只要历史里没有 `system(source=init)` 记录（含 `--notify` 先行发布与消费的
+        //    场景），就执行一次 `init`；因此上轮 init 失败的会话下次运行会自动重试。
         let existing = yaa_store::load(&self.session)?;
         // 归档库不可写入：必须在 init/作废/恢复/写 user 及执行任何命令之前拒绝。
         if self.reject_archived()? {
@@ -173,32 +245,40 @@ impl Runner<'_> {
         }
         let mut watermark = existing.len();
 
-        // 2. 新提示词视为放弃旧待批：先把未决 pending 补成 resolved: deny 与失败结果，
-        //    再走正常流程（D45）。必须发生在 user 落盘之前，使作废记录先于新问题。
-        self.abandon_old_pending(&mut watermark).await?;
-        // 2b. 崩溃恢复：补写无结果的 `tool_call`（D-S10）。在作废旧待批之后执行，
-        //     使未决 pending 仍保留「已作废」文案而非被误判为运行中断。
+        // 2. 新提示词视为放弃旧待批（D45），再补崩溃孤儿；顺序同阶段 1，使未决 pending
+        //    保留「已作废」文案而非被误判为运行中断。纯 follower 的 notify 接管（Keep）
+        //    不替用户作废旧待批。
+        if policy == PendingPolicy::Abandon {
+            self.abandon_old_pending(&mut watermark).await?;
+        }
         self.recover_orphan_tool_calls(&mut watermark).await?;
 
         let initialized = existing
             .iter()
             .any(|record| matches!(record, Record::System(system) if system.source == "init"));
 
-        // 3. 无初始化簿记才执行 `init`；成功后写簿记，失败仍写 user 并按配置错误退出。
+        // 3. 无初始化簿记才执行 `init`；成功后消费 init/ 注入并写簿记，失败仍消费 init/、
+        //    落 own 并按配置错误退出（不消费其他 pending）。
         if !initialized {
             match self.run_init_hook().await {
                 Ok(()) => {
+                    self.consume_messages(self.gather_phase(InboxPhase::Init)?, &mut watermark)
+                        .await?;
                     yaa_store::append(&self.session, &[Record::system("init", "", None, None)])?;
                 }
                 Err(exit) => {
-                    yaa_store::append(&self.session, &[Record::user(prompt_text)])?;
+                    self.consume_messages(self.gather_phase(InboxPhase::Init)?, &mut watermark)
+                        .await?;
+                    self.consume_own(&own, &mut watermark).await?;
                     return Ok(exit);
                 }
             }
         }
 
-        // 4. 用户记录落盘：配置/钩子失败也不能丢失用户输入。
-        yaa_store::append(&self.session, &[Record::user(prompt_text)])?;
+        // 4. 先消费 own 之前（ULID 更小）的 pending 注入，再消费 own。
+        let earlier = self.gather_phase_before(InboxPhase::Pending, own.id())?;
+        self.consume_messages(earlier, &mut watermark).await?;
+        self.consume_own(&own, &mut watermark).await?;
 
         // 5. llm 钩子（每次运行一次，不写记录），并用解析出的配置构造模型。
         let llm_config = match self.resolve_llm_hook().await {
@@ -207,10 +287,246 @@ impl Runner<'_> {
         };
         let model = make_model(llm_config);
 
-        self.run_loop(&model, watermark).await
+        self.run_loop(&model, watermark, true).await
     }
 
-    /// 放行**最旧**一条未决待批命令，随后继续 agent loop。
+    /// 消费一条 `own` 记录：幂等追加后删除对应 inbox 文件。
+    async fn consume_own(&self, own: &Record, watermark: &mut usize) -> anyhow::Result<()> {
+        self.append_idempotent_and_emit(std::slice::from_ref(own), watermark)
+            .await?;
+        for message in yaa_store::scan_inbox(&self.session, InboxPhase::Pending)? {
+            if message.id() == own.id() {
+                yaa_store::remove_inbox(&message)?;
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// 扫描一个 phase 的全部消息（按文件名升序）。
+    fn gather_phase(&self, phase: InboxPhase) -> anyhow::Result<Vec<yaa_store::InboxMessage>> {
+        Ok(yaa_store::scan_inbox(&self.session, phase)?)
+    }
+
+    /// 扫描一个 phase 中 id 严格小于 `bound` 的消息（用于「own 之前」的注入）。
+    fn gather_phase_before(
+        &self,
+        phase: InboxPhase,
+        bound: &str,
+    ) -> anyhow::Result<Vec<yaa_store::InboxMessage>> {
+        let mut messages = yaa_store::scan_inbox(&self.session, phase)?;
+        messages.retain(|message| message.id() < bound);
+        Ok(messages)
+    }
+
+    /// 收集 `init/` 与 `pending/` 的全部消息，按 id（ULID）合并升序；供安全点消费。
+    fn gather_all_inbox(&self) -> anyhow::Result<Vec<yaa_store::InboxMessage>> {
+        let mut messages = yaa_store::scan_inbox(&self.session, InboxPhase::Init)?;
+        messages.extend(yaa_store::scan_inbox(&self.session, InboxPhase::Pending)?);
+        messages.sort_by(|left, right| left.id().cmp(right.id()));
+        Ok(messages)
+    }
+
+    /// 消费一批 inbox 消息：整批幂等追加后逐个删除；返回其中是否含 `User`。
+    ///
+    /// 崩溃在追加与删除之间时消息文件会重现，由 `append_idempotent` 按 id 去重。
+    async fn consume_messages(
+        &self,
+        messages: Vec<yaa_store::InboxMessage>,
+        watermark: &mut usize,
+    ) -> anyhow::Result<bool> {
+        if messages.is_empty() {
+            return Ok(false);
+        }
+        let saw_user = messages
+            .iter()
+            .any(|message| matches!(message.record, Record::User(_)));
+        let records: Vec<Record> = messages
+            .iter()
+            .map(|message| message.record.clone())
+            .collect();
+        self.append_idempotent_and_emit(&records, watermark).await?;
+        for message in &messages {
+            yaa_store::remove_inbox(message)?;
+        }
+        Ok(saw_user)
+    }
+
+    /// 跟随模式：`own` 已发布但未抢到 `runner.lock`（另一 runner 正在跑）。
+    ///
+    /// 只读跟随：不写 events、不跑钩子、不执行工具。启动水位 `(baseline_gen, start_seq)`
+    /// 取「发布 `own` 时同一 clear SH 临界区内的原子水位」，故不回放历史；仅把其后新到达
+    /// 的记录经 [`DisplayProjector`] 增量展示。启动时用 `start_seq` 之前的历史回填命令表
+    /// （不产出条目），使之后到达的 `approval_resolved` 仍能展示命令（B5）。
+    ///
+    /// generation 规则（B1）：
+    /// - **建库不算归档**：`baseline_gen == 0 && 读到 1` 时更新基线、`next_seq = 0` 续跟；
+    /// - 真归档（其余变化）→ 提示「会话已归档」并退出 0，且**不重新 append own**；
+    /// - 拿到 `runner.lock` 后再复检一次 generation，消除「读水位后、抢锁前被 clear」的
+    ///   TOCTOU。
+    ///
+    /// 抢到锁后：`own` 已落库且 inbox 空、历史空闲、无未决审批 → 退出 0（最终回复由 CLI
+    /// 依据 `own` 打印）；纯跟随遇未决审批 → 提示 `--approve` 并留在跟随；其余情形
+    /// **只接管一次**。接管策略按 inbox 是否含新 `User` 区分（B4）。
+    pub async fn follow<M, F>(
+        &self,
+        own: Record,
+        start_seq: i64,
+        baseline_gen: i64,
+        make_model: F,
+    ) -> anyhow::Result<ExitCode>
+    where
+        F: FnOnce(LlmConfig) -> M,
+        M: Model,
+    {
+        self.warn_cwd();
+        let mut make_model = Some(make_model);
+        let mut generation = baseline_gen;
+        let mut next_seq = start_seq;
+        // B5：只把发布水位之前的历史交给投影器回填命令表；`load()` 一次，不重放。
+        let prefix = yaa_store::load(&self.session)?;
+        let prefix_len = usize::try_from(start_seq)
+            .unwrap_or(usize::MAX)
+            .min(prefix.len());
+        let mut projector = DisplayProjector::from_records(&prefix[..prefix_len]);
+        let mut backoff = Duration::from_millis(20);
+        let mut pending_notice_sent = false;
+
+        loop {
+            let (rows, new_seq, read_generation) =
+                yaa_store::read_after_with_generation(&self.session, next_seq)?;
+            if read_generation != generation {
+                if generation == 0 && read_generation == 1 {
+                    // 首次建库：不是归档；从新库起点重新读取。
+                    generation = 1;
+                    next_seq = 0;
+                    continue;
+                }
+                self.sink
+                    .emit(DisplayItem::Notice("会话已归档，停止跟随。".to_string()));
+                return Ok(ExitCode::Success);
+            }
+            if rows.is_empty() {
+                tokio::time::sleep(jitter(backoff)).await;
+                backoff = (backoff * 2).min(Duration::from_millis(250));
+            } else {
+                self.display_rows(&mut projector, rows);
+                next_seq = new_seq;
+                backoff = Duration::from_millis(20);
+            }
+
+            let Some(guard) = yaa_store::FileLock::try_exclusive(&self.session.runner_lock_path())?
+            else {
+                continue;
+            };
+            // 抢锁后复检 generation：读水位与抢锁之间可能被 `--clear` 归档。
+            let current_generation = yaa_store::generation(&self.session)?;
+            if current_generation != generation {
+                if generation == 0 && current_generation == 1 {
+                    generation = 1;
+                    next_seq = 0;
+                    drop(guard);
+                    continue;
+                }
+                self.sink
+                    .emit(DisplayItem::Notice("会话已归档，停止跟随。".to_string()));
+                return Ok(ExitCode::Success);
+            }
+            // 补读旧 runner 释放前的最后一批，避免退出竞态丢展示。
+            let (rows, new_seq, read_generation) =
+                yaa_store::read_after_with_generation(&self.session, next_seq)?;
+            if read_generation != generation {
+                // 持 runner.lock 时 clear 不可能归档；仍按统一规则处理以防外部 bump。
+                drop(guard);
+                if generation == 0 && read_generation == 1 {
+                    generation = 1;
+                    next_seq = 0;
+                    continue;
+                }
+                self.sink
+                    .emit(DisplayItem::Notice("会话已归档，停止跟随。".to_string()));
+                return Ok(ExitCode::Success);
+            }
+            if !rows.is_empty() {
+                self.display_rows(&mut projector, rows);
+                next_seq = new_seq;
+            }
+
+            let records = yaa_store::load(&self.session)?;
+            let own_consumed = records.iter().any(|record| record.id() == own.id());
+            let pending = unresolved_pending(&records);
+            let inbox = self.gather_all_inbox()?;
+            let inbox_empty = inbox.is_empty();
+            let inbox_has_user = inbox
+                .iter()
+                .any(|message| matches!(message.record, Record::User(_)));
+
+            if inbox_empty && own_consumed && pending.is_empty() && display::is_idle(&records) {
+                // B6：own 之后的轮末 `ai` 为空时与 leader 一样明确告知，不静默退出。
+                if display::final_ai_for_own(&records, own.id()).is_some_and(str::is_empty) {
+                    self.sink.emit(DisplayItem::Notice(
+                        "模型返回了空回复（既无文本也无工具调用）。".to_string(),
+                    ));
+                }
+                // 历史空闲：不再有可跑的工作，退出（最终回复由 CLI 打印）。
+                return Ok(ExitCode::Success);
+            }
+            if own_consumed && !pending.is_empty() && !inbox_has_user {
+                // B4：纯跟随（无新 User）遇未决审批：不替用户作废/拒绝，提示后继续跟随。
+                if !pending_notice_sent {
+                    self.sink.emit(DisplayItem::Notice(
+                        "有待批准命令，请运行 `yaa --approve`。".to_string(),
+                    ));
+                    pending_notice_sent = true;
+                }
+                drop(guard);
+                continue;
+            }
+
+            // 其余情形接管，只尝试一次；有新 User 才按 D45 作废旧待批。
+            let policy = if inbox_has_user {
+                PendingPolicy::Abandon
+            } else {
+                PendingPolicy::Keep
+            };
+            let make_model = make_model.take().expect("接管只发生一次");
+            return self.run_takeover(own, policy, make_model).await;
+        }
+    }
+
+    /// 接管：前一个 runner 已释放锁，本次由我继续处理该会话。
+    ///
+    /// 复用 [`Runner::run_queued`] 的消费顺序（作废旧待批 → 崩溃恢复 → init → 消费
+    /// pending 与 `own` → `run_loop`）；`own` 可能已被前一个 runner 消费，按 id 幂等去重。
+    /// 「只尝试一次」由调用方 [`Runner::follow`] 保证：接管返回后不再重新进入跟随。
+    /// 工作目录回退告警已由 [`Runner::follow`] 发出，接管不再重复（B7）。
+    pub async fn run_takeover<M, F>(
+        &self,
+        own: Record,
+        policy: PendingPolicy,
+        make_model: F,
+    ) -> anyhow::Result<ExitCode>
+    where
+        F: FnOnce(LlmConfig) -> M,
+        M: Model,
+    {
+        self.run_queued_inner(own, policy, false, make_model).await
+    }
+
+    /// 把一批 `(seq, record)` 增量交给投影器并逐条上报。
+    ///
+    /// 每批 `push` 后立刻 `flush`：真实历史中 `ai` 与其 `tool_call` 在同一事务原子落盘，
+    /// 因此一批读到的末尾 `ai` 之后不会再有同批 `tool_call`，可安全按轮末正文产出。
+    fn display_rows(&self, projector: &mut DisplayProjector, rows: Vec<(i64, Record)>) {
+        let records: Vec<Record> = rows.into_iter().map(|(_, record)| record).collect();
+        for item in projector.push(&records) {
+            self.sink.emit(item);
+        }
+        for item in projector.flush() {
+            self.sink.emit(item);
+        }
+    }
+
     ///
     /// 与 [`Runner::run`] 的差异：不执行 `init`、不写 `user`；只执行一条 pending 的
     /// 命令（写 `tool_result` 与 `approval_resolved: approve`），然后复用 [`Runner::run_loop`]。
@@ -287,17 +603,23 @@ impl Runner<'_> {
             yaa_store::append(&self.session, &[resolved])?;
         }
 
-        self.run_loop(&model, watermark).await
+        self.run_loop(&model, watermark, false).await
     }
 
-    /// agent loop 主体，供 [`Runner::run`] 与 [`Runner::approve_pending`] 共用。
+    /// agent loop 主体，供 [`Runner::run_queued`] 与 [`Runner::approve_pending`] 共用。
     ///
     /// 从 `watermark` 起只展示增量记录；循环内每次重读历史再渲染，保证外部
     /// `yaa --notify` 在模型请求期间的写入不被跳过（D39）。
+    ///
+    /// `consume` 为真时（普通 run / 接管），每轮开头是安全点：上一轮工具批次已完成，
+    /// 此时消费全部 inbox（`init/`+`pending/` 按 ULID 合并升序）后再渲染、调用模型；
+    /// 消费到含 `User` 的消息时重置 `max_steps` 计数（system notify 不重置）。
+    /// `--approve` 传假，保持「不消费 User 注入」的语义。
     async fn run_loop<M: Model>(
         &self,
         model: &M,
         mut watermark: usize,
+        consume: bool,
     ) -> anyhow::Result<ExitCode> {
         let schema_hash = tools::shell::schema_hash();
         let limits = self.config.shell.to_limits();
@@ -307,7 +629,22 @@ impl Runner<'_> {
         // 本次运行的摘要链尾：生成一次后后续步骤复用，避免重复调用摘要模型。
         let mut compaction_state: Option<compaction::cache::SummaryEntry> = None;
 
-        for _ in 0..self.config.agent.max_steps {
+        let max_steps = self.config.agent.max_steps;
+        let mut step = 0u32;
+        loop {
+            // 安全点：上一轮工具批次已完整落盘、无未决审批时才消费 inbox（I3）。
+            if consume
+                && self
+                    .consume_messages(self.gather_all_inbox()?, &mut watermark)
+                    .await?
+            {
+                // 本批含新的 User：为这一批重置步数预算。
+                step = 0;
+            }
+            if step >= max_steps {
+                break;
+            }
+
             let records = yaa_store::load(&self.session)?;
             let plan = self
                 .plan_messages(&records, model, &mut compaction_state)
@@ -379,6 +716,12 @@ impl Runner<'_> {
                         "模型返回了空回复（既无文本也无工具调用）。".to_string(),
                     ));
                 }
+                // B3：最终模型调用期间到达的 notify 也必须在本次 run 内消费，不能因
+                // 「无 tool_calls」直接返回而滞留到下一次运行。不重置 step（notify 不
+                // 属于新 user 批次），仍由下一轮开头的 `max_steps` 检查兜底。
+                if consume && !self.gather_all_inbox()?.is_empty() {
+                    continue;
+                }
                 return Ok(ExitCode::Success);
             }
 
@@ -403,6 +746,7 @@ impl Runner<'_> {
             if pending_any {
                 return Ok(ExitCode::Pending);
             }
+            step += 1;
         }
 
         // 达到步数上限不在此发事件：`ExitCode::MaxSteps` 已是明确信号，具体警告与
@@ -583,6 +927,18 @@ impl Runner<'_> {
         Ok(())
     }
 
+    /// 幂等追加一批记录并展示增量：已存在的 id 被忽略，不重复、不报错。
+    async fn append_idempotent_and_emit(
+        &self,
+        records: &[Record],
+        watermark: &mut usize,
+    ) -> anyhow::Result<()> {
+        yaa_store::append_idempotent(&self.session, records)?;
+        let after = yaa_store::load(&self.session)?;
+        self.emit_new(&after, watermark);
+        Ok(())
+    }
+
     /// 启动普通 run 时把未决 pending 作废：补 `approval_resolved: deny` 与失败结果（D45）。
     ///
     /// 若该 `call_id` 已有 `tool_result`（执行后、写 `resolved` 前被强杀的中断态），
@@ -661,7 +1017,10 @@ impl Runner<'_> {
     ///
     /// 失败（spawn/IO/超限/非零退出码）返回 `ExitCode::Config`。
     async fn run_init_hook(&self) -> Result<(), ExitCode> {
-        let env = self.hook_env();
+        // 钩子内的 `yaa --notify` 发到 `inbox/init/`：runner 在 init 之后优先消费，
+        // 保持「notify → 簿记 → user」的既有顺序。
+        let mut env = self.hook_env();
+        env.insert("YAA_INBOX_PHASE".to_string(), "init".to_string());
         let command = self.config.hooks.init.as_str();
         match crate::hook::run(command, self.cwd, &env, self.config.hooks.timeout_secs).await {
             Ok(outcome) => {
@@ -791,6 +1150,17 @@ fn session_path(session: &yaa_store::Session) -> String {
         .unwrap_or_else(|_| session.db.clone())
         .to_string_lossy()
         .into_owned()
+}
+
+/// 在 `base` 上叠加 ±20% 抖动，避免多 follower 同步轮询。
+fn jitter(base: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos())
+        .unwrap_or(0);
+    // 映射到 [0.8, 1.2)：`nanos % 4000` 落在 0..4000。
+    let factor = 0.8 + f64::from(nanos % 4000) / 10_000.0;
+    base.mul_f64(factor)
 }
 
 /// 一条未决待批：有 `approval_pending` 而无同 `call_id` 的 `approval_resolved`。

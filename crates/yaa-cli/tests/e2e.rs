@@ -64,6 +64,15 @@ init = "true"
 max_steps = 10
 "#;
 
+/// 步数上限为 1：用于验证工具执行期注入的 User 会重置步数预算。
+const SINGLE_STEP_CONFIG: &str = r#"
+[hooks]
+init = "true"
+
+[agent]
+max_steps = 1
+"#;
+
 /// 命中 `echo *` 即询问的审批配置：用于 ask 拦截与 `--approve` 恢复。
 const APPROVAL_ASK_CONFIG: &str = r#"
 [hooks]
@@ -342,6 +351,31 @@ impl TestEnv {
         let digest = format!("{:x}", hasher.finalize());
         let sid = &digest[..32];
         self.data_home.join("sessions").join(sid).join("session.db")
+    }
+
+    /// 默认会话的文件 inbox 根目录：`<session.db 父目录>/inbox`。
+    fn inbox_root(&self) -> PathBuf {
+        self.session_db()
+            .parent()
+            .expect("session.db 应有父目录")
+            .join("inbox")
+    }
+
+    /// 读取指定 phase 的 inbox 消息（`scan_inbox`，按文件名升序），转为 JSON 值。
+    ///
+    /// `--notify` 改为只发布后，断言注入内容应经此读取而非直接读 events。
+    fn read_inbox(&self, phase: &str) -> Vec<Value> {
+        let phase = match phase {
+            "init" => yaa_store::InboxPhase::Init,
+            "pending" => yaa_store::InboxPhase::Pending,
+            other => panic!("未知 inbox phase：{other}"),
+        };
+        let session = yaa_store::Session::new(self.session_db());
+        yaa_store::scan_inbox(&session, phase)
+            .unwrap()
+            .iter()
+            .map(|message| serde_json::to_value(&message.record).unwrap())
+            .collect()
     }
 }
 
@@ -1025,7 +1059,7 @@ fn notify_command_and_stdin_forms_write_envelopes() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["type"], "system");
     assert_eq!(records[0]["source"], "notify");
@@ -1040,7 +1074,7 @@ fn notify_command_and_stdin_forms_write_envelopes() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert_eq!(records[0]["content"], "<注释>\nhi\n</注释>");
     assert!(
         records[0].get("command").is_none(),
@@ -1061,7 +1095,7 @@ fn notify_command_and_stdin_forms_write_envelopes() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert_eq!(records[0]["content"], "<由用户执行>\nx\n</由用户执行>");
 }
 
@@ -1118,8 +1152,8 @@ fn notify_truncates_and_records_output_files() {
         stderr_of(&output)
     );
 
-    let records = read_events(&env.session_db());
-    assert_eq!(records.len(), 1, "notify 是短路路径，只写一条记录");
+    let records = env.read_inbox("pending");
+    assert_eq!(records.len(), 1, "notify 只发布一条 inbox 消息");
     let record = &records[0];
     assert_eq!(record["source"], "notify");
     assert_eq!(
@@ -1166,7 +1200,7 @@ fn notify_timeout_flag_kills_long_command() {
         "应提示超时：{}",
         stderr_of(&output)
     );
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert_eq!(records[0]["command"], "sleep 30");
 }
 
@@ -1198,7 +1232,7 @@ fn notify_stdin_truncates_and_records_output_files() {
         stderr_of(&output)
     );
 
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert!(
         records[0].get("command").is_none(),
         "stdin 形态不记 command"
@@ -1251,7 +1285,8 @@ async fn notify_stdin_truncation_is_visible_to_model_with_path() {
         stderr_of(&notify)
     );
 
-    let relative = read_events(&env.session_db())
+    let relative = env
+        .read_inbox("pending")
         .iter()
         .find(|record| record["type"] == "system" && record["source"] == "notify")
         .and_then(|record| record["output_files"]["stdout"].as_str())
@@ -2376,8 +2411,8 @@ fn notify_space_separated_comment_is_written() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_events(&env.session_db());
-    assert_eq!(records.len(), 1, "notify 短路路径只写一条记录");
+    let records = env.read_inbox("pending");
+    assert_eq!(records.len(), 1, "notify 只发布一条 inbox 消息");
     assert_eq!(records[0]["command"], "echo hi");
     assert_eq!(records[0]["content"], "<空格注释>\nhi\n</空格注释>");
 }
@@ -2421,7 +2456,7 @@ fn notify_comment_newlines_are_flattened() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert_eq!(records[0]["content"], "<a b>\nhi\n</a b>");
 }
 
@@ -3113,7 +3148,7 @@ fn notify_warns_and_creates_missing_session() {
         "应告警目标不存在：{}",
         stderr_of(&output)
     );
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["content"], "<新>\nhi\n</新>");
 }
@@ -3248,31 +3283,58 @@ fn status_reads_archived_session() {
     );
 }
 
-/// 已有 runner 持锁时，普通 run 明确拒绝且不写记录。
+/// 刀 4：已有 runner 持锁时，普通 run 进入**跟随**而非报错；generation 变化后退出 0。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn run_refuses_when_runner_lock_is_held() {
-    let (addr, _state) = start_server(vec![text_response("不应调用")]).await;
+async fn follower_waits_then_exits_on_generation_change() {
+    let (addr, state) = start_server(vec![text_response("不应调用")]).await;
     let env = TestEnv::new(addr.port());
     env.write_config(PLAIN_CONFIG);
-    let session = yaa_store::Session::new(env.session_db());
-    std::fs::create_dir_all(&session.root).unwrap();
-    let _held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    let session = yaa_store::Session::new(db.clone());
+    let held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
         .unwrap()
         .expect("测试进程应能先持锁");
 
-    let output = env.run(&["你好"]);
+    let mut child = env
+        .command()
+        .arg("你好")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // 抢锁失败应进入跟随并保持存活，而不是报「会话正在运行」退出。
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "跟随者不应退出：{:?}",
+        child.try_wait().unwrap()
+    );
+
+    // 构造归档：generation 变化后跟随者应退出 0 并提示。
+    bump_generation(&db);
+    let output = child.wait_with_output().unwrap();
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(0),
         "stderr：{}",
         stderr_of(&output)
     );
     assert!(
-        stderr_of(&output).contains("会话正在运行"),
+        !stderr_of(&output).contains("会话正在运行"),
+        "不应再报抢锁失败：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("停止跟随"),
         "stderr：{}",
         stderr_of(&output)
     );
-    assert!(!session.db.exists(), "持锁失败时不得创建/写入会话");
+    assert!(
+        state.requests.lock().unwrap().is_empty(),
+        "纯跟随不得调用模型"
+    );
+    drop(held);
 }
 
 /// runner 持锁时 `--clear` 拒绝归档，且主库记录不变。
@@ -3328,7 +3390,7 @@ fn concurrent_notify_processes_do_not_lose_records() {
         );
     }
 
-    let records = read_events(&env.session_db());
+    let records = env.read_inbox("pending");
     assert_eq!(
         count_source(&records, "notify"),
         8,
@@ -3353,6 +3415,8 @@ fn concurrent_notify_processes_do_not_lose_records() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn status_reads_while_writer_is_active() {
     let env = TestEnv::new(0);
+    // 预置记录让会话库存在，`--status` 才有「记录：」摘要可打印（notify 不再直接建库）。
+    seed(&env.session_db(), &[yaa_msg::Record::user("既有")]);
     let first = env.run(&["--notify=初始", "--", "printf", "init"]);
     assert!(first.status.success(), "stderr：{}", stderr_of(&first));
 
@@ -3380,16 +3444,23 @@ async fn status_reads_while_writer_is_active() {
 
     let writer = writer.wait_with_output().unwrap();
     assert!(writer.status.success(), "写者应正常结束");
-    assert_eq!(count_source(&read_events(&env.session_db()), "notify"), 2);
+    assert_eq!(
+        count_source(&env.read_inbox("pending"), "notify"),
+        2,
+        "两条 notify 都应发布到 inbox"
+    );
 }
 
 /// S1：慢 notify 命令执行期间并发 `--clear` 不应等待命令结束；总量守恒且两边库完整。
+///
+/// 刀 6 起 clear 遇到 pending 会拒绝，故这里让慢命令在 clear 期间**尚未发布**：
+/// clear 归档既有库；命令结束后 notify 用预检捕获的旧 generation 发布，必须被拒绝，
+/// 不得把通知写进归档后的新 generation。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clear_conserves_records_while_slow_notify_command_runs() {
     let env = TestEnv::new(0);
-    // 前置一条，确保库已存在、`--clear` 会真正归档。
-    let first = env.run(&["--notify=前置", "--", "printf", "pre"]);
-    assert!(first.status.success(), "stderr：{}", stderr_of(&first));
+    // 预置记录，确保库已存在、`--clear` 会真正归档（notify 不再直接建库）。
+    seed(&env.session_db(), &[yaa_msg::Record::user("既有")]);
 
     let pidfile = env._root.path().join("slow-notify.pid");
     let command = format!("echo $$ > '{}'; sleep 2", pidfile.display());
@@ -3397,7 +3468,7 @@ async fn clear_conserves_records_while_slow_notify_command_runs() {
         .command()
         .args(["--notify=慢", "--", "sh", "-c", &command])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     wait_for_pid(&pidfile, std::time::Duration::from_secs(5))
@@ -3413,23 +3484,1282 @@ async fn clear_conserves_records_while_slow_notify_command_runs() {
         started.elapsed()
     );
 
+    // P0-6：命令期间发生真归档（generation 1 → 2），发布必须被拒绝并返回 1。
     let writer = writer.wait_with_output().unwrap();
+    assert_eq!(
+        writer.status.code(),
+        Some(1),
+        "归档后 notify 应失败：{}",
+        stderr_of(&writer)
+    );
     assert!(
-        writer.status.success(),
-        "慢通知应成功：{}",
+        stderr_of(&writer).contains("已归档") && stderr_of(&writer).contains("通知未写入"),
+        "stderr 应说明会话已归档且通知未写入：{}",
         stderr_of(&writer)
     );
 
-    // 总量守恒：两次成功的 notify 要么进归档、要么进新库。
+    // 归档承载既有事件；迟到的通知不得进入新 generation 的 inbox。
     let archived = PathBuf::from(stdout_of(&cleared).trim());
     assert!(archived.exists(), "归档库应存在：{}", archived.display());
-    let archived_count = count_source(&read_events(&archived), "notify");
-    let live_count = count_source(&read_events(&env.session_db()), "notify");
+    assert!(
+        read_events(&archived)
+            .iter()
+            .any(|record| record["type"] == "user"),
+        "归档应含既有记录"
+    );
     assert_eq!(
-        archived_count + live_count,
-        2,
-        "通知总数应守恒（归档 {archived_count} + 新库 {live_count}）"
+        count_source(&env.read_inbox("pending"), "notify"),
+        0,
+        "归档后的迟到 notify 不得写入 inbox"
     );
     assert!(integrity_ok(&archived), "归档库 integrity 应为 ok");
     assert!(integrity_ok(&env.session_db()), "新库 integrity 应为 ok");
+}
+
+// ===== 阶段 4 刀 2+3：notify 只发布、注入先落库 =====
+
+/// 刀 2：`--notify` 只发布，绝不启动 agent（不跑 init/llm、不调模型、不写 events）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_does_not_start_agent_and_only_publishes() {
+    let (addr, state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    // 默认 init 会写三条 notify；若 `--notify` 误触发 agent，这些就会落库。
+    env.write_agents("代理须知");
+
+    let output = env.run(&["--notify=外部", "--", "printf", "X"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    assert!(
+        state.requests.lock().unwrap().is_empty(),
+        "notify 不得调用模型"
+    );
+    assert!(
+        !env.session_db().exists(),
+        "notify 不得创建或写入会话库：{}",
+        env.session_db().display()
+    );
+    let pending = env.read_inbox("pending");
+    assert_eq!(pending.len(), 1, "应发布一条 pending 消息：{pending:?}");
+    assert!(env.read_inbox("init").is_empty(), "init/ 应为空");
+}
+
+/// 刀 2：`YAA_INBOX_PHASE=init` 使通知写入 `inbox/init/`（磁盘布局断言）。
+#[test]
+fn notify_init_phase_env_publishes_to_init_dir() {
+    let env = TestEnv::new(0);
+    let output = env
+        .command()
+        .env("YAA_INBOX_PHASE", "init")
+        .args(["--notify=初始化", "--", "printf", "i"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    let init = env.read_inbox("init");
+    assert_eq!(init.len(), 1, "通知应写入 init/：{init:?}");
+    assert!(env.read_inbox("pending").is_empty(), "pending/ 应为空");
+
+    let init_dir = env.inbox_root().join("init");
+    assert_eq!(
+        std::fs::read_dir(&init_dir).unwrap().count(),
+        1,
+        "init/ 下应有且仅有一条消息文件"
+    );
+}
+
+/// 刀 3：先发布的消息按文件名序先落库，且都排在本次 user 之前。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn earlier_published_messages_land_before_later_user() {
+    let (addr, _state) = start_server(vec![text_response("答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let first = env.run(&["--notify=早一", "--", "printf", "A"]);
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&first)
+    );
+    let second = env.run(&["--notify=早二", "--", "printf", "B"]);
+    assert_eq!(
+        second.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&second)
+    );
+
+    let run = env.run(&["晚"]);
+    assert!(run.status.success(), "stderr：{}", stderr_of(&run));
+
+    let records = read_events(&env.session_db());
+    let labels: Vec<&str> = records
+        .iter()
+        .map(|record| record["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        ["system", "system", "system", "user", "ai"],
+        "记录顺序：{records:?}"
+    );
+    assert_eq!(records[0]["source"], "init", "首条应为 init 簿记");
+    assert_eq!(records[1]["source"], "notify");
+    assert_eq!(records[2]["source"], "notify");
+    assert_eq!(records[3]["content"], "晚", "own user 应排在本批通知之后");
+    assert_eq!(count_source(&records, "notify"), 2, "两条通知都应落库");
+    assert!(
+        env.read_inbox("pending").is_empty(),
+        "消费后 pending/ 应为空"
+    );
+}
+
+// ===== 阶段 4 刀 4+5：跟随与接管 =====
+
+/// 刀 4：第二个客户端抢锁失败进入 follower；只有 leader 发模型请求，各自打印自己的答案。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_runner_second_client_follows_and_only_leader_requests() {
+    // leader 用一个长工具调用（`sleep 2`）持锁，给 follower 足够时间进入跟随。
+    let (addr, state) = start_server(vec![
+        tool_call_response("call_1", "sleep 2", None, None),
+        text_response("领导人答"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let leader = env
+        .command()
+        .arg("甲问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // 等 leader 写完 user/ai/tool_call 并进入工具执行（持锁）。
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let follower = env
+        .command()
+        .arg("乙问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let leader_out = leader.wait_with_output().unwrap();
+    let follower_out = follower.wait_with_output().unwrap();
+
+    assert!(
+        leader_out.status.success(),
+        "leader 失败：{}",
+        stderr_of(&leader_out)
+    );
+    assert_eq!(
+        follower_out.status.code(),
+        Some(0),
+        "follower 失败：{}",
+        stderr_of(&follower_out)
+    );
+    assert!(stdout_of(&leader_out).contains("领导人答"));
+    assert!(
+        stdout_of(&follower_out).contains("领导人答"),
+        "follower 应打印归属自己的答案：{}",
+        stdout_of(&follower_out)
+    );
+    assert!(
+        !stderr_of(&follower_out).contains("会话正在运行"),
+        "follower 不应再报抢锁失败：{}",
+        stderr_of(&follower_out)
+    );
+    assert!(
+        !stderr_of(&follower_out).contains("甲问"),
+        "follower 不应回放历史：{}",
+        stderr_of(&follower_out)
+    );
+    assert_eq!(
+        state.requests.lock().unwrap().len(),
+        2,
+        "只有 leader 发模型请求（follower 不发）"
+    );
+}
+
+/// 刀 4：follower 从发布自己之前的 `last_seq` 起跟随，绝不回放既有历史。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_does_not_replay_seeded_history() {
+    let (addr, _state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    let mut history = Vec::new();
+    for index in 0..50 {
+        history.push(yaa_msg::Record::user(format!("OLD-{index}")));
+        history.push(yaa_msg::Record::ai(
+            "m",
+            "h",
+            format!("OLD-ANS-{index}"),
+            None,
+        ));
+    }
+    seed(&db, &history);
+    let session = yaa_store::Session::new(db.clone());
+    let held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+        .unwrap()
+        .expect("测试进程应能先持锁");
+
+    let child = env
+        .command()
+        .arg("新问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    bump_generation(&db);
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !stderr_of(&output).contains("OLD-"),
+        "follower 不应回放历史：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        !stdout_of(&output).contains("OLD-"),
+        "stdout 不应含历史：{}",
+        stdout_of(&output)
+    );
+    drop(held);
+}
+
+/// 刀 5：leader 在工具执行中被 SIGKILL，follower 接管、补中断结果并产出答案（不重放）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_takes_over_after_leader_killed() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_kill", "sleep 30", None, None),
+        text_response("接管答"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    let session = yaa_store::Session::new(db.clone());
+
+    let mut leader = env
+        .command()
+        .arg("甲问")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // 等待 `tool_call` 落盘（工具随后进入执行）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let has_call = yaa_store::load(&session).is_ok_and(|records| {
+            records
+                .iter()
+                .any(|record| matches!(record, yaa_msg::Record::ToolCall(call) if call.call_id == "call_kill"))
+        });
+        if has_call {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 leader 的 tool_call 超时"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(150));
+
+    let follower = env
+        .command()
+        .arg("乙问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // 让 follower 进入跟随（抢锁失败）。
+    std::thread::sleep(std::time::Duration::from_millis(250));
+
+    leader.kill().expect("SIGKILL leader");
+    leader.wait().expect("回收 leader");
+
+    let follower_out = follower.wait_with_output().unwrap();
+    assert_eq!(
+        follower_out.status.code(),
+        Some(0),
+        "follower 接管失败：{}",
+        stderr_of(&follower_out)
+    );
+    assert!(
+        stdout_of(&follower_out).contains("接管答"),
+        "接管者应产出答案：{}",
+        stdout_of(&follower_out)
+    );
+    assert!(
+        !stderr_of(&follower_out).contains("会话正在运行"),
+        "{}",
+        stderr_of(&follower_out)
+    );
+    assert!(
+        !stderr_of(&follower_out).contains("甲问"),
+        "接管不应回放历史：{}",
+        stderr_of(&follower_out)
+    );
+
+    let records = yaa_store::load(&session).unwrap();
+    let interrupted: Vec<_> = records
+        .iter()
+        .filter(|record| matches!(record, yaa_msg::Record::ToolResult(result) if result.call_id == "call_kill"))
+        .collect();
+    assert_eq!(interrupted.len(), 1, "应恰好补一条中断结果：{records:?}");
+    let yaa_msg::Record::ToolResult(result) = interrupted[0] else {
+        unreachable!()
+    };
+    assert!(result.stderr.contains("interrupted"), "{result:?}");
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record, yaa_msg::Record::User(user) if user.content == "乙问")),
+        "接管应消费 follower 自己的消息：{records:?}"
+    );
+    let ai_count = records
+        .iter()
+        .filter(|record| matches!(record, yaa_msg::Record::Ai(_)))
+        .count();
+    assert_eq!(ai_count, 2, "甲的中途 ai + 接管 ai：{records:?}");
+}
+
+/// 刀 5：纯 follower（own 已落库）遇未决审批不接管，提示 `--approve` 并保持跟随。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pure_follower_with_pending_prompts_approve_without_taking_over() {
+    // leader 先用 `sleep 1.5` 长工具持锁，随后消费 follower 消息并命中 `echo *` 待批退出 6。
+    let (addr, _state) = start_server(vec![
+        tool_call_response("c1", "sleep 1.5", None, None),
+        tool_call_response("c2", "echo hi", None, None),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_ASK_CONFIG);
+
+    let leader = env
+        .command()
+        .arg("甲问")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let mut follower = env
+        .command()
+        .arg("乙问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let leader_out = leader.wait_with_output().unwrap();
+    assert_eq!(
+        leader_out.status.code(),
+        Some(6),
+        "leader 应以待批退出：{}",
+        stderr_of(&leader_out)
+    );
+
+    // follower 应为纯跟随：own 已被 leader 消费，遇未决 pending 不接管。
+    std::thread::sleep(std::time::Duration::from_millis(700));
+    assert!(
+        follower.try_wait().unwrap().is_none(),
+        "纯 follower 不应接管退出：{:?}",
+        follower.try_wait().unwrap()
+    );
+
+    follower.kill().expect("结束 follower");
+    let follower_out = follower.wait_with_output().unwrap();
+    assert!(
+        stderr_of(&follower_out).contains("--approve"),
+        "应提示运行 --approve：{}",
+        stderr_of(&follower_out)
+    );
+}
+
+// ===== 阶段 4 刀 6：clear/status 待处理消息与 tmp 清理 =====
+
+/// 刀 6：inbox 有消息时 `--clear` 拒绝归档，消息保留且不产生归档。
+#[test]
+fn clear_refuses_when_inbox_has_pending() {
+    let env = TestEnv::new(0);
+    let published = env.run(&["--notify=待归档", "--", "printf", "X"]);
+    assert_eq!(
+        published.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&published)
+    );
+
+    let output = env.run(&["--clear"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("待处理"), "stderr：{stderr}");
+    assert!(stderr.contains("1 条"), "应报告待处理计数：{stderr}");
+    assert_eq!(
+        env.read_inbox("pending").len(),
+        1,
+        "拒绝归档时不得移除 inbox 消息"
+    );
+    assert!(
+        !env.data_home.join("history").exists(),
+        "拒绝归档不得产生归档"
+    );
+}
+
+/// 刀 6：`session.db` 不存在但仅有 init/ 待处理消息时同样拒绝归档。
+#[test]
+fn clear_refuses_when_only_inbox_exists() {
+    let env = TestEnv::new(0);
+    let published = env
+        .command()
+        .env("YAA_INBOX_PHASE", "init")
+        .args(["--notify=初始化", "--", "printf", "i"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        published.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&published)
+    );
+    assert!(!env.session_db().exists(), "notify 不得创建会话库");
+
+    let output = env.run(&["--clear"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("待处理"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(env.read_inbox("init").len(), 1, "init/ 消息应保留");
+    assert!(
+        !env.data_home.join("history").exists(),
+        "拒绝归档不得产生归档"
+    );
+}
+
+/// 刀 6：inbox 排空后 `--clear` 正常归档既有会话。
+#[test]
+fn clear_succeeds_after_inbox_drained() {
+    let env = TestEnv::new(0);
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    let published = env.run(&["--notify=已消费", "--", "printf", "X"]);
+    assert!(
+        published.status.success(),
+        "stderr：{}",
+        stderr_of(&published)
+    );
+
+    // 手工排空 pending（等价于 runner 已消费）。
+    let pending = env.inbox_root().join("pending");
+    for entry in std::fs::read_dir(&pending).unwrap() {
+        std::fs::remove_file(entry.unwrap().path()).unwrap();
+    }
+
+    let output = env.run(&["--clear"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let archived = PathBuf::from(stdout_of(&output).trim());
+    assert!(archived.exists(), "归档库应存在：{}", archived.display());
+    assert!(
+        read_events(&archived)
+            .iter()
+            .any(|record| record["type"] == "user"),
+        "归档应含既有记录"
+    );
+}
+
+/// 刀 6：`--status` 报告 pending/init 计数，且不创建会话库或目录。
+#[test]
+fn status_reports_pending_inbox_count() {
+    let env = TestEnv::new(0);
+    for (comment, body) in [("一", "A"), ("二", "B")] {
+        let output = env.run(&["--notify", comment, "--", "printf", body]);
+        assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+    }
+    let init = env
+        .command()
+        .env("YAA_INBOX_PHASE", "init")
+        .args(["--notify=初始化", "--", "printf", "i"])
+        .output()
+        .unwrap();
+    assert!(init.status.success(), "stderr：{}", stderr_of(&init));
+
+    let output = env.run(&["--status"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("待处理消息：3 条（pending 2 / init 1）"),
+        "stdout：{stdout}"
+    );
+    assert!(
+        !env.session_db().exists(),
+        "status 不得创建会话库：{}",
+        env.session_db().display()
+    );
+}
+
+/// 刀 6/S2：工具执行期间注入不得打断 `tool_call`/`tool_result` 配对；注入在其后落库。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injection_during_tool_execution_does_not_break_pairing() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_inject", "sleep 1", None, None),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    let session = yaa_store::Session::new(db.clone());
+
+    let run = env
+        .command()
+        .arg("开始")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // 等 `tool_call` 落盘（工具随后进入 `sleep 1`）。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let has_call = yaa_store::load(&session).is_ok_and(|records| {
+            records.iter().any(|record| {
+                matches!(record, yaa_msg::Record::ToolCall(call) if call.call_id == "call_inject")
+            })
+        });
+        if has_call {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 tool_call 落盘超时"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let notify = env.run(&["--notify=工具期间", "--", "printf", "INJECT"]);
+    assert_eq!(
+        notify.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&notify)
+    );
+
+    let output = run.wait_with_output().unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = yaa_store::load(&session).unwrap();
+    let call_index = records
+        .iter()
+        .position(|record| {
+            matches!(record, yaa_msg::Record::ToolCall(call) if call.call_id == "call_inject")
+        })
+        .expect("应有 tool_call");
+    let result_index = records
+        .iter()
+        .position(|record| {
+            matches!(record, yaa_msg::Record::ToolResult(result) if result.call_id == "call_inject")
+        })
+        .expect("应有配对的 tool_result");
+    assert!(call_index < result_index, "配对顺序错误：{records:?}");
+    for record in &records[call_index + 1..result_index] {
+        let injects = match record {
+            yaa_msg::Record::User(_) => true,
+            yaa_msg::Record::System(system) => system.source == "notify",
+            _ => false,
+        };
+        assert!(!injects, "注入不得落在工具批次内部：{records:?}");
+    }
+
+    let notify_index = records
+        .iter()
+        .position(|record| {
+            matches!(
+                record,
+                yaa_msg::Record::System(system)
+                    if system.source == "notify" && system.content.contains("INJECT")
+            )
+        })
+        .expect("注入记录应落库");
+    assert!(
+        notify_index > result_index,
+        "注入应排在 tool_result 之后：{records:?}"
+    );
+}
+
+/// 刀 6：`--notify` 尽力清理 1 小时前的 inbox tmp 残留。
+#[test]
+fn notify_cleans_stale_inbox_tmp() {
+    let env = TestEnv::new(0);
+    let tmp_dir = env.inbox_root().join("tmp");
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let stale = tmp_dir.join("stale.json");
+    std::fs::write(&stale, b"{}").unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stale)
+        .unwrap();
+    file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600))
+        .unwrap();
+    drop(file);
+
+    let output = env.run(&["--notify=清理", "--", "printf", "x"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(!stale.exists(), "陈旧 tmp 文件应被清理");
+    assert_eq!(
+        std::fs::read_dir(&tmp_dir).unwrap().count(),
+        0,
+        "tmp/ 不应残留文件"
+    );
+}
+
+// ===== 阶段 4 终审修复：follower 基线、竞态、排空与接管策略 =====
+
+/// C1：全新会话、两个 `run` 真正同时启动：不得把首次建库误报为归档，双方都得到答案。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_runs_do_not_report_archived() {
+    let (addr, state) = start_server(vec![
+        text_response("并发答"),
+        text_response("并发答"),
+        text_response("并发答"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    // 让首个模型请求慢一点，给另一个客户端进入 follow 的机会。
+    let mut delay = Command::new("sleep");
+    delay.arg("0.4");
+    *state.before_response.lock().unwrap() = Some(delay);
+
+    let first = env
+        .command()
+        .arg("甲问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second = env
+        .command()
+        .arg("乙问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let first_out = first.wait_with_output().unwrap();
+    let second_out = second.wait_with_output().unwrap();
+    for (name, output) in [("甲", &first_out), ("乙", &second_out)] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{name} 退出码 {:?}，stderr：{}",
+            output.status.code(),
+            stderr_of(output)
+        );
+        assert!(
+            stdout_of(output).contains("并发答"),
+            "{name} 应打印答案：{}",
+            stdout_of(output)
+        );
+        assert!(
+            !stderr_of(output).contains("已归档"),
+            "{name} 不得把建库误报为归档：{}",
+            stderr_of(output)
+        );
+        assert!(
+            !stderr_of(output).contains("会话正在运行"),
+            "{name} 不应报抢锁失败：{}",
+            stderr_of(output)
+        );
+    }
+    assert!(
+        !state.requests.lock().unwrap().is_empty(),
+        "至少应发起一次模型请求"
+    );
+}
+
+/// C2：generation 0→1 建库期间 follower 不退出；真归档才退出。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_survives_first_database_creation() {
+    let (addr, _state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    assert!(!db.exists(), "前置条件：会话库尚不存在");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let session = yaa_store::Session::new(db.clone());
+    let held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+        .unwrap()
+        .expect("测试进程应能先持锁");
+
+    let mut child = env
+        .command()
+        .arg("你好")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_inbox(&env, yaa_store::InboxPhase::Pending, 1);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "建库前 follower 不应退出：{:?}",
+        child.try_wait().unwrap()
+    );
+
+    // 首次建库：generation 0 → 1。旧实现会在此误判为「会话已归档」。
+    seed(&db, &[yaa_msg::Record::system("init", "", None, None)]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "建库后 follower 不应退出：{:?}",
+        child.try_wait().unwrap()
+    );
+
+    // 真正的归档（generation 1 → 2）才退出。
+    bump_generation(&db);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("停止跟随"),
+        "真归档应提示停止跟随：{}",
+        stderr_of(&output)
+    );
+    drop(held);
+}
+
+/// C3（烟雾）：`--clear` 与 run 发布竞态。
+///
+/// 主证据在 store 单测：`captured_generation_archived_before_publish_is_rejected`
+/// （捕获 generation → 归档 → 发布被拒且不落盘）、
+/// `publish_with_generation_waits_for_clear_exclusive_lock`（SH/EX 互斥），
+/// 以及 e2e `clear_conserves_records_while_slow_notify_command_runs`（长窗口真归档）。
+/// run 的 SH 临界区极短，e2e 无法稳定卡在中途，故这里只验证两种线性化结果自洽：
+/// clear 成功 ⇒ run 被拒绝且 own 不滞留；clear 拒绝 ⇒ run 正常落库并回答。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clear_and_publish_race_leaves_no_stranded_own() {
+    let (addr, _state) = start_server(vec![
+        text_response("竞态答"),
+        text_response("竞态答"),
+        text_response("竞态答"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    seed(
+        &db,
+        &[
+            yaa_msg::Record::user("既有"),
+            yaa_msg::Record::ai("m", "h", "旧答", None),
+        ],
+    );
+    let session = yaa_store::Session::new(db.clone());
+
+    // 先冻结发布临界区：run 会阻塞在 clear.lock SH；clear 随后拿到 runner.lock 并阻塞在 EX。
+    let held_clear = yaa_store::FileLock::exclusive(&session.clear_lock_path()).unwrap();
+    let run = env
+        .command()
+        .arg("竞态问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let clear = env
+        .command()
+        .arg("--clear")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    drop(held_clear);
+
+    let run_out = run.wait_with_output().unwrap();
+    let clear_out = clear.wait_with_output().unwrap();
+    let clear_code = clear_out.status.code();
+    assert!(
+        matches!(clear_code, Some(0 | 1)),
+        "clear 只能成功或拒绝：{:?} / {}",
+        clear_code,
+        stderr_of(&clear_out)
+    );
+
+    let current_has_own = yaa_store::load(&session)
+        .unwrap()
+        .iter()
+        .any(|record| matches!(record, yaa_msg::Record::User(user) if user.content == "竞态问"));
+    match clear_code {
+        // clear 抢在发布前归档：run 的发布被 generation 守卫拒绝，不得误判为成功。
+        Some(0) => {
+            assert_eq!(
+                run_out.status.code(),
+                Some(1),
+                "归档后 run 应失败：stdout={} stderr={}",
+                stdout_of(&run_out),
+                stderr_of(&run_out)
+            );
+            assert!(
+                stderr_of(&run_out).contains("已归档"),
+                "run 应报告会话已归档：{}",
+                stderr_of(&run_out)
+            );
+            assert!(!current_has_own, "被拒绝的 own 不得出现在新库");
+        }
+        // clear 看到 own 已发布而拒绝：run 之后接管并完成本轮。
+        Some(1) => {
+            assert_eq!(
+                run_out.status.code(),
+                Some(0),
+                "clear 拒绝后 run 应成功：stderr={}",
+                stderr_of(&run_out)
+            );
+            assert!(
+                stdout_of(&run_out).contains("竞态答"),
+                "run 应得到答案：{}",
+                stdout_of(&run_out)
+            );
+            assert!(
+                !stderr_of(&run_out).contains("已归档"),
+                "run 不得在发布竞态中误报归档：{}",
+                stderr_of(&run_out)
+            );
+            assert!(current_has_own, "own 必须落库");
+        }
+        _ => unreachable!(),
+    }
+    assert_eq!(
+        yaa_store::count_inbox(&session, yaa_store::InboxPhase::Pending).unwrap(),
+        0,
+        "own 不得滞留在 inbox（两种线性化结果皆然）"
+    );
+}
+
+/// C4：最终模型调用期间到达的 notify 必须在本次 run 内消费（纯文本响应也要续跑）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_during_final_model_call_is_consumed_in_same_run() {
+    let (addr, state) = start_server(vec![text_response("初答"), text_response("通知后答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let mut notify = env.command();
+    notify
+        .args(["--notify=模型期间", "--", "printf", "INJECT"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    *state.before_response.lock().unwrap() = Some(notify);
+
+    let output = env.run(&["问题"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    let records = read_events(&env.session_db());
+    assert!(
+        records.iter().any(|record| {
+            record["type"] == "system"
+                && record["source"] == "notify"
+                && record["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("INJECT"))
+        }),
+        "notify 应在本 run 内落库：{records:?}"
+    );
+    assert_eq!(
+        state.requests.lock().unwrap().len(),
+        2,
+        "最终回复后应因新 notify 再调用一次模型"
+    );
+    let requests = state.requests.lock().unwrap();
+    assert!(
+        requests[1]["messages"]
+            .as_array()
+            .is_some_and(|messages| messages.iter().any(|message| message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("INJECT")))),
+        "第二次请求应包含注入正文：{}",
+        requests[1]
+    );
+    assert_eq!(
+        yaa_store::count_inbox(
+            &yaa_store::Session::new(env.session_db()),
+            yaa_store::InboxPhase::Pending
+        )
+        .unwrap(),
+        0,
+        "notify 应已消费"
+    );
+}
+
+/// C5：纯 follower（own 已落库）接管时只有 notify：不作废旧待批，提示 `--approve` 并继续等待。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn notify_only_takeover_keeps_pending_approval() {
+    let (addr, _state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    seed(
+        &db,
+        &[
+            yaa_msg::Record::user("甲问"),
+            yaa_msg::Record::ai("m", "h", "想跑命令", None),
+            yaa_msg::Record::tool_call(yaa_msg::ToolOrigin::Ai, "c1", "echo hi", None),
+            yaa_msg::Record::approval_pending("c1", "echo hi", "echo *"),
+        ],
+    );
+    let session = yaa_store::Session::new(db.clone());
+    let held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+        .unwrap()
+        .expect("测试进程应能先持锁");
+
+    let mut follower = env
+        .command()
+        .arg("乙问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for_inbox(&env, yaa_store::InboxPhase::Pending, 1);
+    // 模拟 leader 已消费 follower 的 own（落库并删除 inbox 文件）。
+    consume_pending_user(&db);
+
+    let notify = env.run(&["--notify=提醒", "--", "printf", "R"]);
+    assert!(
+        notify.status.success(),
+        "notify 失败：{}",
+        stderr_of(&notify)
+    );
+    drop(held);
+
+    std::thread::sleep(std::time::Duration::from_millis(900));
+    assert!(
+        follower.try_wait().unwrap().is_none(),
+        "纯 follower 不应接管退出：{:?}",
+        follower.try_wait().unwrap()
+    );
+
+    follower.kill().expect("结束 follower");
+    let output = follower.wait_with_output().unwrap();
+    assert!(
+        stderr_of(&output).contains("--approve"),
+        "应提示运行 --approve：{}",
+        stderr_of(&output)
+    );
+
+    let records = yaa_store::load(&session).unwrap();
+    assert!(
+        !records.iter().any(|record| matches!(
+            record,
+            yaa_msg::Record::ApprovalResolved(resolved) if resolved.call_id == "c1"
+        )),
+        "不得替用户作废旧待批：{records:?}"
+    );
+    assert!(
+        yaa_store::count_inbox(&session, yaa_store::InboxPhase::Pending).unwrap() >= 1,
+        "notify 应留在 inbox（未接管）"
+    );
+}
+
+/// C6：follower 从 `tool_call` 之后启动，前缀回填命令表后仍能展示 `approval_resolved` 的命令。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_backfills_command_for_later_approval_resolution() {
+    let (addr, _state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    seed(
+        &db,
+        &[
+            yaa_msg::Record::user("甲问"),
+            yaa_msg::Record::ai("m", "h", "想跑命令", None),
+            yaa_msg::Record::tool_call(yaa_msg::ToolOrigin::Ai, "c1", "echo hi", None),
+        ],
+    );
+    let session = yaa_store::Session::new(db.clone());
+    let held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+        .unwrap()
+        .expect("测试进程应能先持锁");
+
+    let child = env
+        .command()
+        .arg("乙问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(350));
+
+    // 在 follower 启动水位之后落一条审批决策；命令来自更早的 tool_call。
+    yaa_store::append(
+        &session,
+        &[yaa_msg::Record::approval_resolved(
+            "c1",
+            yaa_msg::ApprovalDecision::Approve,
+        )],
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(600));
+
+    bump_generation(&db);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("已批准"), "stderr：{stderr}");
+    assert!(
+        stderr.contains("% echo hi"),
+        "审批决策应带回前缀中的命令：{stderr}"
+    );
+    drop(held);
+}
+
+/// C7：`max_steps=1` 时工具执行期注入 User → 新 User 被处理，不提前 MaxSteps。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn user_injected_during_tool_execution_resets_max_steps() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_slow", "sleep 1", None, None),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(SINGLE_STEP_CONFIG);
+    let db = env.session_db();
+    let session = yaa_store::Session::new(db.clone());
+
+    let leader = env
+        .command()
+        .arg("甲问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_until(
+        || {
+            yaa_store::load(&session).is_ok_and(|records| {
+                records.iter().any(|record| {
+                    matches!(record, yaa_msg::Record::ToolCall(call) if call.call_id == "call_slow")
+                })
+            })
+        },
+        "leader 的 tool_call 落盘",
+    );
+    let follower = env
+        .command()
+        .arg("乙问")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let leader_out = leader.wait_with_output().unwrap();
+    let follower_out = follower.wait_with_output().unwrap();
+    assert_eq!(
+        leader_out.status.code(),
+        Some(0),
+        "工具期间注入的 User 应重置步数预算，而不是 MaxSteps：{}",
+        stderr_of(&leader_out)
+    );
+    assert!(
+        !stderr_of(&leader_out).contains("达到最大步数"),
+        "stderr：{}",
+        stderr_of(&leader_out)
+    );
+    assert!(
+        stdout_of(&leader_out).contains("完成"),
+        "leader 应产出答案：{}",
+        stdout_of(&leader_out)
+    );
+    assert_eq!(
+        follower_out.status.code(),
+        Some(0),
+        "follower 失败：{}",
+        stderr_of(&follower_out)
+    );
+
+    let records = yaa_store::load(&session).unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record, yaa_msg::Record::User(user) if user.content == "乙问")),
+        "注入的 User 应落库：{records:?}"
+    );
+}
+
+/// C8：`a.db` 与 `a.sqlite` 的 runner.lock 互不阻塞。
+#[test]
+fn explicit_db_and_sqlite_runner_locks_are_independent() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = yaa_store::Session::new(dir.path().join("a.db"));
+    let second = yaa_store::Session::new(dir.path().join("a.sqlite"));
+    assert_ne!(first.runner_lock_path(), second.runner_lock_path());
+
+    let held = yaa_store::FileLock::try_exclusive(&first.runner_lock_path())
+        .unwrap()
+        .expect("应能先持有 a.db 的 runner.lock");
+    let other = yaa_store::FileLock::try_exclusive(&second.runner_lock_path()).unwrap();
+    assert!(other.is_some(), "a.sqlite 的 runner.lock 不应被 a.db 阻塞");
+    drop(held);
+}
+
+/// C9：`--status` 只读计数，malformed inbox 文件不得被移入 rejected/。
+#[test]
+fn status_does_not_reject_malformed_inbox_file() {
+    let env = TestEnv::new(0);
+    let pending = env.inbox_root().join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let malformed = pending.join("broken.json");
+    std::fs::write(&malformed, b"{ not json").unwrap();
+
+    let output = env.run(&["--status"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("待处理消息：1 条"),
+        "stdout：{}",
+        stdout_of(&output)
+    );
+    assert!(malformed.exists(), "status 不得移动 malformed 文件");
+    assert!(
+        !env.inbox_root().join("rejected").exists(),
+        "status 不得创建 rejected/"
+    );
+}
+
+/// C9b：`--clear` 遇 malformed inbox 文件也必须拒绝归档，且不移动文件、不创建 rejected。
+#[test]
+fn clear_refuses_malformed_inbox_file_without_side_effects() {
+    let env = TestEnv::new(0);
+    // 先让 session.db 存在，否则会走「库不存在」分支而非持锁后的检查。
+    seed(&env.session_db(), &[yaa_msg::Record::user("已有记录")]);
+    let pending = env.inbox_root().join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let malformed = pending.join("broken.json");
+    std::fs::write(&malformed, b"{ not json").unwrap();
+
+    let output = env.run(&["--clear"]);
+    assert_ne!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("待处理消息"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(malformed.exists(), "clear 不得移动 malformed 文件");
+    assert!(
+        !env.inbox_root().join("rejected").exists(),
+        "clear 不得创建 rejected/"
+    );
+    let history = env.data_home.join("history");
+    assert!(
+        !history.exists() || std::fs::read_dir(&history).unwrap().next().is_none(),
+        "拒绝归档时不得产生 history/"
+    );
+}
+
+/// 等待 `inbox` 指定 phase 的 `.json` 文件数达到 `expected`。
+fn wait_for_inbox(env: &TestEnv, phase: yaa_store::InboxPhase, expected: usize) {
+    let session = yaa_store::Session::new(env.session_db());
+    wait_until(
+        || yaa_store::count_inbox(&session, phase).is_ok_and(|count| count >= expected),
+        "inbox 消息发布",
+    );
+}
+
+/// 把 inbox 中唯一一条 `User` 记录落库并删除文件（模拟 leader 已消费 own）。
+fn consume_pending_user(db: &Path) {
+    let session = yaa_store::Session::new(db);
+    let messages = yaa_store::scan_inbox(&session, yaa_store::InboxPhase::Pending).unwrap();
+    let own = messages
+        .into_iter()
+        .find(|message| matches!(message.record, yaa_msg::Record::User(_)))
+        .expect("pending 中应有 own user");
+    yaa_store::append(&session, std::slice::from_ref(&own.record)).unwrap();
+    yaa_store::remove_inbox(&own).unwrap();
+}
+
+/// 轮询等待条件成立，超时则失败。
+fn wait_until(mut condition: impl FnMut() -> bool, description: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待超时：{description}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// 把默认会话的 `generation` 加一（构造归档，让 follower 检测到并退出）。
+fn bump_generation(db: &Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.execute(
+        "UPDATE session SET generation = generation + 1 WHERE id = 1",
+        [],
+    )
+    .unwrap();
 }
