@@ -67,6 +67,9 @@ impl ExitCode {
 /// 普通 run 作废旧待批时补写的失败 `tool_result` 文案。
 const ABANDONED_RESULT: &str = "上一轮待批命令已随新提示词作废，未执行。";
 
+/// 崩溃恢复时为无结果的 `tool_call` 补写的中断文案。
+const INTERRUPTED_RESULT: &str = "runner interrupted";
+
 /// 模型抽象。
 ///
 /// 阶段 1 只需要一次「请求→回复」，不引入流式与重试抽象（重试在 [`llm::chat`] 内），
@@ -124,9 +127,7 @@ impl compaction::Summarizer for OpenAiModel {
         messages: &'a [ChatMessage],
         max_tokens: u32,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send + 'a>> {
-        Box::pin(async move {
-            llm::summarize(&self.client, &self.cfg, messages, max_tokens).await
-        })
+        Box::pin(async move { llm::summarize(&self.client, &self.cfg, messages, max_tokens).await })
     }
 }
 
@@ -166,11 +167,18 @@ impl Runner<'_> {
         //    只要历史里没有 `system(source=init)` 记录（含 `--notify` 先行写入的场景），
         //    就执行一次 `init`；因此上轮 init 失败的会话下次运行会自动重试。
         let existing = yaa_store::load(&self.session)?;
+        // 归档库不可写入：必须在 init/作废/恢复/写 user 及执行任何命令之前拒绝。
+        if self.reject_archived()? {
+            return Ok(ExitCode::Error);
+        }
         let mut watermark = existing.len();
 
         // 2. 新提示词视为放弃旧待批：先把未决 pending 补成 resolved: deny 与失败结果，
         //    再走正常流程（D45）。必须发生在 user 落盘之前，使作废记录先于新问题。
         self.abandon_old_pending(&mut watermark).await?;
+        // 2b. 崩溃恢复：补写无结果的 `tool_call`（D-S10）。在作废旧待批之后执行，
+        //     使未决 pending 仍保留「已作废」文案而非被误判为运行中断。
+        self.recover_orphan_tool_calls(&mut watermark).await?;
 
         let initialized = existing
             .iter()
@@ -216,6 +224,14 @@ impl Runner<'_> {
         // 1. 先取最旧未决 pending；没有则提示并成功返回。此路径**不解析 llm 钩子**，
         //    否则钩子损坏时用户连「没有待批准」都看不到。
         let records = yaa_store::load(&self.session)?;
+        // 归档库不可写入：必须在恢复补写、执行 pending 命令之前拒绝。
+        if self.reject_archived()? {
+            return Ok(ExitCode::Error);
+        }
+        // 1b. `--approve` 也做崩溃恢复，但只补真正的孤儿 `tool_call`；未决 pending
+        //     不在此作废（本次就要放行最旧一条）。
+        let mut watermark = records.len();
+        self.recover_orphan_tool_calls(&mut watermark).await?;
         let unresolved = unresolved_pending(&records);
         let Some((pending_index, pending)) = unresolved.into_iter().next() else {
             self.sink
@@ -231,10 +247,9 @@ impl Runner<'_> {
         };
         let model = make_model(llm_config);
 
-        // 3. 水位取「执行前的记录总数」：本轮只展示新追加的 `tool_result` 与
+        // 3. 水位已在恢复后取定：本轮只展示新追加的 `tool_result` 与
         //    `approval_resolved`，不重放历史（多个 pending 时不会牵连展示其余待批）。
         //    被放行的 pending 单独补显一次，让用户知道这次放行的是哪条。
-        let watermark = records.len();
         // 前缀 + 起点 = 只投影该条 pending；命令表仍基于全量前缀（对本条非必需，
         // 但与 `emit_new` 的全量记录约定保持一致）。
         self.emit_items(&records[..=pending_index], pending_index);
@@ -294,7 +309,9 @@ impl Runner<'_> {
 
         for _ in 0..self.config.agent.max_steps {
             let records = yaa_store::load(&self.session)?;
-            let plan = self.plan_messages(&records, model, &mut compaction_state).await;
+            let plan = self
+                .plan_messages(&records, model, &mut compaction_state)
+                .await;
 
             // 先展示自上次以来新增的记录（注入、用户、工具批次），再推进水位。
             self.emit_new(&records, &mut watermark);
@@ -597,6 +614,40 @@ impl Runner<'_> {
         Ok(())
     }
 
+    /// 归档库拒绝写入：返回 `true` 表示已上报错误、调用方应立即以退出码 1 结束。
+    ///
+    /// 只在产生任何副作用（init、作废旧 pending、崩溃恢复、写 user、执行命令）之前调用。
+    fn reject_archived(&self) -> anyhow::Result<bool> {
+        if yaa_store::is_archived(&self.session)? {
+            self.sink.emit(DisplayItem::Error(format!(
+                "错误：会话已归档，不可写入：{}",
+                self.session.db.display()
+            )));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// 崩溃恢复：为 `origin=ai` 且无 `tool_result` 的工具调用补写中断结果。
+    ///
+    /// 未决 `approval_pending` 不在此处理：普通 run 已由 [`Runner::abandon_old_pending`]
+    /// 先作废，`--approve` 则要把最旧一条留给本次放行。已有结果或未决 pending 的
+    /// `call_id` 一律跳过，因此重复运行是幂等的。
+    async fn recover_orphan_tool_calls(&self, watermark: &mut usize) -> anyhow::Result<()> {
+        let records = yaa_store::load(&self.session)?;
+        let orphan_calls = orphan_tool_calls(&records);
+        if orphan_calls.is_empty() {
+            return Ok(());
+        }
+        let batch: Vec<Record> = orphan_calls
+            .iter()
+            .map(|call_id| {
+                Record::tool_result(call_id, "", INTERRUPTED_RESULT, -1, false, false, None)
+            })
+            .collect();
+        self.append_and_emit(&batch, watermark).await
+    }
+
     /// 工作目录无法规范化时的统一告警。
     fn warn_cwd(&self) {
         if self.cwd_warned {
@@ -734,10 +785,10 @@ impl Runner<'_> {
     }
 }
 
-/// 会话 JSONL 的绝对路径；`absolute` 失败时退回原路径。
+/// 会话数据库的绝对路径；`absolute` 失败时退回原路径。
 fn session_path(session: &yaa_store::Session) -> String {
-    std::path::absolute(&session.file)
-        .unwrap_or_else(|_| session.file.clone())
+    std::path::absolute(&session.db)
+        .unwrap_or_else(|_| session.db.clone())
         .to_string_lossy()
         .into_owned()
 }
@@ -769,6 +820,36 @@ fn unresolved_pending(records: &[Record]) -> Vec<(usize, Pending)> {
                         command: pending.command.clone(),
                     },
                 ))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// 无对应 `tool_result` 且不属于未决待批的 `origin=ai` 工具调用 `call_id`。
+///
+/// 保持记录顺序，供崩溃恢复按原批次补写中断结果。
+fn orphan_tool_calls(records: &[Record]) -> Vec<String> {
+    let results: HashSet<&str> = records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolResult(result) => Some(result.call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let pending: HashSet<String> = unresolved_pending(records)
+        .into_iter()
+        .map(|(_, pending)| pending.call_id)
+        .collect();
+    records
+        .iter()
+        .filter_map(|record| match record {
+            Record::ToolCall(call)
+                if call.origin == ToolOrigin::Ai
+                    && !results.contains(call.call_id.as_str())
+                    && !pending.contains(call.call_id.as_str()) =>
+            {
+                Some(call.call_id.clone())
             }
             _ => None,
         })
@@ -1304,7 +1385,7 @@ mod tests {
             .unwrap();
 
         let written = std::fs::read_to_string(harness.config_root.join("session.txt")).unwrap();
-        let expected = std::path::absolute(&harness.session.file)
+        let expected = std::path::absolute(&harness.session.db)
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -1312,13 +1393,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notify_record_is_displayed_as_injection() {
-        // 让 init 钩子经 `$YAA_SESSION` 直接追加一条 notify 记录，验证增量展示。
-        // 会话目录此时尚未物化，先建目录（真实路径由 `yaa --notify` 的 store 负责）。
-        let harness = Harness::new(test_config(
-            r#"mkdir -p "$(dirname "$YAA_SESSION")" && printf '%s\n' '{"type":"system","id":"01JNOTIFY","ts":1,"source":"notify","command":"echo hi","content":"<注释>\n内容\n</注释>"}' >> "$YAA_SESSION""#,
-        ));
-        let sink = RecordingSink::default();
+    async fn notify_record_is_projected_as_injection() {
+        // 预置一条通知，验证它进入模型上下文时保留命令前缀与信封。
+        // （真实 `yaa --notify` 的落盘路径由 yaa-cli 的 e2e 覆盖。）
+        let harness = Harness::new(test_config("true"));
+        yaa_store::append(
+            &harness.session,
+            &[Record::system(
+                "notify",
+                "<注释>\n内容\n</注释>",
+                Some("echo hi".to_string()),
+                None,
+            )],
+        )
+        .unwrap();
+        let sink = NullSink;
         let model = FakeModel::new(vec![text_response("好")]);
 
         harness
@@ -1327,21 +1416,20 @@ mod tests {
             .await
             .unwrap();
 
-        let items = sink.items();
-        let injections: Vec<_> = items
+        let seen = model.seen();
+        let first = seen.first().expect("应发起一次模型请求");
+        let projected = first
             .iter()
-            .filter_map(|item| match item {
-                DisplayItem::Injection {
-                    comment,
-                    command,
-                    content,
-                } => Some((comment.as_str(), command.as_deref(), content.as_str())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            injections,
-            vec![("注释", Some("echo hi"), "<注释>\n内容\n</注释>")]
+            .find(|message| message.role == "system")
+            .and_then(|message| message.content.as_deref())
+            .expect("应投影 system 消息");
+        assert!(
+            projected.contains("[执行命令] echo hi"),
+            "通知应带命令前缀：{projected}"
+        );
+        assert!(
+            projected.contains("<注释>\n内容\n</注释>"),
+            "通知信封应保留：{projected}"
         );
     }
 
@@ -2056,6 +2144,175 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, Record::ToolResult(_) | Record::ApprovalResolved(_))),
             "不得补 tool_result / approval_resolved"
+        );
+    }
+
+    /// D-S10：普通 run 启动时为无结果的 `origin=ai` 工具调用补写中断结果。
+    #[tokio::test]
+    async fn run_recovers_orphan_tool_call_with_interrupted_result() {
+        let harness = Harness::new(test_config("true"));
+        let sink = NullSink;
+        yaa_store::append(
+            &harness.session,
+            &[
+                Record::user("旧问"),
+                Record::ai("fake-model", "h", "", None),
+                Record::tool_call(ToolOrigin::Ai, "orphan", "sleep 1", None),
+            ],
+        )
+        .unwrap();
+
+        let model = FakeModel::new(vec![text_response("新答")]);
+        let exit = harness
+            .runner(&sink)
+            .run("新问", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success);
+
+        let records = harness.records();
+        let result = records
+            .iter()
+            .find_map(|record| match record {
+                Record::ToolResult(result) if result.call_id == "orphan" => Some(result),
+                _ => None,
+            })
+            .expect("应补一条中断结果");
+        assert_eq!(result.code, -1);
+        assert!(result.stderr.contains("interrupted"), "{result:?}");
+        assert!(result.stdout.is_empty());
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, Record::ToolResult(r) if r.call_id == "orphan"))
+                .count(),
+            1,
+            "重复运行不得重复补写"
+        );
+    }
+
+    /// D-S10：`--approve` 只补孤儿调用，未决 pending 留给本次放行、不得被中断结果顶替。
+    #[tokio::test]
+    async fn approve_recovers_only_orphans_and_keeps_pending() {
+        let harness = Harness::new(approval_config("echo *", Action::Ask));
+        let sink = NullSink;
+        yaa_store::append(
+            &harness.session,
+            &[
+                Record::user("旧问"),
+                Record::ai("fake-model", "h", "", None),
+                Record::tool_call(ToolOrigin::Ai, "orphan", "sleep 1", None),
+                Record::tool_call(ToolOrigin::Ai, "call_1", "echo hi", None),
+                Record::approval_pending("call_1", "echo hi", "echo *"),
+            ],
+        )
+        .unwrap();
+
+        let model = FakeModel::new(vec![text_response("完成")]);
+        let exit = harness
+            .runner(&sink)
+            .approve_pending(|_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Success);
+
+        let records = harness.records();
+        let orphan = records
+            .iter()
+            .find_map(|record| match record {
+                Record::ToolResult(result) if result.call_id == "orphan" => Some(result),
+                _ => None,
+            })
+            .expect("孤儿调用应补中断结果");
+        assert_eq!(orphan.code, -1);
+        let approved = records
+            .iter()
+            .find_map(|record| match record {
+                Record::ToolResult(result) if result.call_id == "call_1" => Some(result),
+                _ => None,
+            })
+            .expect("待批命令应被真正执行");
+        assert_eq!(approved.stdout, "hi\n");
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record, Record::ToolResult(r) if r.call_id == "call_1"))
+                .count(),
+            1,
+            "未决 pending 不得被中断结果顶替"
+        );
+    }
+
+    /// S3：归档库上的 `run` 在写 user / 执行 init 前拒绝，退出码 1。
+    #[tokio::test]
+    async fn run_on_archived_session_is_rejected_without_writes() {
+        let harness = Harness::new(test_config("true"));
+        let sink = RecordingSink::default();
+        yaa_store::append(&harness.session, &[Record::user("既有")]).unwrap();
+        yaa_store::set_archived(&harness.session).unwrap();
+        let before = harness.records();
+
+        let model = FakeModel::new(vec![text_response("不应调用")]);
+        let exit = harness
+            .runner(&sink)
+            .run("新问", |_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Error);
+        assert_eq!(harness.records(), before, "归档库不得新增记录");
+        assert!(model.seen().is_empty(), "归档库不得调用模型");
+        assert!(
+            sink.items().iter().any(|item| matches!(
+                item,
+                DisplayItem::Error(text) if text.contains("已归档")
+            )),
+            "应上报已归档错误：{:?}",
+            sink.items()
+        );
+    }
+
+    /// S3：归档库上的 `--approve` 不执行 pending 命令，退出码 1。
+    #[tokio::test]
+    async fn approve_on_archived_session_does_not_execute() {
+        let harness = Harness::new(approval_config("touch *", Action::Ask));
+        let sink = RecordingSink::default();
+        let marker = harness.cwd.join("marker");
+        yaa_store::append(
+            &harness.session,
+            &[
+                Record::tool_call(
+                    ToolOrigin::Ai,
+                    "call_1",
+                    format!("touch {}", marker.display()),
+                    None,
+                ),
+                Record::approval_pending(
+                    "call_1",
+                    format!("touch {}", marker.display()),
+                    "touch *",
+                ),
+            ],
+        )
+        .unwrap();
+        yaa_store::set_archived(&harness.session).unwrap();
+        let before = harness.records();
+
+        let model = FakeModel::new(vec![text_response("不应调用")]);
+        let exit = harness
+            .runner(&sink)
+            .approve_pending(|_config| model.clone())
+            .await
+            .unwrap();
+        assert_eq!(exit, ExitCode::Error);
+        assert_eq!(harness.records(), before, "归档库不得新增记录");
+        assert!(!marker.exists(), "归档库不得执行 pending 命令");
+        assert!(
+            sink.items().iter().any(|item| matches!(
+                item,
+                DisplayItem::Error(text) if text.contains("已归档")
+            )),
+            "应上报已归档错误：{:?}",
+            sink.items()
         );
     }
 }

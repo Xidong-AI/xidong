@@ -4,7 +4,7 @@
 //! 独立的临时 `YAA_CONFIG_HOME`/`YAA_DATA_HOME` 运行**真实二进制**
 //! （`CARGO_BIN_EXE_yaa`）。绝不读写真实 `$HOME`、绝不访问网络。
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -332,30 +332,51 @@ impl TestEnv {
         child.wait_with_output().unwrap()
     }
 
-    /// 默认会话文件 `<data>/sessions/<sid>/default.jsonl`。
+    /// 默认会话数据库 `<data>/sessions/<sid>/session.db`。
     ///
     /// `sid` 由规范化工作目录的 sha256 前 32 位十六进制决定，与 core 算法一致。
-    fn session_file(&self) -> PathBuf {
+    fn session_db(&self) -> PathBuf {
         let canon = self.work.canonicalize().unwrap();
         let mut hasher = Sha256::new();
         hasher.update(canon.as_os_str().as_encoded_bytes());
         let digest = format!("{:x}", hasher.finalize());
         let sid = &digest[..32];
-        self.data_home
-            .join("sessions")
-            .join(sid)
-            .join("default.jsonl")
+        self.data_home.join("sessions").join(sid).join("session.db")
     }
 }
 
-/// 读取 JSONL 为 JSON 值列表。
-fn read_jsonl(path: &Path) -> Vec<Value> {
-    std::fs::read_to_string(path)
+/// 读取会话数据库的全部记录，转为 JSON 值列表（断言结构保持与旧 JSONL 一致）。
+fn read_events(db: &Path) -> Vec<Value> {
+    let session = yaa_store::Session::new(db);
+    yaa_store::load(&session)
         .unwrap()
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).unwrap())
+        .iter()
+        .map(|record| serde_json::to_value(record).unwrap())
         .collect()
+}
+
+/// 用 store API 预置历史记录。
+fn seed(db: &Path, records: &[yaa_msg::Record]) {
+    let session = yaa_store::Session::new(db);
+    yaa_store::append(&session, records).unwrap();
+}
+
+/// 数据库 `PRAGMA integrity_check` 是否为 `ok`；库不存在返回 false。
+fn integrity_ok(db: &Path) -> bool {
+    let Ok(conn) = rusqlite::Connection::open(db) else {
+        return false;
+    };
+    conn.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+        .is_ok_and(|result| result == "ok")
+}
+
+/// 会话数据库的全部 payload 文本（用于敏感信息/原始内容断言）。
+fn payload_text(db: &Path) -> String {
+    read_events(db)
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -445,8 +466,8 @@ async fn empty_session_runs_default_init_and_displays_once() {
         stdout_of(&output)
     );
 
-    let session = env.session_file();
-    let records = read_jsonl(&session);
+    let session = env.session_db();
+    let records = read_events(&session);
     let labels: Vec<&str> = records
         .iter()
         .map(|r| r["type"].as_str().unwrap())
@@ -491,10 +512,8 @@ async fn empty_session_runs_default_init_and_displays_once() {
         "请求体不得含 api_key"
     );
     assert!(
-        !std::fs::read_to_string(&session)
-            .unwrap()
-            .contains("sk-secret"),
-        "JSONL 不得含 api_key"
+        !payload_text(&session).contains("sk-secret"),
+        "会话记录不得含 api_key"
     );
 
     // 第二次：不重跑 init、不再展示注入块。
@@ -507,7 +526,7 @@ async fn empty_session_runs_default_init_and_displays_once() {
     );
     assert!(stdout_of(&second).contains("第二答"));
 
-    let records = read_jsonl(&session);
+    let records = read_events(&session);
     assert_eq!(count_source(&records, "notify"), 3, "不应新增 notify 记录");
     assert_eq!(count_source(&records, "init"), 1, "init 簿记只应有一条");
 
@@ -584,7 +603,7 @@ async fn tool_loop_persists_call_result_and_finishes() {
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
     assert!(stdout_of(&output).contains("完成"));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let labels: Vec<&str> = records
         .iter()
         .map(|r| r["type"].as_str().unwrap())
@@ -634,10 +653,10 @@ async fn tool_loop_persists_call_result_and_finishes() {
     );
 }
 
-/// 验收 5：`--clear` 归档 JSONL 到 `history/<sid>/sessions-<ts>.jsonl`，`outputs/`
-/// 留在原地，归档记录中的相对路径仍有效。
+/// 验收 5：`--clear` 归档数据库到 `history/<sid>/sessions-<ts>.db`，清空主库并递增
+/// generation；`outputs/` 留在原地，归档记录中的相对路径仍有效。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn clear_archives_jsonl_and_keeps_outputs_resolvable() {
+async fn clear_archives_database_and_keeps_outputs_resolvable() {
     let (addr, _state) = start_server(vec![
         tool_call_response("call_big", "seq 1 200", None, None),
         text_response("完成"),
@@ -649,8 +668,9 @@ async fn clear_archives_jsonl_and_keeps_outputs_resolvable() {
     let output = env.run(&["你好"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let session = env.session_file();
-    let records = read_jsonl(&session);
+    let session = env.session_db();
+    let session_handle = yaa_store::Session::new(session.clone());
+    let records = read_events(&session);
     let result = records
         .iter()
         .find(|record| record["type"] == "tool_result")
@@ -663,10 +683,13 @@ async fn clear_archives_jsonl_and_keeps_outputs_resolvable() {
     assert!(!relative.starts_with('/'), "数据根内应为相对路径");
     let full = env.data_home.join(&relative);
     assert!(full.exists(), "完整输出文件应存在：{}", full.display());
+    assert_eq!(yaa_store::generation(&session_handle).unwrap(), 1);
 
     let cleared = env.run(&["--clear"]);
     assert!(cleared.status.success(), "stderr：{}", stderr_of(&cleared));
-    assert!(!session.exists(), "default.jsonl 应已归档");
+    assert!(session.exists(), "主库不删除，只清空事件");
+    assert!(read_events(&session).is_empty(), "主库 events 应清空");
+    assert_eq!(yaa_store::generation(&session_handle).unwrap(), 2);
     assert!(full.exists(), "outputs/ 不移动，相对路径仍有效");
 
     let history = env.data_home.join("history");
@@ -683,9 +706,17 @@ async fn clear_archives_jsonl_and_keeps_outputs_resolvable() {
             }
         }
     }
-    assert!(archived.is_some(), "history 下应有 sessions-<ts>.jsonl");
+    let archived = archived.expect("history 下应有 sessions-<ts>.db");
+    assert_eq!(
+        archived.extension().and_then(|ext| ext.to_str()),
+        Some("db")
+    );
+    let archived_session = yaa_store::Session::new(archived.clone());
+    let archived_records = yaa_store::load(&archived_session).unwrap();
+    assert_eq!(archived_records.len(), records.len(), "归档应保留全部记录");
+    assert!(yaa_store::is_archived(&archived_session).unwrap());
     assert!(
-        stdout_of(&cleared).contains(&history.to_string_lossy().to_string()),
+        stdout_of(&cleared).contains(&archived.to_string_lossy().to_string()),
         "stdout 应打印归档路径：{}",
         stdout_of(&cleared)
     );
@@ -705,10 +736,8 @@ async fn api_key_never_leaks_to_requests_jsonl_or_stderr() {
             "stderr 不得含 api_key（{args:?}）"
         );
         assert!(
-            !std::fs::read_to_string(env.session_file())
-                .unwrap()
-                .contains("sk-secret"),
-            "JSONL 不得含 api_key（{args:?}）"
+            !payload_text(&env.session_db()).contains("sk-secret"),
+            "会话记录不得含 api_key（{args:?}）"
         );
         let body = serde_json::to_string(&*state.requests.lock().unwrap()).unwrap();
         assert!(
@@ -747,23 +776,23 @@ fn get_prompt_matches_shell_schema_and_user_is_usage_error() {
     );
 }
 
-/// 验收 8：历史里 `ai` + `tool_call(origin=ai)` 无配对结果时，渲染器合成中断
-/// `tool` 消息，请求体合法。
+/// 验收 8：历史里 `ai` + `tool_call(origin=ai)` 无配对结果时，启动恢复补写中断
+/// `tool_result`，请求体合法。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupted_tool_call_gets_synthetic_tool_message() {
     let (addr, state) = start_server(vec![text_response("继续完成")]).await;
     let env = TestEnv::new(addr.port());
     env.write_config(PLAIN_CONFIG);
 
-    let session = env.session_file();
-    std::fs::create_dir_all(session.parent().unwrap()).unwrap();
-    let lines = [
-        r#"{"type":"user","id":"01JUSER","ts":1,"content":"第一问"}"#,
-        r#"{"type":"ai","id":"01JAI","ts":2,"model":"fake-model","tool_schema_hash":"h","content":""}"#,
-        r#"{"type":"tool_call","id":"01JCALL","ts":3,"origin":"ai","call_id":"orphan","command":"sleep 1"}"#,
-    ]
-    .join("\n");
-    std::fs::write(&session, format!("{lines}\n")).unwrap();
+    let session = env.session_db();
+    seed(
+        &session,
+        &[
+            yaa_msg::Record::user("第一问"),
+            yaa_msg::Record::ai("fake-model", "h", "", None),
+            yaa_msg::Record::tool_call(yaa_msg::ToolOrigin::Ai, "orphan", "sleep 1", None),
+        ],
+    );
 
     let output = env.run(&["继续"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
@@ -786,7 +815,124 @@ async fn interrupted_tool_call_gets_synthetic_tool_message() {
             .as_str()
             .unwrap_or_default()
             .contains("interrupted"),
-        "中断结果应为合成标记：{following}"
+        "中断结果应带 interrupted 标记：{following}"
+    );
+    assert!(
+        read_events(&session)
+            .iter()
+            .any(|record| record["type"] == "tool_result"
+                && record["call_id"] == "orphan"
+                && record["code"] == -1),
+        "中断结果应已持久化"
+    );
+}
+
+/// D-S10：真实进程被 SIGKILL 后，下次启动补写中断 `tool_result` 并继续对话。
+///
+/// 第一次运行在 `sleep 60` 工具执行中被 SIGKILL：`ai` + `tool_call` 已落盘、无结果。
+/// 第二次运行启动恢复应补一条 `code=-1`、`stderr` 含 `interrupted` 的结果，且只补一次。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_after_sigkill_recovers_interrupted_tool_call() {
+    let (addr, state) = start_server(vec![
+        tool_call_response("call_kill", "sleep 60", None, None),
+        text_response("已恢复"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let mut child = env
+        .command()
+        .arg("开始")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    // 轮询等待 `ai` + `tool_call` 落盘（工具随后进入执行）。
+    let session = yaa_store::Session::new(env.session_db());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let has_call = yaa_store::load(&session).is_ok_and(|records| {
+            records
+                .iter()
+                .any(|record| matches!(record, yaa_msg::Record::ToolCall(call) if call.call_id == "call_kill"))
+        });
+        if has_call {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等待 tool_call 落盘超时：{}",
+            session.db.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // 进入工具执行后再强杀，模拟运行中崩溃。
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    child.kill().expect("发送 SIGKILL");
+    child.wait().expect("回收子进程");
+
+    let records = yaa_store::load(&session).unwrap();
+    assert!(
+        records
+            .iter()
+            .any(|record| matches!(record, yaa_msg::Record::ToolCall(call) if call.call_id == "call_kill")),
+        "SIGKILL 前 tool_call 应已落盘：{records:?}"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| matches!(record, yaa_msg::Record::ToolResult(result) if result.call_id == "call_kill")),
+        "SIGKILL 时不应存在 tool_result：{records:?}"
+    );
+
+    let second = env.run(&["继续"]);
+    assert!(
+        second.status.success(),
+        "恢复运行应成功，退出码 {:?}，stderr：{}",
+        second.status.code(),
+        stderr_of(&second)
+    );
+    assert!(
+        stdout_of(&second).contains("已恢复"),
+        "stdout：{}",
+        stdout_of(&second)
+    );
+
+    // 恢复结果恰好一条，内容为中断标记。
+    let records = yaa_store::load(&session).unwrap();
+    let results: Vec<_> = records
+        .iter()
+        .filter_map(|record| match record {
+            yaa_msg::Record::ToolResult(result) if result.call_id == "call_kill" => Some(result),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 1, "恢复应恰好补一条结果：{records:?}");
+    assert_eq!(results[0].code, -1);
+    assert!(
+        results[0].stderr.contains("interrupted"),
+        "中断结果应带 interrupted 标记：{:?}",
+        results[0]
+    );
+
+    // 第二跳请求体合法，且包含该调用的 tool 消息（模型能看到中断）。
+    let requests = state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "应恰好两次模型请求：{requests:?}");
+    let messages = requests[1]["messages"].as_array().unwrap();
+    assert_valid_openai_sequence(messages);
+    let tool_message = messages
+        .iter()
+        .find(|message| message["role"] == "tool" && message["tool_call_id"] == "call_kill")
+        .expect("第二跳应包含中断 tool 消息");
+    assert!(
+        tool_message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("interrupted"),
+        "第二跳 tool 消息应含中断标记：{tool_message:?}"
     );
 }
 
@@ -801,7 +947,7 @@ async fn displayed_injections_match_request_context() {
     let output = env.run(&["--verbose", "你好"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let notifies: Vec<(String, String)> = records
         .iter()
         .filter(|record| record["type"] == "system" && record["source"] == "notify")
@@ -852,10 +998,10 @@ async fn llm_hook_is_never_persisted_or_displayed() {
         let output = env.run(&args);
         assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-        let raw = std::fs::read_to_string(env.session_file()).unwrap();
+        let raw = payload_text(&env.session_db());
         assert!(
             !raw.contains("llm"),
-            "JSONL 不应含 llm 记录（{args:?}）：{raw}"
+            "会话记录不应含 llm 记录（{args:?}）：{raw}"
         );
 
         let stderr = stderr_of(&output);
@@ -879,7 +1025,7 @@ fn notify_command_and_stdin_forms_write_envelopes() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["type"], "system");
     assert_eq!(records[0]["source"], "notify");
@@ -894,7 +1040,7 @@ fn notify_command_and_stdin_forms_write_envelopes() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(records[0]["content"], "<注释>\nhi\n</注释>");
     assert!(
         records[0].get("command").is_none(),
@@ -915,7 +1061,7 @@ fn notify_command_and_stdin_forms_write_envelopes() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(records[0]["content"], "<由用户执行>\nx\n</由用户执行>");
 }
 
@@ -972,7 +1118,7 @@ fn notify_truncates_and_records_output_files() {
         stderr_of(&output)
     );
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(records.len(), 1, "notify 是短路路径，只写一条记录");
     let record = &records[0];
     assert_eq!(record["source"], "notify");
@@ -1020,7 +1166,7 @@ fn notify_timeout_flag_kills_long_command() {
         "应提示超时：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(records[0]["command"], "sleep 30");
 }
 
@@ -1052,7 +1198,7 @@ fn notify_stdin_truncates_and_records_output_files() {
         stderr_of(&output)
     );
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert!(
         records[0].get("command").is_none(),
         "stdin 形态不记 command"
@@ -1105,7 +1251,7 @@ async fn notify_stdin_truncation_is_visible_to_model_with_path() {
         stderr_of(&notify)
     );
 
-    let relative = read_jsonl(&env.session_file())
+    let relative = read_events(&env.session_db())
         .iter()
         .find(|record| record["type"] == "system" && record["source"] == "notify")
         .and_then(|record| record["output_files"]["stdout"].as_str())
@@ -1168,12 +1314,16 @@ fn notify_timeout_flag_overrides_env_and_config() {
 #[test]
 fn status_accepts_system_without_output_files() {
     let env = TestEnv::new(0);
-    let session = env.work.join("s.jsonl");
-    std::fs::write(
+    let session = env.work.join("s.db");
+    seed(
         &session,
-        b"{\"type\":\"system\",\"id\":\"01J\",\"ts\":1,\"source\":\"notify\",\"command\":\"echo hi\",\"content\":\"<x>\\nhi\\n</x>\"}\n",
-    )
-    .unwrap();
+        &[yaa_msg::Record::system(
+            "notify",
+            "<x>\nhi\n</x>",
+            Some("echo hi".to_string()),
+            None,
+        )],
+    );
 
     let output = env.run(&["--status", "--session", session.to_str().unwrap()]);
     assert_eq!(
@@ -1265,12 +1415,7 @@ async fn session_flag_triggers_init_into_given_file() {
     let env = TestEnv::new(addr.port());
     env.write_config(CUSTOM_INIT_CONFIG);
 
-    let session_path = env
-        .data_home
-        .parent()
-        .unwrap()
-        .join("custom")
-        .join("s.jsonl");
+    let session_path = env.data_home.parent().unwrap().join("custom").join("s.db");
     let output = env
         .command()
         .arg("--session")
@@ -1280,7 +1425,7 @@ async fn session_flag_triggers_init_into_given_file() {
         .unwrap();
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let records = read_jsonl(&session_path);
+    let records = read_events(&session_path);
     let labels: Vec<&str> = records
         .iter()
         .map(|r| r["type"].as_str().unwrap())
@@ -1296,9 +1441,9 @@ async fn session_flag_triggers_init_into_given_file() {
     );
 }
 
-/// 验收 15：旧 schema 会话由 `--status` 报明确错误并提示 `--clear`，退出码非零。
+/// 验收 15：旧 JSONL 会话由 `--status` 报明确错误并提示 `--clear`，退出码非零。
 #[test]
-fn status_reports_old_schema_with_clear_hint() {
+fn status_reports_old_jsonl_with_clear_hint() {
     let env = TestEnv::new(0);
     let session_path = env.work.join("old.jsonl");
     std::fs::write(
@@ -1308,12 +1453,94 @@ fn status_reports_old_schema_with_clear_hint() {
     .unwrap();
 
     let output = env.run(&["--status", "--session", session_path.to_str().unwrap()]);
-    assert_ne!(output.status.code(), Some(0), "旧 schema 应报错");
+    assert_ne!(output.status.code(), Some(0), "旧格式应报错");
     let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("旧版 JSONL"),
+        "错误应说明旧版 JSONL：{stderr}"
+    );
     assert!(stderr.contains("--clear"), "错误应提示 --clear：{stderr}");
     assert!(
         !stdout_of(&output).contains("记录："),
         "解析失败不应打印摘要"
+    );
+}
+
+/// M2：默认会话目录里残留旧 `default.jsonl` 且无 `session.db` 时，默认路径明确报错，
+/// 不得静默创建空库绕过旧历史。
+#[test]
+fn default_session_rejects_legacy_default_jsonl() {
+    let env = TestEnv::new(0);
+    let db = env.session_db();
+    let session_dir = db.parent().unwrap();
+    std::fs::create_dir_all(session_dir).unwrap();
+    let legacy = session_dir.join("default.jsonl");
+    std::fs::write(
+        &legacy,
+        b"{\"type\":\"user\",\"id\":\"01J\",\"ts\":1,\"content\":\"x\"}\n",
+    )
+    .unwrap();
+
+    let output = env.run(&["--status"]);
+    assert_ne!(output.status.code(), Some(0), "默认旧历史应报错");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("旧版 JSONL"), "stderr：{stderr}");
+    assert!(stderr.contains("--clear"), "stderr：{stderr}");
+    assert!(
+        stderr.contains(&legacy.to_string_lossy().to_string()),
+        "文案应给出具体 default.jsonl 路径：{stderr}"
+    );
+    assert!(!db.exists(), "报错时不得创建空 session.db");
+}
+
+/// M2：显式目录里残留旧 `default.jsonl` 且无 `session.db` 时，`--status` 同样报错。
+#[test]
+fn explicit_directory_status_rejects_legacy_default_jsonl() {
+    let env = TestEnv::new(0);
+    let dir = env.work.join("custom");
+    std::fs::create_dir_all(&dir).unwrap();
+    let legacy = dir.join("default.jsonl");
+    std::fs::write(
+        &legacy,
+        b"{\"type\":\"user\",\"id\":\"01J\",\"ts\":1,\"content\":\"x\"}\n",
+    )
+    .unwrap();
+
+    let output = env.run(&["--status", "--session", dir.to_str().unwrap()]);
+    assert_ne!(output.status.code(), Some(0), "显式目录旧历史应报错");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("旧版 JSONL"), "stderr：{stderr}");
+    assert!(stderr.contains("--clear"), "stderr：{stderr}");
+    assert!(
+        stderr.contains(&legacy.to_string_lossy().to_string()),
+        "文案应给出具体 default.jsonl 路径：{stderr}"
+    );
+    assert!(
+        !dir.join("session.db").exists(),
+        "报错时不得创建空 session.db"
+    );
+}
+
+/// M2：显式目录里残留旧 `default.jsonl` 时普通 run 也应拒绝，且不创建新库。
+#[test]
+fn explicit_directory_run_rejects_legacy_default_jsonl() {
+    let env = TestEnv::new(0);
+    let dir = env.work.join("custom");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("default.jsonl"),
+        b"{\"type\":\"user\",\"id\":\"01J\",\"ts\":1,\"content\":\"x\"}\n",
+    )
+    .unwrap();
+
+    let output = env.run(&["--session", dir.to_str().unwrap(), "你好"]);
+    assert_ne!(output.status.code(), Some(0), "显式目录旧历史应报错");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("旧版 JSONL"), "stderr：{stderr}");
+    assert!(stderr.contains("--clear"), "stderr：{stderr}");
+    assert!(
+        !dir.join("session.db").exists(),
+        "报错时不得创建空 session.db"
     );
 }
 
@@ -1347,7 +1574,7 @@ async fn multi_word_prompt_is_joined_with_single_space() {
     let output = env.run(&["你好", "世界", "！"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let user = records
         .iter()
         .find(|record| record["type"] == "user")
@@ -1381,14 +1608,14 @@ async fn empty_reply_does_not_reprint_previous_answer() {
     let env = TestEnv::new(addr.port());
     env.write_config(PLAIN_CONFIG);
 
-    let session = env.session_file();
-    std::fs::create_dir_all(session.parent().unwrap()).unwrap();
-    let seed = [
-        r#"{"type":"user","id":"01JOLDQ","ts":1,"content":"旧问"}"#,
-        r#"{"type":"ai","id":"01JOLDA","ts":2,"model":"fake-model","tool_schema_hash":"h","content":"旧答案"}"#,
-    ]
-    .join("\n");
-    std::fs::write(&session, format!("{seed}\n")).unwrap();
+    let session = env.session_db();
+    seed(
+        &session,
+        &[
+            yaa_msg::Record::user("旧问"),
+            yaa_msg::Record::ai("fake-model", "h", "旧答案", None),
+        ],
+    );
 
     let output = env.run(&["新问"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
@@ -1417,12 +1644,7 @@ async fn shell_embedded_notify_writes_to_explicit_session() {
     let env = TestEnv::new(addr.port());
     env.write_config(CUSTOM_INIT_CONFIG);
 
-    let session_path = env
-        .data_home
-        .parent()
-        .unwrap()
-        .join("custom")
-        .join("s3.jsonl");
+    let session_path = env.data_home.parent().unwrap().join("custom").join("s3.db");
     let output = env
         .command()
         .arg("--session")
@@ -1432,7 +1654,7 @@ async fn shell_embedded_notify_writes_to_explicit_session() {
         .unwrap();
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let records = read_jsonl(&session_path);
+    let records = read_events(&session_path);
     assert!(
         records.iter().any(|record| {
             record["type"] == "system"
@@ -1469,7 +1691,7 @@ async fn unknown_tool_name_is_rejected_without_execution() {
     let output = env.run(&["你好"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let result = records
         .iter()
         .find(|record| record["type"] == "tool_result" && record["call_id"] == "call_x")
@@ -1528,7 +1750,7 @@ async fn notify_before_task_still_runs_init() {
     let output = env.run(&["新任务"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(
         count_source(&records, "init"),
         1,
@@ -1557,7 +1779,7 @@ async fn failed_init_retries_on_next_run() {
         "init 失败应配置错误退出：{}",
         stderr_of(&first)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(count_source(&records, "init"), 0, "失败不写簿记");
     assert_eq!(
         records.iter().filter(|r| r["type"] == "user").count(),
@@ -1568,19 +1790,16 @@ async fn failed_init_retries_on_next_run() {
     env.write_config(PLAIN_CONFIG);
     let second = env.run(&["二"]);
     assert!(second.status.success(), "stderr：{}", stderr_of(&second));
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(count_source(&records, "init"), 1, "修好后重试应成功 init");
 }
 
-/// F9：`--clear --session <裸文件名>` 也能成功归档（无目录名时 sid 回退路径哈希）。
+/// F9：旧 `.jsonl` 的 `--clear --session <裸文件名>` 走文件级归档（绝对化后 sid 取父目录名）。
 #[test]
 fn clear_bare_filename_session_archives() {
     let env = TestEnv::new(0);
-    std::fs::write(
-        env.work.join("s.jsonl"),
-        b"{\"type\":\"user\",\"id\":\"01J\",\"ts\":1,\"content\":\"x\"}\n",
-    )
-    .unwrap();
+    let original = b"{\"type\":\"user\",\"id\":\"01J\",\"ts\":1,\"content\":\"x\"}\n";
+    std::fs::write(env.work.join("s.jsonl"), original).unwrap();
 
     let output = env.run(&["--clear", "--session", "s.jsonl"]);
     assert!(
@@ -1589,8 +1808,29 @@ fn clear_bare_filename_session_archives() {
         stderr_of(&output)
     );
     assert!(!env.work.join("s.jsonl").exists(), "原文件应已归档");
-    let printed = stdout_of(&output);
+    let printed = stdout_of(&output).trim().to_string();
     assert!(printed.contains("history"), "应打印归档路径：{printed}");
+
+    let archived = PathBuf::from(&printed);
+    assert_eq!(
+        archived.extension().and_then(|ext| ext.to_str()),
+        Some("jsonl")
+    );
+    assert_eq!(
+        std::fs::read(&archived).unwrap(),
+        original,
+        "内容应原样保留"
+    );
+    let sid = archived
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .unwrap();
+    assert_eq!(
+        sid,
+        env.work.file_name().unwrap().to_str().unwrap(),
+        "sid 应取 JSONL 父目录名"
+    );
 }
 
 /// A1 回归：单次运行内，工具调用的描述、命令与中间正文各自只展示一次。
@@ -1661,7 +1901,7 @@ async fn external_notify_during_model_request_is_displayed_exactly_once() {
     let mut side_effect = env.command();
     side_effect
         .arg("--session")
-        .arg(env.session_file())
+        .arg(env.session_db())
         .arg("--notify=外部")
         .arg("--")
         .arg("printf")
@@ -1695,7 +1935,7 @@ async fn external_notify_during_model_request_is_displayed_exactly_once() {
         "工具命令应恰好展示一次：\n{stderr}"
     );
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(
         count_source(&records, "notify"),
         1,
@@ -1804,7 +2044,7 @@ async fn ask_interception_writes_pending_and_exits_six() {
     assert!(stderr.contains("echo *"), "清单应含命中规则：{stderr}");
     assert!(stderr.contains("% echo hi"), "清单应含可重放命令：{stderr}");
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let pending = records
         .iter()
         .find(|record| record["type"] == "approval_pending")
@@ -1849,7 +2089,7 @@ async fn approve_executes_oldest_pending_and_continues() {
     assert!(stderr.contains("# 待批准"), "应展示待批条目：{stderr}");
     assert!(stderr.contains("# 已批准"), "应展示批准条目：{stderr}");
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let labels: Vec<&str> = records
         .iter()
         .map(|record| record["type"].as_str().unwrap())
@@ -1913,7 +2153,7 @@ async fn auto_allows_ask_calls_and_completes_loop() {
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
     assert!(stdout_of(&output).contains("完成"));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let labels: Vec<&str> = records
         .iter()
         .map(|record| record["type"].as_str().unwrap())
@@ -1954,7 +2194,7 @@ async fn auto_still_enforces_explicit_deny() {
         stderr_of(&output)
     );
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let resolved = records
         .iter()
         .find(|record| record["type"] == "approval_resolved")
@@ -2006,7 +2246,7 @@ async fn new_prompt_abandons_old_pending() {
     assert!(second.status.success(), "stderr：{}", stderr_of(&second));
     assert!(stdout_of(&second).contains("新答"));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let deny_index = records
         .iter()
         .position(|record| record["type"] == "approval_resolved" && record["decision"] == "deny")
@@ -2107,7 +2347,7 @@ max_steps = 10
         .unwrap();
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let notify = records
         .iter()
         .find(|record| record["type"] == "system" && record["source"] == "notify")
@@ -2136,7 +2376,7 @@ fn notify_space_separated_comment_is_written() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(records.len(), 1, "notify 短路路径只写一条记录");
     assert_eq!(records[0]["command"], "echo hi");
     assert_eq!(records[0]["content"], "<空格注释>\nhi\n</空格注释>");
@@ -2157,7 +2397,7 @@ async fn invalid_utf8_stdin_is_lossy_not_fatal() {
     );
     assert!(stdout_of(&output).contains("完成"));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let user = records
         .iter()
         .find(|record| record["type"] == "user")
@@ -2181,7 +2421,7 @@ fn notify_comment_newlines_are_flattened() {
         "stderr：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(records[0]["content"], "<a b>\nhi\n</a b>");
 }
 
@@ -2278,7 +2518,7 @@ async fn approve_releases_pending_oldest_first_and_keeps_projection_clean() {
         "同批 ask 应以 6 退出：{}",
         stderr_of(&first)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let pendings: Vec<&Value> = records
         .iter()
         .filter(|record| record["type"] == "approval_pending")
@@ -2295,7 +2535,7 @@ async fn approve_releases_pending_oldest_first_and_keeps_projection_clean() {
     let second = env.run(&["--approve"]);
     assert!(second.status.success(), "stderr：{}", stderr_of(&second));
     assert!(stdout_of(&second).contains("第一答"));
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let results: Vec<&Value> = records
         .iter()
         .filter(|record| record["type"] == "tool_result")
@@ -2331,7 +2571,7 @@ async fn approve_releases_pending_oldest_first_and_keeps_projection_clean() {
     let third = env.run(&["--approve"]);
     assert!(third.status.success(), "stderr：{}", stderr_of(&third));
     assert!(stdout_of(&third).contains("第二答"));
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert_eq!(
         records
             .iter()
@@ -2379,7 +2619,7 @@ async fn non_string_tool_arguments_exit_model_error() {
         "非字符串 arguments 应为模型错误：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert!(
         !records
             .iter()
@@ -2407,7 +2647,7 @@ async fn unknown_tool_fails_without_pending() {
     );
     assert!(stdout_of(&output).contains("完成"));
 
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert!(
         !records
             .iter()
@@ -2449,7 +2689,7 @@ async fn invalid_command_field_fails_without_pending() {
         "参数非法应落失败结果而非待批退出：{}",
         stderr_of(&output)
     );
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     assert!(
         !records
             .iter()
@@ -2473,7 +2713,7 @@ async fn approve_honors_env_session_target() {
     .await;
     let env = TestEnv::new(addr.port());
     env.write_config(APPROVAL_ASK_CONFIG);
-    let target = env.work.join("explicit.jsonl");
+    let target = env.work.join("explicit.db");
 
     let first = env.run(&["--session", target.to_str().unwrap(), "你好"]);
     assert_eq!(
@@ -2483,7 +2723,7 @@ async fn approve_honors_env_session_target() {
         stderr_of(&first)
     );
     assert!(
-        read_jsonl(&target)
+        read_events(&target)
             .iter()
             .any(|record| record["type"] == "approval_pending"),
         "pending 应落在 --session 指定的会话"
@@ -2502,15 +2742,15 @@ async fn approve_honors_env_session_target() {
         stderr_of(&approved)
     );
     assert!(stdout_of(&approved).contains("完成"));
-    let resolved = read_jsonl(&target)
+    let resolved = read_events(&target)
         .into_iter()
         .find(|record| record["type"] == "approval_resolved")
         .expect("应写 approval_resolved");
     assert_eq!(resolved["decision"], "approve");
     assert!(
-        !env.session_file().exists(),
+        !env.session_db().exists(),
         "不得越界操作默认会话：{:?}",
-        env.session_file()
+        env.session_db()
     );
 }
 
@@ -2527,7 +2767,7 @@ async fn deny_records_matched_rule() {
 
     let output = env.run(&["你好"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let pending = records
         .iter()
         .find(|record| record["type"] == "approval_pending")
@@ -2557,7 +2797,7 @@ async fn deny_not_bypassed_by_single_ampersand() {
 
     let output = env.run(&["你好"]);
     assert!(output.status.success(), "stderr：{}", stderr_of(&output));
-    let records = read_jsonl(&env.session_file());
+    let records = read_events(&env.session_db());
     let resolved = records
         .iter()
         .find(|record| record["type"] == "approval_resolved")
@@ -2591,17 +2831,17 @@ async fn quoted_env_prefix_does_not_bypass_approval() {
         stderr_of(&output)
     );
     assert!(
-        read_jsonl(&env.session_file())
+        read_events(&env.session_db())
             .iter()
             .any(|record| record["type"] == "approval_pending"),
         "应落 approval_pending"
     );
 }
 
-/// 阶段 3 验收 5–7、9：历史超阈值时压缩为侧车摘要，投影被替换、`default.jsonl`
-/// 不被改写，并在 stderr 展示一条压缩条目。
+/// 阶段 3 验收 5–7、9：历史超阈值时压缩为侧车摘要，投影被替换、既有会话记录不被
+/// 改写，并在 stderr 展示一条压缩条目。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn compaction_summarizes_history_into_sidecar_and_keeps_jsonl() {
+async fn compaction_summarizes_history_into_sidecar_and_keeps_records() {
     // 第一次运行：压缩未启用，制造两轮大工具输出作为历史。
     let (first_addr, _first_state) = start_server(vec![
         tool_call_response("c1", "seq 1 4000", None, None),
@@ -2620,7 +2860,11 @@ max_steps = 10
 "#,
     );
     let first = env.run(&["第一问"]);
-    assert!(first.status.success(), "首次运行失败：{}", stderr_of(&first));
+    assert!(
+        first.status.success(),
+        "首次运行失败：{}",
+        stderr_of(&first)
+    );
 
     // 第二次运行：启用压缩（pruner 预算调大以免干扰本用例），既有历史立即超阈值。
     let (second_addr, second_state) = start_server(vec![
@@ -2651,19 +2895,23 @@ max_steps = 10
 "#,
     );
 
-    let session = env.session_file();
-    let before = std::fs::read_to_string(&session).unwrap();
+    let session = env.session_db();
+    let before = yaa_store::load(&yaa_store::Session::new(session.clone())).unwrap();
     let output = env.run(&["第二问"]);
-    assert!(output.status.success(), "压缩运行失败：{}", stderr_of(&output));
+    assert!(
+        output.status.success(),
+        "压缩运行失败：{}",
+        stderr_of(&output)
+    );
 
     // 恰好一次摘要 + 一次主调用，顺序为「摘要 → 主」。
     let requests = second_state.requests.lock().unwrap().clone();
-    assert_eq!(requests.len(), 2, "应恰好一次摘要 + 一次主调用：{requests:?}");
-    let instruction = requests[0]["messages"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()["content"]
+    assert_eq!(
+        requests.len(),
+        2,
+        "应恰好一次摘要 + 一次主调用：{requests:?}"
+    );
+    let instruction = requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
         .as_str()
         .unwrap_or_default();
     assert!(
@@ -2695,7 +2943,7 @@ max_steps = 10
             .collect::<Vec<_>>()
     );
 
-    // 侧车摘要落盘；`default.jsonl` 的原历史逐字保留（只追加本次记录）。
+    // 侧车摘要落盘；既有记录逐条保留（只追加本次记录）。
     let summaries = session.parent().unwrap().join("summaries");
     let files: Vec<_> = std::fs::read_dir(&summaries)
         .unwrap()
@@ -2703,10 +2951,17 @@ max_steps = 10
         .map(|item| item.path())
         .collect();
     assert_eq!(files.len(), 1, "应生成 1 条侧车摘要：{files:?}");
-    let after = std::fs::read_to_string(&session).unwrap();
+    let after = yaa_store::load(&yaa_store::Session::new(session.clone())).unwrap();
     assert!(
-        after.starts_with(&before),
-        "`default.jsonl` 的原历史必须逐字保留"
+        after.len() > before.len(),
+        "压缩只追加记录，不删改历史：{} → {}",
+        before.len(),
+        after.len()
+    );
+    assert_eq!(
+        after[..before.len()],
+        before[..],
+        "压缩前的记录必须逐条保留"
     );
 
     // 展示：stderr 出现一条压缩条目。
@@ -2764,9 +3019,9 @@ async fn no_store_uses_temporary_session_without_touching_existing() {
     // 先用普通运行创建一个既有会话。
     let first = env.run(&["首次提问"]);
     assert!(first.status.success(), "stderr={}", stderr_of(&first));
-    let session = env.session_file();
-    assert!(session.exists(), "普通运行应创建会话文件");
-    let before = std::fs::read_to_string(&session).unwrap();
+    let session = env.session_db();
+    assert!(session.exists(), "普通运行应创建会话数据库");
+    let before = read_events(&session);
 
     // 复用同一服务端，追加一个响应给临时运行。
     state
@@ -2779,9 +3034,9 @@ async fn no_store_uses_temporary_session_without_touching_existing() {
     assert!(output.status.success(), "stderr={}", stderr_of(&output));
     assert_eq!(stdout_of(&output).trim(), "临时答复");
 
-    // 既有会话逐字未变；数据根只保留普通运行创建的会话目录。
+    // 既有会话记录未变；数据根只保留普通运行创建的会话目录。
     assert_eq!(
-        std::fs::read_to_string(&session).unwrap(),
+        read_events(&session),
         before,
         "`--no-store` 不得改动既有会话"
     );
@@ -2800,4 +3055,381 @@ async fn no_store_uses_temporary_session_without_touching_existing() {
         !session_dir.join("summaries").exists() && !session_dir.join("outputs").exists(),
         "临时运行不得在既有会话目录留下 summaries/outputs"
     );
+}
+
+// ===== 存储迁移：旧格式、非 yaa 库、锁与并发 =====
+
+/// 旧 `.jsonl` 会话在普通 run 前被拒绝，并提示 `--clear`。
+#[test]
+fn run_rejects_legacy_jsonl_session() {
+    let env = TestEnv::new(0);
+    std::fs::write(
+        env.work.join("legacy.jsonl"),
+        b"{\"type\":\"user\",\"id\":\"01J\",\"ts\":1,\"content\":\"x\"}\n",
+    )
+    .unwrap();
+
+    let output = env.run(&["--session", "legacy.jsonl", "你好"]);
+    assert_ne!(output.status.code(), Some(0), "旧格式应报错");
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("旧版 JSONL"), "应说明旧版 JSONL：{stderr}");
+    assert!(stderr.contains("--clear"), "应提示 --clear：{stderr}");
+}
+
+/// 非 yaa 的普通 SQLite 库绝不能被当作会话读取或写入。
+#[test]
+fn status_rejects_non_yaa_database() {
+    let env = TestEnv::new(0);
+    let db = env.work.join("plain.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE other (x INTEGER);")
+        .unwrap();
+    drop(conn);
+
+    let output = env.run(&["--status", "--session", db.to_str().unwrap()]);
+    assert_ne!(output.status.code(), Some(0), "非 yaa 库应报错");
+    assert!(
+        stderr_of(&output).contains("不是 yaa 会话数据库"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+}
+
+/// `--notify` 目标不存在时先告警再创建。
+#[test]
+fn notify_warns_and_creates_missing_session() {
+    let env = TestEnv::new(0);
+    assert!(!env.session_db().exists());
+
+    let output = env.run(&["--notify=新", "--", "printf", "hi"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("目标会话不存在"),
+        "应告警目标不存在：{}",
+        stderr_of(&output)
+    );
+    let records = read_events(&env.session_db());
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["content"], "<新>\nhi\n</新>");
+}
+
+/// 已归档的数据库拒绝写入，通知不得静默丢失。
+#[test]
+fn notify_rejects_archived_session() {
+    let env = TestEnv::new(0);
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    let session = yaa_store::Session::new(db.clone());
+    yaa_store::set_archived(&session).unwrap();
+
+    let output = env.run(&["--notify=x", "--", "printf", "y"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("已归档"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read_events(&db).len(), 1, "归档库不得新增记录");
+}
+
+/// 归档当前（默认）会话并返回归档数据库路径。
+fn archive_current_session(env: &TestEnv) -> PathBuf {
+    let cleared = env.run(&["--clear"]);
+    assert!(
+        cleared.status.success(),
+        "归档失败，stderr：{}",
+        stderr_of(&cleared)
+    );
+    let printed = stdout_of(&cleared).trim().to_string();
+    assert!(!printed.is_empty(), "归档应打印路径");
+    PathBuf::from(printed)
+}
+
+/// S3：归档库上的 run 在写 user / init / 执行前拒绝，退出 1 且归档库不变。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_on_archived_session_is_rejected() {
+    let (addr, _state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    let archived = archive_current_session(&env);
+    let before = read_events(&archived);
+
+    let output = env.run(&["--session", archived.to_str().unwrap(), "你好"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("已归档"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(stdout_of(&output).is_empty(), "归档库不得产生最终回复");
+    assert_eq!(read_events(&archived), before, "归档库不得被修改");
+}
+
+/// S3：归档库上的 `--approve` 不执行 pending 命令、不写记录。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approve_on_archived_session_is_rejected() {
+    let (addr, _state) = start_server(vec![]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(APPROVAL_ASK_CONFIG);
+    let db = env.session_db();
+    let marker = env.work.join("approve-marker");
+    seed(
+        &db,
+        &[
+            yaa_msg::Record::tool_call(
+                yaa_msg::ToolOrigin::Ai,
+                "c1",
+                format!("touch {}", marker.display()),
+                None,
+            ),
+            yaa_msg::Record::approval_pending(
+                "c1",
+                format!("touch {}", marker.display()),
+                "touch *",
+            ),
+        ],
+    );
+    let archived = archive_current_session(&env);
+    let before = read_events(&archived);
+
+    let output = env.run(&["--approve", "--session", archived.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("已归档"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(!marker.exists(), "归档库不得执行 pending 命令");
+    assert_eq!(read_events(&archived), before, "归档库不得被修改");
+}
+
+/// S3：`--status` 仍可只读归档库。
+#[test]
+fn status_reads_archived_session() {
+    let env = TestEnv::new(0);
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    let archived = archive_current_session(&env);
+
+    let output = env.run(&["--status", "--session", archived.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("记录："), "stdout：{stdout}");
+    assert!(
+        stdout.contains(&archived.to_string_lossy().to_string()),
+        "stdout：{stdout}"
+    );
+}
+
+/// 已有 runner 持锁时，普通 run 明确拒绝且不写记录。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_refuses_when_runner_lock_is_held() {
+    let (addr, _state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let session = yaa_store::Session::new(env.session_db());
+    std::fs::create_dir_all(&session.root).unwrap();
+    let _held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+        .unwrap()
+        .expect("测试进程应能先持锁");
+
+    let output = env.run(&["你好"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("会话正在运行"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(!session.db.exists(), "持锁失败时不得创建/写入会话");
+}
+
+/// runner 持锁时 `--clear` 拒绝归档，且主库记录不变。
+#[test]
+fn clear_refuses_while_runner_lock_is_held() {
+    let env = TestEnv::new(0);
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("保留")]);
+    let session = yaa_store::Session::new(db.clone());
+    let _held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+        .unwrap()
+        .expect("测试进程应能先持锁");
+
+    let output = env.run(&["--clear"]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("无法归档"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read_events(&db).len(), 1, "拒绝归档时不得清空记录");
+    assert!(!env.data_home.join("history").exists(), "不得产生归档");
+}
+
+/// 8 个进程并发 `--notify`：记录不丢、不重、无半条。
+#[test]
+fn concurrent_notify_processes_do_not_lose_records() {
+    let env = TestEnv::new(0);
+    let mut children = Vec::new();
+    for index in 0..8 {
+        let mut command = env.command();
+        command
+            .arg("--notify=并发")
+            .arg("--")
+            .arg("printf")
+            .arg(format!("N{index}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        children.push(command.spawn().unwrap());
+    }
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "并发 notify 失败：{}",
+            stderr_of(&output)
+        );
+    }
+
+    let records = read_events(&env.session_db());
+    assert_eq!(
+        count_source(&records, "notify"),
+        8,
+        "记录不得丢失：{records:?}"
+    );
+    let ids: HashSet<&str> = records
+        .iter()
+        .map(|record| record["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 8, "记录 id 不得重复");
+    for index in 0..8 {
+        assert!(
+            records.iter().any(|record| record["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(&format!("N{index}")))),
+            "缺少 N{index} 的通知：{records:?}"
+        );
+    }
+}
+
+/// 写者活跃（正在执行 notify 命令）时 `--status` 仍能正常返回。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_reads_while_writer_is_active() {
+    let env = TestEnv::new(0);
+    let first = env.run(&["--notify=初始", "--", "printf", "init"]);
+    assert!(first.status.success(), "stderr：{}", stderr_of(&first));
+
+    let pidfile = env._root.path().join("writer.pid");
+    let command = format!("echo $$ > '{}'; sleep 2", pidfile.display());
+    let writer = env
+        .command()
+        .args(["--notify=慢", "--", "sh", "-c", &command])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_pid(&pidfile, std::time::Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("写者未启动：{}", pidfile.display()));
+
+    let started = std::time::Instant::now();
+    let status = env.run(&["--status"]);
+    assert!(status.status.success(), "stderr：{}", stderr_of(&status));
+    assert!(stdout_of(&status).contains("记录："));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "status 不应等待写者：{:?}",
+        started.elapsed()
+    );
+
+    let writer = writer.wait_with_output().unwrap();
+    assert!(writer.status.success(), "写者应正常结束");
+    assert_eq!(count_source(&read_events(&env.session_db()), "notify"), 2);
+}
+
+/// S1：慢 notify 命令执行期间并发 `--clear` 不应等待命令结束；总量守恒且两边库完整。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clear_conserves_records_while_slow_notify_command_runs() {
+    let env = TestEnv::new(0);
+    // 前置一条，确保库已存在、`--clear` 会真正归档。
+    let first = env.run(&["--notify=前置", "--", "printf", "pre"]);
+    assert!(first.status.success(), "stderr：{}", stderr_of(&first));
+
+    let pidfile = env._root.path().join("slow-notify.pid");
+    let command = format!("echo $$ > '{}'; sleep 2", pidfile.display());
+    let writer = env
+        .command()
+        .args(["--notify=慢", "--", "sh", "-c", &command])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for_pid(&pidfile, std::time::Duration::from_secs(5))
+        .unwrap_or_else(|| panic!("慢通知未启动：{}", pidfile.display()));
+
+    // notify 命令执行阶段不持 clear.lock，clear 应迅速完成而非等待 2 秒命令。
+    let started = std::time::Instant::now();
+    let cleared = env.run(&["--clear"]);
+    assert!(cleared.status.success(), "stderr：{}", stderr_of(&cleared));
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(1500),
+        "clear 不应等待 notify 命令结束：{:?}",
+        started.elapsed()
+    );
+
+    let writer = writer.wait_with_output().unwrap();
+    assert!(
+        writer.status.success(),
+        "慢通知应成功：{}",
+        stderr_of(&writer)
+    );
+
+    // 总量守恒：两次成功的 notify 要么进归档、要么进新库。
+    let archived = PathBuf::from(stdout_of(&cleared).trim());
+    assert!(archived.exists(), "归档库应存在：{}", archived.display());
+    let archived_count = count_source(&read_events(&archived), "notify");
+    let live_count = count_source(&read_events(&env.session_db()), "notify");
+    assert_eq!(
+        archived_count + live_count,
+        2,
+        "通知总数应守恒（归档 {archived_count} + 新库 {live_count}）"
+    );
+    assert!(integrity_ok(&archived), "归档库 integrity 应为 ok");
+    assert!(integrity_ok(&env.session_db()), "新库 integrity 应为 ok");
 }

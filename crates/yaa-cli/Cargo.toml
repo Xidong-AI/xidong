@@ -27,3 +27,7 @@ tempfile.workspace = true
 # 仅测试用：假的 OpenAI 兼容服务端。
 axum = "0.8"
 sha2.workspace = true
+# 端到端测试直接构造/读取 SQLite 会话。
+yaa-store = { path = "../yaa-store" }
+yaa-msg = { path = "../yaa-msg" }
+rusqlite = { version = "0.40", features = ["bundled"] }

@@ -1,8 +1,12 @@
 //! 会话解析：由工作目录或显式路径得到 `yaa_store::Session`。
 //!
-//! 默认会话根为 `<数据根>/sessions/<sid>/`，`sid` 取规范化工作目录字节的
-//! sha256 前 32 位十六进制（128 位）。`canonicalize` 失败（目录已删、符号链接断裂）
-//! 时回退到词法绝对路径并在 [`Resolved::warned`] 中标记，绝不静默。
+//! 默认会话根为 `<数据根>/sessions/<sid>/`，数据库为其中的 `session.db`；`sid` 取
+//! 规范化工作目录字节的 sha256 前 32 位十六进制（128 位）。`canonicalize` 失败
+//! （目录已删、符号链接断裂）时回退到词法绝对路径并在 [`Resolved::warned`] 中标记，
+//! 绝不静默。
+//!
+//! 显式路径统一绝对化后按以下规则解释：以 `.jsonl` 结尾视为旧版会话并报错；是目录
+//! 时使用 `<目录>/session.db`；其余按数据库路径。
 
 use std::path::{Path, PathBuf};
 
@@ -13,7 +17,7 @@ use sha2::{Digest, Sha256};
 pub struct Resolved {
     /// 存储层会话句柄。
     pub session: yaa_store::Session,
-    /// 会话 id；显式 `--session` 时取会话根目录名。
+    /// 会话 id；显式路径取数据库父目录名（无目录名时取路径哈希）。
     pub sid: String,
     /// 用于 sid 计算的绝对工作目录。
     pub cwd_absolute: PathBuf,
@@ -23,8 +27,8 @@ pub struct Resolved {
 
 /// 解析会话。
 ///
-/// `session_arg` 给出时直接以其构造 [`yaa_store::Session`]；否则按规范化工作目录计算
-/// sid。本函数是只读的：不创建任何目录，目录创建交给真正写入的
+/// `session_arg` 给出时按 `session_from_path` 的规则构造 [`yaa_store::Session`]；否则
+/// 按规范化工作目录计算 sid。本函数是只读的：不创建任何目录，目录创建交给真正写入的
 /// [`yaa_store::append`]，使 `--status`/`--clear` 不会物化空的会话目录。
 pub fn resolve(
     cwd: &Path,
@@ -34,7 +38,7 @@ pub fn resolve(
     let (cwd_absolute, warned) = absolute_cwd(cwd);
 
     if let Some(path) = session_arg {
-        let session = yaa_store::Session::new(path);
+        let session = session_from_path(path)?;
         let sid = sid_of(&session);
         return Ok(Resolved {
             session,
@@ -46,13 +50,66 @@ pub fn resolve(
 
     let sid = sid_for(&cwd_absolute);
     let dir = data_root.join("sessions").join(&sid);
-    let session = yaa_store::Session::new(dir.join("default.jsonl"));
+    let db = dir.join("session.db");
+    reject_legacy_sibling(&db)?;
+    let session = yaa_store::Session::new(db);
     Ok(Resolved {
         session,
         sid,
         cwd_absolute,
         warned,
     })
+}
+
+/// 把显式会话路径解释为数据库路径。
+///
+/// 相对路径先词法绝对化（与 `--notify` 的既有语义一致）；`.jsonl` 是旧版会话，明确
+/// 报错并提示 `--clear`；目录则使用其中的 `session.db`。
+fn session_from_path(path: &Path) -> anyhow::Result<yaa_store::Session> {
+    let absolute = std::path::absolute(path)?;
+    if is_legacy_jsonl(&absolute) {
+        return Err(legacy_jsonl_error(&absolute));
+    }
+    let db = if absolute.is_dir() {
+        let db = absolute.join("session.db");
+        reject_legacy_sibling(&db)?;
+        db
+    } else {
+        absolute
+    };
+    Ok(yaa_store::Session::new(db))
+}
+
+/// 目标数据库尚未创建、但同目录存在旧 `default.jsonl` 时，拒绝静默绕过旧历史。
+///
+/// 只在 `session.db` 不存在时检查：已迁移用户的旧文件残留无碍。
+fn reject_legacy_sibling(db: &Path) -> anyhow::Result<()> {
+    if db.exists() {
+        return Ok(());
+    }
+    let Some(dir) = db.parent() else {
+        return Ok(());
+    };
+    let legacy = dir.join("default.jsonl");
+    if legacy.exists() {
+        return Err(legacy_jsonl_error(&legacy));
+    }
+    Ok(())
+}
+
+/// 旧版 JSONL 会话的统一错误文案。
+fn legacy_jsonl_error(path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "检测到旧版 JSONL 会话：{}；请运行 `yaa --clear --session {}` 归档后使用 SQLite 会话",
+        path.display(),
+        path.display()
+    )
+}
+
+/// 路径是否以 `.jsonl` 结尾（旧版会话格式）。
+fn is_legacy_jsonl(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
 }
 
 /// 解析会话目标，优先级：显式 `--session` → 环境变量 `YAA_SESSION`（非空才算）
@@ -68,7 +125,7 @@ pub fn resolve_target(
     data_root: &Path,
 ) -> anyhow::Result<Resolved> {
     if let Some(path) = session_arg {
-        let session = yaa_store::Session::new(std::path::absolute(path)?);
+        let session = session_from_path(path)?;
         let sid = sid_of(&session);
         let (cwd_absolute, warned) = absolute_cwd(cwd);
         return Ok(Resolved {
@@ -79,7 +136,7 @@ pub fn resolve_target(
         });
     }
     if let Some(path) = env_session.filter(|value| !value.is_empty()) {
-        let session = yaa_store::Session::new(std::path::absolute(Path::new(path))?);
+        let session = session_from_path(Path::new(path))?;
         let sid = sid_of(&session);
         return Ok(Resolved {
             session,
@@ -91,13 +148,9 @@ pub fn resolve_target(
     resolve(cwd, None, data_root)
 }
 
-/// 会话根目录名作为 sid；无目录名时回退空串。
+/// 会话 id；store 已按「父目录名 → 路径哈希」推导。
 fn sid_of(session: &yaa_store::Session) -> String {
-    session
-        .root
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default()
+    session.sid.clone()
 }
 
 /// 会话输出目录：`<会话根>/outputs`。
@@ -147,7 +200,7 @@ mod tests {
         assert_eq!(first.sid, second.sid);
         assert!(!first.warned);
         assert_eq!(first.session.root, data.join("sessions").join(&first.sid));
-        assert_eq!(first.session.file, first.session.root.join("default.jsonl"));
+        assert_eq!(first.session.db, first.session.root.join("session.db"));
         // 解析是只读的：--status/--clear 不得物化空会话目录，写入时才创建。
         assert!(
             !first.session.root.exists(),
@@ -179,13 +232,97 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
-        let file = dir.path().join("custom").join("my.jsonl");
+        let db = dir.path().join("custom").join("my.db");
 
-        let resolved = resolve(&cwd, Some(&file), &dir.path().join("data")).unwrap();
-        assert_eq!(resolved.session.file, file);
+        let resolved = resolve(&cwd, Some(&db), &dir.path().join("data")).unwrap();
+        assert_eq!(resolved.session.db, db);
         assert_eq!(resolved.session.root, dir.path().join("custom"));
         assert_eq!(resolved.sid, "custom");
         assert!(!resolved.warned);
+    }
+
+    #[test]
+    fn explicit_directory_uses_session_db_inside() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("custom");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let resolved = resolve(&cwd, Some(&target), &dir.path().join("data")).unwrap();
+        assert_eq!(resolved.session.db, target.join("session.db"));
+        assert_eq!(resolved.sid, "custom");
+    }
+
+    #[test]
+    fn default_session_rejects_legacy_default_jsonl_when_db_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // 先算出默认会话目录，放入旧 `default.jsonl`。
+        let sid = sid_for(&cwd.canonicalize().unwrap());
+        let session_dir = data.join("sessions").join(&sid);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let legacy = session_dir.join("default.jsonl");
+        std::fs::write(&legacy, b"{}\n").unwrap();
+
+        let err = resolve(&cwd, None, &data).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("旧版 JSONL"), "{message}");
+        assert!(message.contains("--clear"), "{message}");
+        assert!(
+            message.contains(&legacy.to_string_lossy().to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn explicit_directory_rejects_legacy_default_jsonl_when_db_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("custom");
+        std::fs::create_dir_all(&target).unwrap();
+        let legacy = target.join("default.jsonl");
+        std::fs::write(&legacy, b"{}\n").unwrap();
+
+        let err = resolve(&cwd, Some(&target), &dir.path().join("data")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("旧版 JSONL"), "{message}");
+        assert!(message.contains("--clear"), "{message}");
+        assert!(
+            message.contains(&legacy.to_string_lossy().to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn existing_session_db_allows_legacy_sibling_to_remain() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("custom");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("default.jsonl"), b"{}\n").unwrap();
+        std::fs::write(target.join("session.db"), b"x").unwrap();
+
+        let resolved = resolve(&cwd, Some(&target), &dir.path().join("data")).unwrap();
+        assert_eq!(resolved.session.db, target.join("session.db"));
+    }
+
+    #[test]
+    fn explicit_jsonl_is_rejected_with_clear_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let legacy = dir.path().join("old.jsonl");
+
+        let err = resolve(&cwd, Some(&legacy), &dir.path().join("data")).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("旧版 JSONL"), "{message}");
+        assert!(message.contains("--clear"), "{message}");
     }
 
     #[test]
@@ -194,8 +331,8 @@ mod tests {
         let data = dir.path().join("data");
         let cwd = dir.path().join("work");
         std::fs::create_dir_all(&cwd).unwrap();
-        let explicit = dir.path().join("explicit.jsonl");
-        let from_env = dir.path().join("env").join("from-env.jsonl");
+        let explicit = dir.path().join("explicit.db");
+        let from_env = dir.path().join("env").join("from-env.db");
 
         // 显式参数优先于环境变量。
         let resolved = resolve_target(
@@ -205,11 +342,11 @@ mod tests {
             &data,
         )
         .unwrap();
-        assert_eq!(resolved.session.file, explicit);
+        assert_eq!(resolved.session.db, explicit);
 
         // 无显式参数时用 YAA_SESSION；显式路径不算 cwd 规范化回退，故不告警。
         let resolved = resolve_target(&cwd, None, Some(from_env.to_str().unwrap()), &data).unwrap();
-        assert_eq!(resolved.session.file, from_env);
+        assert_eq!(resolved.session.db, from_env);
         assert!(!resolved.warned);
         assert_eq!(resolved.cwd_absolute, cwd);
 
@@ -218,6 +355,10 @@ mod tests {
         assert_eq!(
             resolved.session.root,
             data.join("sessions").join(&resolved.sid)
+        );
+        assert_eq!(
+            resolved.session.db,
+            resolved.session.root.join("session.db")
         );
         assert!(is_lower_hex(&resolved.sid));
     }

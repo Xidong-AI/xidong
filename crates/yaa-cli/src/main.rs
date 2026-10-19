@@ -153,6 +153,25 @@ async fn notify(
     data_root: &Path,
 ) -> anyhow::Result<i32> {
     let session = notify_session(cli, env, data_root)?;
+    // 目标不存在时明确告警后照常创建（design.md：发现目标不存在时 stderr 警告）。
+    // `YAA_SESSION` 来自钩子内部调用时，首次创建是预期行为，不打扰用户。
+    if !session.db.exists() && env("YAA_SESSION").is_none() {
+        eprintln!("警告：目标会话不存在，将创建：{}", session.db.display());
+    }
+    // clear.lock 需要父目录存在；写入本来也会创建会话目录。
+    std::fs::create_dir_all(&session.root)?;
+    // 归档预检：短暂持 clear.lock 共享锁并串行 init，取出即放，绝不覆盖命令执行。
+    // 这样 notify 命令内嵌 `yaa --clear` 时不会形成「子等父释放 SH、父等子结束」的死锁。
+    {
+        let _clear_guard = yaa_store::FileLock::shared(&session.clear_lock_path())?;
+        let init_guard = yaa_store::FileLock::exclusive(&session.init_lock_path())?;
+        let archived = yaa_store::is_archived(&session)?;
+        drop(init_guard);
+        if archived {
+            eprintln!("错误：会话已归档，不可写入：{}", session.db.display());
+            return Ok(1);
+        }
+    }
     // 缺注释或注释为空串时统一用「由用户执行」。
     let comment = match cli.notify.as_deref() {
         Some(text) if !text.is_empty() => text,
@@ -171,10 +190,11 @@ async fn notify(
             stderr: None,
         });
         let content = envelope(comment, &captured.text);
-        yaa_store::append(
+        append_with_retry(
             &session,
             &[Record::system("notify", content, None, output_files)],
-        )?;
+        )
+        .await?;
         return Ok(0);
     }
 
@@ -204,7 +224,7 @@ async fn notify(
 
     let output_files = notify_output_files(&output, data_root);
     let content = envelope(comment, &output.stdout);
-    yaa_store::append(
+    append_with_retry(
         &session,
         &[Record::system(
             "notify",
@@ -212,8 +232,32 @@ async fn notify(
             Some(command),
             output_files,
         )],
-    )?;
+    )
+    .await?;
     Ok(exit)
+}
+
+/// 写入通知：对 `Busy` 做外层退避重试，约 30 秒预算；最终失败必须向上报错。
+///
+/// 只重试写入本身，不重放命令执行，避免副作用重复。clear.lock 共享锁只包住每次
+/// 写入尝试，命令执行阶段不持锁。
+async fn append_with_retry(session: &yaa_store::Session, records: &[Record]) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut delay = std::time::Duration::from_millis(100);
+    loop {
+        let result = {
+            let _clear_guard = yaa_store::FileLock::shared(&session.clear_lock_path())?;
+            yaa_store::append(session, records)
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(yaa_store::StoreError::Busy { .. }) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(2));
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 }
 
 /// 把正文包进 `<注释>…</注释>` 信封，去掉结尾换行（design.md 的示例形态）。
@@ -361,19 +405,57 @@ fn resolve_run_session(
 
 /// 归档当前会话，打印目标路径。
 fn clear(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
+    let history_root = data_root.join("history");
+    // 旧 JSONL 走文件级归档；`resolve` 会拒绝旧格式，因此必须先于解析处理。
+    if let Some(path) = cli.session.as_deref() {
+        let absolute = std::path::absolute(path)?;
+        if is_legacy_jsonl(&absolute) {
+            if !absolute.exists() {
+                eprintln!("提示：会话文件不存在，无需归档：{}", absolute.display());
+                return Ok(0);
+            }
+            let target = yaa_store::archive_legacy_jsonl(&absolute, &history_root, now_ms())?;
+            println!("{}", target.display());
+            return Ok(0);
+        }
+    }
+
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
-    if !resolved.session.file.exists() {
+    if !resolved.session.db.exists() {
         eprintln!(
             "提示：会话文件不存在，无需归档：{}",
-            resolved.session.file.display()
+            resolved.session.db.display()
         );
         return Ok(0);
     }
 
-    let target = yaa_store::archive(&resolved.session, &data_root.join("history"), now_ms())?;
+    let Some(_runner_lock) =
+        yaa_store::FileLock::try_exclusive(&resolved.session.runner_lock_path())?
+    else {
+        eprintln!(
+            "错误：会话正在运行，无法归档：{}",
+            resolved.session.db.display()
+        );
+        return Ok(1);
+    };
+    let clear_path = resolved.session.clear_lock_path();
+    let _clear_lock = match yaa_store::FileLock::try_exclusive(&clear_path)? {
+        Some(lock) => lock,
+        None => {
+            eprintln!("会话正在写入，等待完成…");
+            yaa_store::FileLock::exclusive(&clear_path)?
+        }
+    };
+    let target = yaa_store::archive(&resolved.session, &history_root, now_ms())?;
     println!("{}", target.display());
     Ok(0)
+}
+
+/// 路径是否以 `.jsonl` 结尾（旧版会话格式）。
+fn is_legacy_jsonl(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
 }
 
 /// 打印会话摘要。
@@ -382,8 +464,8 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
 
     let cwd = std::env::current_dir()?;
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
-    if !resolved.session.file.exists() {
-        eprintln!("提示：会话文件不存在：{}", resolved.session.file.display());
+    if !resolved.session.db.exists() {
+        eprintln!("提示：会话文件不存在：{}", resolved.session.db.display());
         return Ok(0);
     }
 
@@ -400,7 +482,7 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
         }
     }
 
-    println!("会话文件：{}", resolved.session.file.display());
+    println!("会话文件：{}", resolved.session.db.display());
     println!(
         "记录：{} 条（user {} / ai {} / tool_call {} / tool_result {} / system {} / approval {}）",
         records.len(),
@@ -445,6 +527,20 @@ async fn run_agent(
     let config = yaa_core::config::Config::load(&config_path).map_err(CliError::config)?;
 
     let resolved = resolve_run_session(&cli, env, data_root)?;
+
+    // 逻辑单 runner：`run`/`--approve` 持 runner.lock 直到进程结束。锁文件需要会话
+    // 目录存在；首次运行时创建目录无副作用（写入本来也会创建）。
+    std::fs::create_dir_all(&resolved.session.root)?;
+    let Some(_runner_lock) =
+        yaa_store::FileLock::try_exclusive(&resolved.session.runner_lock_path())
+            .map_err(anyhow::Error::from)?
+    else {
+        eprintln!(
+            "错误：会话正在运行，另一次 yaa 已持有该会话：{}",
+            resolved.session.db.display()
+        );
+        return Ok(ExitCode::Error.code());
+    };
 
     let prompt = if cli.approve {
         // `--approve` 不读提示词、不写 stdin 提示。
@@ -679,7 +775,7 @@ mod tests {
     fn run_session_uses_env_only_for_approve() {
         let dir = tempfile::tempdir().unwrap();
         let data_root = dir.path().join("data");
-        let env_path = dir.path().join("from-env.jsonl");
+        let env_path = dir.path().join("from-env.db");
         let env =
             |key: &str| (key == "YAA_SESSION").then(|| env_path.to_string_lossy().into_owned());
 
@@ -687,18 +783,18 @@ mod tests {
         let approve = Cli::parse_from(["yaa", "--approve"]);
         let resolved = resolve_run_session(&approve, &env, &data_root).unwrap();
         assert_eq!(
-            resolved.session.file,
+            resolved.session.db,
             env_path,
             "--approve 应认 YAA_SESSION：{}",
-            resolved.session.file.display()
+            resolved.session.db.display()
         );
 
         // `--session` 优先于 YAA_SESSION。
-        let explicit = dir.path().join("explicit.jsonl");
+        let explicit = dir.path().join("explicit.db");
         let approve =
             Cli::parse_from(["yaa", "--approve", "--session", explicit.to_str().unwrap()]);
         let resolved = resolve_run_session(&approve, &env, &data_root).unwrap();
-        assert_eq!(resolved.session.file, explicit, "--session 应最优先");
+        assert_eq!(resolved.session.db, explicit, "--session 应最优先");
 
         // 普通 run 的会话解析保持不变：忽略 YAA_SESSION，仍走 cwd 默认。
         let normal = Cli::parse_from(["yaa", "你好"]);
@@ -706,7 +802,7 @@ mod tests {
         assert!(
             resolved.session.root.starts_with(&data_root),
             "普通 run 不得因 YAA_SESSION 改变目标：{}",
-            resolved.session.file.display()
+            resolved.session.db.display()
         );
     }
 
