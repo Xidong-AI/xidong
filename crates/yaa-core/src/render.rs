@@ -139,7 +139,8 @@ fn is_user_run_item(record: &Record) -> bool {
 /// 非空判定同时看 `content` 与 `output_files`：正文被截断、`content` 为空但有完整
 /// 输出文件时同样要投影。
 fn is_projectable_system(system: &yaa_msg::System) -> bool {
-    (!system.content.is_empty() || system.output_files.is_some()) && system.source != "init"
+    yaa_msg::is_injectable_system(system)
+        && (!system.content.is_empty() || system.output_files.is_some())
 }
 
 /// 把一个 `system` 投影为进入上下文的文本。
@@ -387,6 +388,30 @@ mod tests {
             panic!("应投影为 Injection");
         };
         assert_eq!(content, projected, "展示正文应与渲染正文一致");
+    }
+
+    #[test]
+    fn display_and_render_share_injectable_system_predicate() {
+        // F12：同一记录集里，display 的 Injection 与 render 的投影必须使用同一
+        // 「可注入 System」判定；非 notify 来源与空正文都不得进入上下文。
+        let records = vec![
+            Record::system("notify", "<通知>\n正文\n</通知>", None, None),
+            Record::system("other", "其他来源", None, None),
+            Record::system("init", "", None, None),
+            Record::system("notify", "", None, None),
+        ];
+
+        let injections = display::items(&records)
+            .into_iter()
+            .filter(|item| matches!(item, display::DisplayItem::Injection { .. }))
+            .count();
+        assert_eq!(injections, 1, "只有非空 notify 可展示");
+
+        let messages = render(&records);
+        assert_eq!(roles(&messages), ["system"]);
+        let content = messages[0].content.as_deref().unwrap();
+        assert!(content.contains("正文"), "{content}");
+        assert!(!content.contains("其他来源"), "{content}");
     }
 
     #[test]

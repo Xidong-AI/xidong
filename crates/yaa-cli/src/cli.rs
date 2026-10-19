@@ -13,6 +13,11 @@ use clap::Parser;
 #[command(name = "yaa", version, about, long_about = None)]
 pub struct Cli {
     /// 用户提示词；可含空格（多个词以单个空格连接），缺失时从 stdin 读到 EOF。
+    ///
+    /// 与 `--notify` 互斥：通知是短路写入路径，不会进入 agent loop，位置提示词
+    /// 若被静默忽略会让用户误以为发起了对话（F14）。该冲突由
+    /// [`Cli::validate_combinations`] 显式校验——clap 的 `conflicts_with` 会与
+    /// `--to` 的 `requires = "notify"` 互相抵消，故不在此声明。
     #[arg(value_name = "PROMPT", num_args = 0..)]
     pub prompt: Vec<String>,
 
@@ -27,6 +32,18 @@ pub struct Cli {
     /// 指定会话文件。
     #[arg(long, value_name = "PATH")]
     pub session: Option<PathBuf>,
+
+    /// `--notify` 的目标会话（严格校验：必须已存在且为 yaa 库；**不创建**）。
+    ///
+    /// 仅与 `--notify` 组合有意义：未给 `--notify` 时由 clap 报用法错误（退出码 2）。
+    /// 与 `--session` 同时给出时必须指向同一数据库。
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "notify",
+        conflicts_with = "no_store"
+    )]
+    pub to: Option<PathBuf>,
 
     /// 本次运行使用临时会话，退出即淘（不读写既有会话）。
     #[arg(long, conflicts_with_all = ["session", "clear", "status", "notify", "approve"])]
@@ -49,7 +66,16 @@ pub struct Cli {
     /// 值为可选：`--notify 注释 `、`--notify=注释` 都取注释；裸 `--notify`（无值，
     /// 如 `cmd | yaa --notify`）或 `--notify=` 走缺省/空值语义。**不设**
     /// `require_equals`，否则 `--notify 注释` 会走 `default_missing_value` 而静默丢弃注释。
-    #[arg(long, value_name = "注释", num_args = 0..=1, default_missing_value = "由用户执行")]
+    ///
+    /// `--notify` 是短路写入路径，不会执行 `--clear`/`--status`/`--get-prompt`，也不会
+    /// 进入对话；这些组合一律按用法错误拒绝，避免静默忽略（F13/F15）。
+    #[arg(
+        long,
+        value_name = "注释",
+        num_args = 0..=1,
+        default_missing_value = "由用户执行",
+        conflicts_with_all = ["clear", "status", "get_prompt"]
+    )]
     pub notify: Option<String>,
 
     /// `--notify` 要执行的命令（写在 `--` 之后）。
@@ -79,6 +105,24 @@ pub struct Cli {
     /// 只在 stdout 打印最终回复。
     #[arg(long)]
     pub quiet: bool,
+}
+
+impl Cli {
+    /// 解析后校验 clap 无法表达的参数组合。
+    ///
+    /// `--to` 的 `requires = "notify"` 与位置提示词对 `--notify` 的 `conflicts_with`
+    /// 会互相抵消：给位置提示词时 clap 会放过缺 `--notify` 的 `--to`。为同时保留
+    /// 「`--to` 必须搭配 `--notify`」与「`--notify` 不得忽略位置提示词」（F14），
+    /// 后者在此显式校验。
+    pub fn validate_combinations(&self) -> Result<(), String> {
+        if self.notify.is_some() && !self.prompt.is_empty() {
+            return Err(
+                "`--notify` 不能与位置提示词同时使用：通知是短路写入路径，不会进入对话。"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -185,10 +229,7 @@ mod tests {
         assert_eq!(cli.prompt, vec!["你好".to_string()]);
 
         // `--json` 已是稳定的机器接口，不再与人类可读的冗长度开关叠加。
-        for args in [
-            ["yaa", "--json", "--quiet"],
-            ["yaa", "--json", "--verbose"],
-        ] {
+        for args in [["yaa", "--json", "--quiet"], ["yaa", "--json", "--verbose"]] {
             let err = Cli::try_parse_from(args).unwrap_err();
             assert_eq!(
                 err.kind(),
@@ -196,5 +237,79 @@ mod tests {
                 "应为参数冲突（{args:?}）"
             );
         }
+    }
+
+    #[test]
+    fn to_requires_notify() {
+        // 阶段 5：`--to` 未与 `--notify` 组合时是用法错误（clap 缺必需参数，退出码 2）。
+        let err = Cli::try_parse_from(["yaa", "--to", "/tmp/x.db", "你好"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn to_with_notify_parses() {
+        let cli = Cli::parse_from(["yaa", "--notify=注释", "--to", "/tmp/x.db"]);
+        assert_eq!(cli.notify.as_deref(), Some("注释"));
+        assert_eq!(cli.to.as_deref(), Some(std::path::Path::new("/tmp/x.db")));
+    }
+
+    #[test]
+    fn to_conflicts_with_no_store() {
+        // `--to` 显式声明与 `--no-store` 冲突；无论是否同时给 `--notify`，都以
+        // 用法错误（退出码 2）结束。
+        for args in [
+            vec!["yaa", "--notify=x", "--to", "/tmp/x.db", "--no-store"],
+            vec!["yaa", "--to", "/tmp/x.db", "--no-store"],
+        ] {
+            let err = Cli::try_parse_from(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "应为参数冲突（{args:?}）"
+            );
+        }
+    }
+
+    #[test]
+    fn notify_rejects_clear_status_and_get_prompt() {
+        // F13/F15：`--notify` 是短路写入路径，不得静默忽略 `--clear`/`--status`/
+        // `--get-prompt`；这些组合必须是用法错误（退出码 2）。
+        for args in [
+            vec!["yaa", "--notify=x", "--clear"],
+            vec!["yaa", "--notify=x", "--status"],
+            vec!["yaa", "--notify=x", "--get-prompt", "system"],
+        ] {
+            let err = Cli::try_parse_from(&args).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "应为参数冲突（{args:?}）"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("--notify"),
+                "文案应指明 --notify（{args:?}）：{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn notify_rejects_positional_prompt() {
+        // F14：`--notify` 不进入对话，位置提示词不得被静默忽略。
+        // clap 的 `conflicts_with` 会与 `--to` 的 `requires` 互相抵消，故走显式校验。
+        let cli = Cli::parse_from(["yaa", "--notify=注释", "提示词"]);
+        let message = cli.validate_combinations().unwrap_err();
+        assert!(
+            message.contains("--notify"),
+            "文案应指明 --notify：{message}"
+        );
+        assert!(
+            message.contains("位置提示词"),
+            "文案应指明位置提示词：{message}"
+        );
+
+        // 不带位置提示词时校验通过。
+        let cli = Cli::parse_from(["yaa", "--notify=注释"]);
+        assert!(cli.validate_combinations().is_ok());
     }
 }

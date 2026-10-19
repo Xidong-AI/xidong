@@ -102,7 +102,7 @@ pub fn items_from(records: &[Record], start: usize) -> Vec<DisplayItem> {
         let index = start + offset;
         match record {
             Record::System(system) => {
-                if system.source == "notify" && has_visible_text(system) {
+                if yaa_msg::is_injectable_system(system) && has_visible_text(system) {
                     items.push(DisplayItem::Injection {
                         comment: envelope_comment(&system.content)
                             .unwrap_or("通知")
@@ -253,7 +253,7 @@ impl DisplayProjector {
         }
         match record {
             Record::System(system) => {
-                if system.source == "notify" && has_visible_text(system) {
+                if yaa_msg::is_injectable_system(system) && has_visible_text(system) {
                     items.push(DisplayItem::Injection {
                         comment: envelope_comment(&system.content)
                             .unwrap_or("通知")
@@ -537,6 +537,8 @@ mod tests {
             id: "s".into(),
             ts: 1,
             source: "notify".into(),
+            origin: None,
+            call_id: None,
             command: None,
             output_files: None,
             content: "正文".into(),

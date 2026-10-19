@@ -7,6 +7,7 @@ mod record;
 
 pub use record::{
     Ai, ApprovalDecision, OutputFiles, Record, System, ToolCall, ToolOrigin, ToolResult, User,
+    is_injectable_system,
 };
 
 /// 当前 Unix 毫秒时间戳。

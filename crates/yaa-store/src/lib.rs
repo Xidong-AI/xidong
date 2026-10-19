@@ -17,11 +17,17 @@ use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionB
 use sha2::{Digest, Sha256};
 use yaa_msg::Record;
 
+mod file_queue;
 mod inbox;
+mod spool;
 
 pub use inbox::{
     InboxMessage, InboxPhase, cleanup_inbox_tmp, count_inbox, publish_inbox, remove_inbox,
     scan_inbox,
+};
+pub use spool::{
+    SpoolMessage, cleanup_spool_tmp, count_spool, publish_spool, publish_spool_with_generation,
+    remove_spool, scan_spool,
 };
 
 /// `application_id` 取 `"YAA1"` 的 ASCII 字节。
@@ -130,6 +136,11 @@ impl Session {
     pub fn inbox_dir(&self) -> PathBuf {
         self.root.join(format!("{}inbox", self.artifact_prefix()))
     }
+
+    /// spool 根目录：发布失败的通知暂存于此，下次运行补投。
+    pub fn spool_dir(&self) -> PathBuf {
+        self.root.join(format!("{}spool", self.artifact_prefix()))
+    }
 }
 
 /// 存储层错误。
@@ -162,6 +173,22 @@ pub enum StoreError {
     Inbox(String),
     #[error("会话已归档：发布世代已变化（期望 {expected}，当前 {current}）")]
     GenerationChanged { expected: i64, current: i64 },
+}
+
+impl StoreError {
+    /// 发布失败是否属于可重试类别（BUSY/IO），可降级写 spool。
+    ///
+    /// generation 变化、归档、载荷非法与 schema 错误都是终态，不得 spool。
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            StoreError::Busy { .. } | StoreError::Io(_) => true,
+            StoreError::Sqlite(rusqlite::Error::SqliteFailure(inner, _)) => matches!(
+                inner.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked | ErrorCode::SystemIoFailure
+            ),
+            _ => false,
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -508,6 +535,23 @@ pub fn is_archived(session: &Session) -> Result<bool> {
     })
 }
 
+/// 只读查询归档标志：不触发 init 窗口重试、不创建任何文件。
+///
+/// 供显式 `--to` 的严格校验使用：目标可能不是 yaa 库，必须在**不创建任何目标文件**
+/// （含 `init.lock`/`-wal`/`-shm`）的前提下完成 `application_id`/`user_version`
+/// 校验并读取 archived。数据库以 `immutable=1` 只读 URI 打开，SQLite 不会创建
+/// 共享内存或 WAL 文件；文件不存在或为 0 字节时返回 `false`。
+///
+/// `immutable` 读的是最后一次 checkpoint 的主库内容；归档状态的最终裁决仍由发布
+/// 路径在锁内复查，故不会把通知写进已归档会话。
+pub fn archived_readonly(session: &Session) -> Result<bool> {
+    let Some(conn) = open_existing_readonly(session)? else {
+        return Ok(false);
+    };
+    validate_yaa(&conn, &session.db)?;
+    read_archived(&conn)
+}
+
 /// 基于 `flock` 的文件锁。锁随 [`FileLock`] 的 `File` 关闭而释放。
 pub struct FileLock {
     file: File,
@@ -618,6 +662,50 @@ fn open_existing_required(session: &Session, busy_timeout_ms: u64) -> Result<Con
             format!("会话数据库不存在：{}", session.db.display()),
         ))
     })
+}
+
+/// 以只读方式打开已存在的数据库；不存在或为 0 字节时返回 `None`。
+///
+/// 不创建数据库，也不走 [`retry_init_window`]（后者会创建 `init.lock`）。使用
+/// `immutable=1` URI：SQLite 不获取锁、不创建 `-wal`/`-shm`，满足显式 `--to`
+/// 「绝不创建目标文件」的约束。
+fn open_existing_readonly(session: &Session) -> Result<Option<Connection>> {
+    check_sqlite_version()?;
+    match fs::metadata(&session.db) {
+        Ok(meta) if meta.len() > 0 => {}
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    }
+
+    let uri = immutable_uri(&session.db);
+    let conn = Connection::open_with_flags(
+        &uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|err| map_open_error(err, &session.db))?;
+    conn.busy_timeout(Duration::from_millis(DEFAULT_BUSY_TIMEOUT_MS))?;
+    Ok(Some(conn))
+}
+
+/// 构造 `file:<percent-encoded-path>?immutable=1` URI。
+///
+/// 只保留 URI 路径中的安全字符；其余字节（含空格、`?`、`#`、非 ASCII）逐字节
+/// 百分号编码，避免路径中的特殊字符改变 URI 语义。
+fn immutable_uri(path: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut uri = String::from("file:");
+    for &byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'.' | b'_' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            // 写入 String 不会失败；忽略返回值以满足 `write!` 的 Result。
+            let _ = write!(uri, "%{byte:02X}");
+        }
+    }
+    uri.push_str("?immutable=1");
+    uri
 }
 
 /// 在读路径上容忍「数据库文件已非空、schema 尚未提交」的初始化窗口。
@@ -1009,6 +1097,17 @@ mod tests {
 
     fn session_in(dir: &Path) -> Session {
         Session::new(dir.join("session.db"))
+    }
+
+    /// 目录条目名（排序），用于断言只读路径没有新增文件。
+    fn dir_entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     fn user(content: &str) -> Record {
@@ -1522,6 +1621,29 @@ mod tests {
             .unwrap();
         assert_eq!(app_id, 0, "不得把普通 SQLite 库改写成 yaa 库");
         assert_eq!(events, 0);
+    }
+
+    /// F6：显式 `--to` 的只读校验对非 yaa 库（即使处于 WAL 模式）也不得创建
+    /// `init.lock`/`-wal`/`-shm`。
+    #[test]
+    fn archived_readonly_rejects_non_yaa_without_creating_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+        {
+            let conn = Connection::open(&session.db).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch("CREATE TABLE other (x INTEGER);")
+                .unwrap();
+        }
+        let before = dir_entries(dir.path());
+
+        let err = archived_readonly(&session).unwrap_err();
+        assert!(matches!(err, StoreError::NotYaaSession { .. }), "{err:?}");
+        assert_eq!(
+            dir_entries(dir.path()),
+            before,
+            "只读校验不得创建 init.lock/-wal/-shm"
+        );
     }
 
     #[test]

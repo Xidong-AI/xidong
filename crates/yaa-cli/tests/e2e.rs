@@ -345,7 +345,12 @@ impl TestEnv {
     ///
     /// `sid` 由规范化工作目录的 sha256 前 32 位十六进制决定，与 core 算法一致。
     fn session_db(&self) -> PathBuf {
-        let canon = self.work.canonicalize().unwrap();
+        self.session_db_for(&self.work)
+    }
+
+    /// 指定工作目录对应的会话数据库。
+    fn session_db_for(&self, work: &Path) -> PathBuf {
+        let canon = work.canonicalize().unwrap();
         let mut hasher = Sha256::new();
         hasher.update(canon.as_os_str().as_encoded_bytes());
         let digest = format!("{:x}", hasher.finalize());
@@ -386,6 +391,21 @@ fn read_events(db: &Path) -> Vec<Value> {
         .unwrap()
         .iter()
         .map(|record| serde_json::to_value(record).unwrap())
+        .collect()
+}
+
+/// 读取任意会话数据库指定 phase 的 inbox 消息（跨会话 `--to` 断言用）。
+fn read_inbox_at(db: &Path, phase: &str) -> Vec<Value> {
+    let phase = match phase {
+        "init" => yaa_store::InboxPhase::Init,
+        "pending" => yaa_store::InboxPhase::Pending,
+        other => panic!("未知 inbox phase：{other}"),
+    };
+    let session = yaa_store::Session::new(db);
+    yaa_store::scan_inbox(&session, phase)
+        .unwrap()
+        .iter()
+        .map(|message| serde_json::to_value(&message.record).unwrap())
         .collect()
 }
 
@@ -790,7 +810,14 @@ fn get_prompt_matches_shell_schema_and_user_is_usage_error() {
     let output = env.run(&["--get-prompt", "system"]);
     assert_eq!(output.status.code(), Some(0));
     let stdout = stdout_of(&output);
-    for needle in ["shell", "command", "description"] {
+    for needle in [
+        "shell",
+        "command",
+        "description",
+        "YAA_SESSION",
+        "YAA_PARENT",
+        "YAA_NOTIFY",
+    ] {
         assert!(
             stdout.contains(needle),
             "工具 section 缺少 {needle}：{stdout}"
@@ -1975,6 +2002,53 @@ async fn external_notify_during_model_request_is_displayed_exactly_once() {
         count_source(&records, "notify"),
         1,
         "外部通知应恰好落盘一次：{records:?}"
+    );
+}
+
+/// 阶段 5 环境链：shell 工具子进程看到 `YAA_SESSION`/`YAA_NOTIFY` = 本会话库、
+/// `YAA_NOTIFY_CALL_ID` = 本次调用 id，且继承的外部 `YAA_SESSION` 记为 `YAA_PARENT`
+/// （模拟嵌套子智能体）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_tool_env_chain_injects_notify_and_parent() {
+    let env = TestEnv::new(0);
+    env.write_config(PLAIN_CONFIG);
+    let parent = env._root.path().join("parent").join("session.db");
+
+    let command = r#"printf '%s\n%s\n%s\n%s\n' "$YAA_SESSION" "$YAA_NOTIFY" "${YAA_PARENT:-<unset>}" "$YAA_NOTIFY_CALL_ID""#;
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_1", command, None, None),
+        text_response("完成"),
+    ])
+    .await;
+    env.write_llm(&llm_toml_with(addr.port(), "openai"));
+
+    let output = env
+        .command()
+        .env("YAA_SESSION", &parent)
+        .env_remove("YAA_NOTIFY")
+        .env_remove("YAA_PARENT")
+        .arg("你好")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let self_db = env.session_db().to_string_lossy().into_owned();
+    let parent_str = parent.to_string_lossy().into_owned();
+    let records = read_events(&env.session_db());
+    let result = records
+        .iter()
+        .find(|record| record["type"] == "tool_result")
+        .expect("应有工具结果");
+    let lines: Vec<&str> = result["stdout"].as_str().unwrap().lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            self_db.as_str(),
+            self_db.as_str(),
+            parent_str.as_str(),
+            "call_1"
+        ],
+        "工具子进程环境链应为 SESSION=自己、NOTIFY=自己、PARENT=继承会话、CALL_ID=本条调用"
     );
 }
 
@@ -3177,6 +3251,312 @@ fn notify_rejects_archived_session() {
     assert_eq!(read_events(&db).len(), 1, "归档库不得新增记录");
 }
 
+// ===== 阶段 5 刀 2：`--to` 与严格校验 =====
+
+/// 显式 `--to` 指向不存在的路径：退出 1，且绝不创建目标目录或回落到默认会话。
+#[test]
+fn notify_to_missing_target_is_rejected_without_creation() {
+    let env = TestEnv::new(0);
+    let missing_dir = env._root.path().join("missing");
+    let missing_db = missing_dir.join("session.db");
+
+    let output = env.run(&[
+        "--to",
+        missing_db.to_str().unwrap(),
+        "--notify=x",
+        "--",
+        "printf",
+        "y",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("目标会话不存在"), "stderr：{stderr}");
+    assert!(stderr.contains("不会创建新会话"), "stderr：{stderr}");
+    assert!(
+        !missing_dir.exists(),
+        "显式 --to 不得创建目标目录：{}",
+        missing_dir.display()
+    );
+    assert!(
+        env.read_inbox("pending").is_empty(),
+        "失败的通知不得回落到默认会话"
+    );
+}
+
+/// 显式 `--to` 指向非 yaa 的 SQLite 库：退出 1，错误原样来自 store 校验；
+/// 且目标目录不得新增 `init.lock`/`-wal`/`-shm`（F6：只读校验不创建任何文件）。
+#[test]
+fn notify_to_non_yaa_database_is_rejected() {
+    let env = TestEnv::new(0);
+    let target_dir = env._root.path().join("plain");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let db = target_dir.join("session.db");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch("CREATE TABLE other (x INTEGER);")
+        .unwrap();
+    drop(conn);
+    let before = directory_entries(&target_dir);
+
+    let output = env.run(&[
+        "--to",
+        db.to_str().unwrap(),
+        "--notify=x",
+        "--",
+        "printf",
+        "y",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("不是 yaa 会话数据库"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(read_inbox_at(&db, "pending").is_empty());
+    assert_eq!(
+        directory_entries(&target_dir),
+        before,
+        "显式 --to 校验失败不得创建 init.lock/-wal/-shm"
+    );
+}
+
+/// 目录下的条目名集合（排序后），用于断言「没有新增文件」。
+fn directory_entries(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// 显式 `--to` 指向已归档会话：退出 1，且不写入 inbox。
+#[test]
+fn notify_to_archived_session_is_rejected() {
+    let env = TestEnv::new(0);
+    let db = env._root.path().join("target").join("session.db");
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    yaa_store::set_archived(&yaa_store::Session::new(db.clone())).unwrap();
+
+    let output = env.run(&[
+        "--to",
+        db.to_str().unwrap(),
+        "--notify=x",
+        "--",
+        "printf",
+        "y",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("已归档"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(read_inbox_at(&db, "pending").is_empty());
+}
+
+/// 显式 `--to` 指向旧 `.jsonl`：退出 1，并提示 `--clear`。
+#[test]
+fn notify_to_legacy_jsonl_is_rejected() {
+    let env = TestEnv::new(0);
+    let legacy = env._root.path().join("old.jsonl");
+    std::fs::write(&legacy, b"{}\n").unwrap();
+
+    let output = env.run(&[
+        "--to",
+        legacy.to_str().unwrap(),
+        "--notify=x",
+        "--",
+        "printf",
+        "y",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("旧版 JSONL"), "stderr：{stderr}");
+    assert!(stderr.contains("--clear"), "stderr：{stderr}");
+}
+
+/// 显式 `--to` 指向缺少 `session.db` 的目录：退出 1，且不创建 `session.db`。
+#[test]
+fn notify_to_directory_without_session_db_is_rejected() {
+    let env = TestEnv::new(0);
+    let target = env._root.path().join("empty-target");
+    std::fs::create_dir_all(&target).unwrap();
+    let db = target.join("session.db");
+
+    let output = env.run(&[
+        "--to",
+        target.to_str().unwrap(),
+        "--notify=x",
+        "--",
+        "printf",
+        "y",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("目标会话不存在"), "stderr：{stderr}");
+    assert!(
+        stderr.contains(&db.to_string_lossy().to_string()),
+        "应指明探测路径：{stderr}"
+    );
+    assert!(!db.exists(), "不得在目标目录创建 session.db");
+}
+
+/// 显式 `--to` 跨会话投递：消息写入目标 `pending/`，默认会话保持干净。
+#[test]
+fn notify_to_explicit_session_delivers_to_target_inbox() {
+    let env = TestEnv::new(0);
+    let target_dir = env._root.path().join("target");
+    let target_db = target_dir.join("session.db");
+    seed(&target_db, &[yaa_msg::Record::user("既有")]);
+
+    let output = env.run(&[
+        "--to",
+        target_dir.to_str().unwrap(),
+        "--notify=跨会话",
+        "--",
+        "printf",
+        "X",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    let pending = read_inbox_at(&target_db, "pending");
+    assert_eq!(pending.len(), 1, "目标 inbox：{pending:?}");
+    assert_eq!(pending[0]["content"], "<跨会话>\nX\n</跨会话>");
+    assert!(
+        read_inbox_at(&target_db, "init").is_empty(),
+        "跨会话目标不得写 init/"
+    );
+    assert!(
+        env.read_inbox("pending").is_empty(),
+        "默认会话不得收到跨会话通知"
+    );
+    assert_eq!(
+        read_events(&target_db).len(),
+        1,
+        "--notify 只发布，不得直接写 events"
+    );
+}
+
+/// 显式 `--to` 即使环境标记为 init 阶段，也一律写目标 `pending/`。
+#[test]
+fn notify_to_explicit_target_ignores_init_phase() {
+    let env = TestEnv::new(0);
+    let target_db = env._root.path().join("target").join("session.db");
+    seed(&target_db, &[yaa_msg::Record::user("既有")]);
+
+    let output = env
+        .command()
+        .env("YAA_INBOX_PHASE", "init")
+        .args([
+            "--to",
+            target_db.to_str().unwrap(),
+            "--notify=初始化",
+            "--",
+            "printf",
+            "i",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read_inbox_at(&target_db, "pending").len(), 1);
+    assert!(read_inbox_at(&target_db, "init").is_empty());
+}
+
+/// 显式 `--to` 与 `--session` 指向不同会话：用法错误（退出 2），两边都不写。
+#[test]
+fn notify_to_and_session_conflict_is_usage_error() {
+    let env = TestEnv::new(0);
+    let left_db = env._root.path().join("left").join("session.db");
+    seed(&left_db, &[yaa_msg::Record::user("左")]);
+    let right_db = env._root.path().join("right").join("session.db");
+    seed(&right_db, &[yaa_msg::Record::user("右")]);
+
+    let output = env.run(&[
+        "--to",
+        left_db.to_str().unwrap(),
+        "--session",
+        right_db.to_str().unwrap(),
+        "--notify=x",
+        "--",
+        "printf",
+        "y",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("--to"), "stderr：{stderr}");
+    assert!(stderr.contains("--session"), "stderr：{stderr}");
+    assert!(read_inbox_at(&left_db, "pending").is_empty());
+    assert!(read_inbox_at(&right_db, "pending").is_empty());
+}
+
+/// `--to` 目录与 `--session` 数据库指向同一会话时允许。
+#[test]
+fn notify_to_and_session_same_target_is_allowed() {
+    let env = TestEnv::new(0);
+    let target_dir = env._root.path().join("target");
+    let target_db = target_dir.join("session.db");
+    seed(&target_db, &[yaa_msg::Record::user("既有")]);
+
+    let output = env.run(&[
+        "--to",
+        target_dir.to_str().unwrap(),
+        "--session",
+        target_db.to_str().unwrap(),
+        "--notify=同目标",
+        "--",
+        "printf",
+        "X",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read_inbox_at(&target_db, "pending").len(), 1);
+}
+
 /// 归档当前（默认）会话并返回归档数据库路径。
 fn archive_current_session(env: &TestEnv) -> PathBuf {
     let cleared = env.run(&["--clear"]);
@@ -3329,6 +3709,57 @@ async fn follower_waits_then_exits_on_generation_change() {
         stderr_of(&output).contains("停止跟随"),
         "stderr：{}",
         stderr_of(&output)
+    );
+    assert!(
+        state.requests.lock().unwrap().is_empty(),
+        "纯跟随不得调用模型"
+    );
+    drop(held);
+}
+
+/// 刀 3：follower 不补投 spool，但检测到滞留时提示数量，且不删除文件。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn follower_notices_spool_without_replaying() {
+    let (addr, state) = start_server(vec![text_response("不应调用")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    let session = yaa_store::Session::new(db.clone());
+    let held = yaa_store::FileLock::try_exclusive(&session.runner_lock_path())
+        .unwrap()
+        .expect("测试进程应能先持锁");
+
+    let mut child = env
+        .command()
+        .arg("跟随")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(child.try_wait().unwrap().is_none(), "跟随者应保持存活");
+
+    let spooled = yaa_msg::Record::system("notify", "<通知>\n滞留\n</通知>", None, None);
+    yaa_store::publish_spool(&session, &spooled).unwrap();
+    // 给 follower 一个轮询周期检测 spool。
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    bump_generation(&db);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("暂存在 spool"), "stderr：{stderr}");
+    assert!(stderr.contains("1 条"), "应提示数量：{stderr}");
+    assert_eq!(
+        yaa_store::count_spool(&session).unwrap(),
+        1,
+        "follower 不得补投或删除 spool 文件"
     );
     assert!(
         state.requests.lock().unwrap().is_empty(),
@@ -4762,4 +5193,1077 @@ fn bump_generation(db: &Path) {
         [],
     )
     .unwrap();
+}
+
+// ===== 阶段 5 刀 3：归因字段与 spool 保底 =====
+
+/// 刀 3：`--to` 子→父通知落库后带发布者 `origin` 与合法 `call_id`；`--` 与 stdin
+/// 两种形态都填。
+#[test]
+fn notify_to_parent_records_origin_and_call_id() {
+    let env = TestEnv::new(0);
+    let parent = env.work.join("parent").join("session.db");
+    seed(&parent, &[yaa_msg::Record::user("父既有")]);
+    let child = env.work.join("child").join("session.db");
+    seed(&child, &[yaa_msg::Record::user("子既有")]);
+
+    let output = env
+        .command()
+        .env("YAA_SESSION", child.to_str().unwrap())
+        .env("YAA_NOTIFY_CALL_ID", "call_abc-123")
+        .args([
+            "--notify=子完成",
+            "--to",
+            parent.to_str().unwrap(),
+            "--",
+            "printf",
+            "X",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    let records = read_inbox_at(&parent, "pending");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["source"], "notify");
+    let child_origin = std::path::absolute(&child)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        records[0]["origin"].as_str(),
+        Some(child_origin.as_str()),
+        "origin 应为发布者会话库绝对路径：{}",
+        records[0]
+    );
+    assert_eq!(records[0]["call_id"], "call_abc-123");
+
+    // stdin 形态同样带归因。
+    let stdin = env
+        .command()
+        .env("YAA_SESSION", child.to_str().unwrap())
+        .env("YAA_NOTIFY_CALL_ID", "call_stdin")
+        .args(["--notify=stdin", "--to", parent.to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = stdin;
+    stdin.stdin.take().unwrap().write_all(b"payload").unwrap();
+    let stdin = stdin.wait_with_output().unwrap();
+    assert_eq!(
+        stdin.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&stdin)
+    );
+
+    let records = read_inbox_at(&parent, "pending");
+    assert_eq!(records.len(), 2);
+    let stdin_record = records
+        .iter()
+        .find(|record| record["content"].as_str().unwrap().contains("payload"))
+        .expect("应找到 stdin 通知");
+    assert_eq!(stdin_record["call_id"], "call_stdin");
+    assert_eq!(stdin_record["origin"].as_str(), Some(child_origin.as_str()));
+}
+
+/// 刀 3：非法 `YAA_NOTIFY_CALL_ID`（空、超长、含非法字符）静默忽略，不写字段；
+/// `origin` 仍然写。
+#[test]
+fn notify_ignores_illegal_call_id() {
+    let too_long = "x".repeat(129);
+    for illegal in ["", "has space", too_long.as_str(), "冒号:"] {
+        let env = TestEnv::new(0);
+        let output = env
+            .command()
+            .env("YAA_NOTIFY_CALL_ID", illegal)
+            .args(["--notify=非法归因", "--", "true"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "非法 call_id 不得报错：{}",
+            stderr_of(&output)
+        );
+
+        let records = env.read_inbox("pending");
+        assert_eq!(records.len(), 1);
+        assert!(
+            records[0].get("call_id").is_none(),
+            "非法 call_id 不得写入：{}",
+            records[0]
+        );
+        assert!(
+            records[0]["origin"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("session.db")),
+            "origin 应总是写入：{}",
+            records[0]
+        );
+    }
+}
+
+/// 刀 3：旧 `system` JSON（无 `origin`/`call_id`）仍可被 `--status` 解析。
+#[test]
+fn status_accepts_system_without_attribution() {
+    let env = TestEnv::new(0);
+    let db = env.work.join("old.db");
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+
+    let payload = r#"{"type":"system","id":"01JOLDSYSTEM000000000000000","ts":5,"source":"notify","command":"echo hi","content":"<注释>\n旧记录\n</注释>"}"#;
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO events (id, payload) VALUES (?1, ?2)",
+        rusqlite::params!["01JOLDSYSTEM000000000000000", payload],
+    )
+    .unwrap();
+
+    let output = env.run(&["--status", "--session", db.to_str().unwrap()]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "缺归因字段的旧 system 应可解析：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("记录：2 条"),
+        "{}",
+        stdout_of(&output)
+    );
+}
+
+/// 刀 3：发布 inbox 因 IO 失败（`inbox/tmp` 是普通文件）时降级写 spool，命令仍退出 0；
+/// 下次 run 补投且重复 run 不重复（events 恰一条）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_falls_back_to_spool_and_next_run_replays_once() {
+    let (addr, _state) = start_server(vec![text_response("答一"), text_response("答二")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    // 让 inbox 发布必然失败：`inbox/tmp` 被一个普通文件占位。
+    std::fs::create_dir_all(env.inbox_root()).unwrap();
+    std::fs::write(env.inbox_root().join("tmp"), b"block").unwrap();
+
+    let notify = env.run(&["--notify=保底", "--", "printf", "X"]);
+    assert_eq!(
+        notify.status.code(),
+        Some(0),
+        "降级 spool 后退出码应保持 0：{}",
+        stderr_of(&notify)
+    );
+    assert!(
+        stderr_of(&notify).contains("spool"),
+        "应提示已写入 spool：{}",
+        stderr_of(&notify)
+    );
+
+    let session = yaa_store::Session::new(env.session_db());
+    let spooled = yaa_store::scan_spool(&session).unwrap();
+    assert_eq!(spooled.len(), 1, "应有一条 spool 保底记录");
+    let spooled_id = spooled[0].id().to_owned();
+    assert!(
+        matches!(&spooled[0].record, yaa_msg::Record::System(system) if system.source == "notify")
+    );
+    assert_eq!(
+        yaa_store::count_inbox(&session, yaa_store::InboxPhase::Pending).unwrap(),
+        0,
+        "inbox 发布失败时不得留下半成品"
+    );
+
+    // 解除阻塞后正常 run：spool 在 init 前补投。
+    std::fs::remove_file(env.inbox_root().join("tmp")).unwrap();
+    let first = env.run(&["任务"]);
+    assert!(first.status.success(), "stderr：{}", stderr_of(&first));
+
+    let records = read_events(&env.session_db());
+    let delivered: Vec<_> = records
+        .iter()
+        .filter(|record| record["id"] == spooled_id.as_str())
+        .collect();
+    assert_eq!(delivered.len(), 1, "spool 记录应恰好落库一次：{records:?}");
+    assert_eq!(delivered[0]["source"], "notify");
+    assert!(env.read_inbox("pending").is_empty());
+    assert!(yaa_store::scan_spool(&session).unwrap().is_empty());
+
+    // 再 run 一次：不得重复补投。
+    let second = env.run(&["继续"]);
+    assert!(second.status.success(), "stderr：{}", stderr_of(&second));
+    let records = read_events(&env.session_db());
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["id"] == spooled_id.as_str())
+            .count(),
+        1,
+        "重复 run 不得重复落库：{records:?}"
+    );
+}
+
+/// 刀 3：同一条记录同时出现在 inbox 与 spool 时，补投按 id 幂等，events 恰一条。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spool_and_inbox_duplicate_is_idempotent() {
+    let (addr, _state) = start_server(vec![text_response("答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    let session = yaa_store::Session::new(db.clone());
+
+    let notify = yaa_msg::Record::system("notify", "<注释>\n双投\n</注释>", None, None);
+    let id = notify.id().to_owned();
+    yaa_store::publish_inbox(&session, yaa_store::InboxPhase::Pending, &notify).unwrap();
+    yaa_store::publish_spool(&session, &notify).unwrap();
+
+    let output = env.run(&["任务"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = read_events(&db);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["id"] == id.as_str())
+            .count(),
+        1,
+        "双投应幂等：{records:?}"
+    );
+    assert!(yaa_store::scan_spool(&session).unwrap().is_empty());
+}
+
+/// 刀 3：非空 spool 阻止 `--clear` 归档；`--status` 显示 spool 计数。
+#[test]
+fn clear_refuses_when_spool_nonempty_and_status_counts_it() {
+    let env = TestEnv::new(0);
+    let db = env.session_db();
+    seed(&db, &[yaa_msg::Record::user("既有")]);
+    let session = yaa_store::Session::new(db.clone());
+    yaa_store::publish_spool(
+        &session,
+        &yaa_msg::Record::system("notify", "<注释>\n滞留\n</注释>", None, None),
+    )
+    .unwrap();
+
+    let status = env.run(&["--status"]);
+    assert_eq!(status.status.code(), Some(0));
+    assert!(
+        stdout_of(&status).contains("滞留 spool：1 条"),
+        "stdout：{}",
+        stdout_of(&status)
+    );
+
+    let cleared = env.run(&["--clear"]);
+    assert_eq!(
+        cleared.status.code(),
+        Some(1),
+        "非空 spool 必须拒绝归档：{}",
+        stderr_of(&cleared)
+    );
+    assert!(
+        stderr_of(&cleared).contains("待处理"),
+        "stderr：{}",
+        stderr_of(&cleared)
+    );
+    assert_eq!(
+        yaa_store::count_spool(&session).unwrap(),
+        1,
+        "不得删除 spool"
+    );
+    assert!(
+        !env.data_home.join("history").exists(),
+        "拒绝归档不得产生历史"
+    );
+}
+
+// ===== 阶段 5 刀 4：后台回注范式与时序 =====
+
+/// I5：目标会话存在但无 runner 时，外部 `--to` 通知只滞留 `pending/`，
+/// `--status` 计数随之 +1，且绝不触发任何模型请求。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_to_session_without_runner_stays_pending_and_makes_no_requests() {
+    // 给一个可用响应只为让意外请求留下计数，而不是把服务端脚本耗尽。
+    let (addr, state) = start_server(vec![text_response("不应被请求")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let target_db = env._root.path().join("target").join("session.db");
+    seed(&target_db, &[yaa_msg::Record::user("既有历史")]);
+    let target = target_db.to_str().unwrap();
+
+    let before = env.run(&["--status", "--session", target]);
+    assert_eq!(
+        before.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&before)
+    );
+    assert!(
+        stdout_of(&before).contains("待处理消息：0 条（pending 0 / init 0）"),
+        "stdout：{}",
+        stdout_of(&before)
+    );
+
+    let notify = env.run(&["--to", target, "--notify=无 runner", "--", "printf", "X"]);
+    assert_eq!(
+        notify.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&notify)
+    );
+
+    let pending = read_inbox_at(&target_db, "pending");
+    assert_eq!(pending.len(), 1, "目标 pending：{pending:?}");
+    assert_eq!(pending[0]["source"], "notify");
+
+    let after = env.run(&["--status", "--session", target]);
+    assert_eq!(
+        after.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&after)
+    );
+    assert!(
+        stdout_of(&after).contains("待处理消息：1 条（pending 1 / init 0）"),
+        "status 计数应 +1：{}",
+        stdout_of(&after)
+    );
+
+    assert_eq!(
+        read_events(&target_db).len(),
+        1,
+        "通知只滞留 inbox，不得直接写 events"
+    );
+    assert!(
+        state.requests.lock().unwrap().is_empty(),
+        "无 runner 的会话不得产生任何模型请求：{:?}",
+        state.requests.lock().unwrap()
+    );
+}
+
+/// I10：模型请求在途（服务端阻塞）时外部 `--to` 注入；放开后本 run 先执行工具，
+/// 再在安全点消费通知并继续请求，通知恰落库一次、恰展示一次，最终回复正常。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_injected_while_request_in_flight_is_consumed_once() {
+    let env = TestEnv::new(0);
+    env.write_config(PLAIN_CONFIG);
+
+    // 服务端收到请求后先 touch 标记，再轮询等待 release 文件；避免固定长 sleep 赌时序。
+    let marker = env._root.path().join("request-seen");
+    let release = env._root.path().join("release-request");
+    let mut blocker = Command::new("sh");
+    blocker
+        .arg("-c")
+        .arg(format!(
+            "touch '{}'; while [ ! -e '{}' ]; do sleep 0.02; done",
+            marker.display(),
+            release.display()
+        ))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let (addr, state) = start_server_with_side_effect(
+        vec![
+            tool_call_response("call_wait", "true", None, None),
+            text_response("通知后答"),
+        ],
+        blocker,
+    )
+    .await;
+    env.write_llm(&llm_toml_with(addr.port(), "openai"));
+
+    let run = env
+        .command()
+        .arg("问题")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // 第一个模型请求已到达服务端且响应被阻塞。
+    wait_until(|| marker.exists(), "模型请求到达");
+    let db = env.session_db();
+    let notify = env.run(&[
+        "--to",
+        db.to_str().unwrap(),
+        "--notify=请求期间",
+        "--",
+        "printf",
+        "INJECT",
+    ]);
+    assert_eq!(
+        notify.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&notify)
+    );
+    let pending = read_inbox_at(&db, "pending");
+    assert_eq!(pending.len(), 1, "注入应滞留 pending：{pending:?}");
+    let injected_id = pending[0]["id"].as_str().unwrap().to_string();
+
+    std::fs::write(&release, b"go").unwrap();
+    let output = run.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+
+    let records = read_events(&db);
+    let delivered: Vec<_> = records
+        .iter()
+        .filter(|record| record["id"] == injected_id.as_str())
+        .collect();
+    assert_eq!(delivered.len(), 1, "通知应恰落库一次：{records:?}");
+    assert_eq!(delivered[0]["type"], "system");
+    assert_eq!(delivered[0]["source"], "notify");
+    assert_eq!(
+        stderr_of(&output).matches("# 请求期间").count(),
+        1,
+        "通知应恰展示一次：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stdout_of(&output).contains("通知后答"),
+        "最终回复应来自注入后的请求：{}",
+        stdout_of(&output)
+    );
+    assert_eq!(
+        state.requests.lock().unwrap().len(),
+        2,
+        "注入后应再请求一次模型"
+    );
+    assert_eq!(
+        yaa_store::count_inbox(&yaa_store::Session::new(db), yaa_store::InboxPhase::Pending)
+            .unwrap(),
+        0,
+        "通知应已消费"
+    );
+}
+
+/// 刀 4（可选）：父的 `tool_call` → 工具内嵌 `yaa --notify --to "$YAA_SESSION"`
+/// → 落库 `call_id` 等于父那次调用 id（不手工设置 `YAA_NOTIFY_CALL_ID`）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_embedded_notify_inherits_tool_call_id() {
+    let env = TestEnv::new(0);
+    env.write_config(PLAIN_CONFIG);
+    let command = format!(
+        "'{}' --notify=\"链路\" --to \"$YAA_SESSION\" -- printf CHAIN",
+        env!("CARGO_BIN_EXE_yaa")
+    );
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_chain", &command, None, None),
+        text_response("完成"),
+    ])
+    .await;
+    env.write_llm(&llm_toml_with(addr.port(), "openai"));
+
+    let output = env.run(&["任务"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let db = env.session_db();
+    let records = read_events(&db);
+    let notify = records
+        .iter()
+        .find(|record| {
+            record["type"] == "system"
+                && record["source"] == "notify"
+                && record["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("CHAIN"))
+        })
+        .unwrap_or_else(|| panic!("应落库一条通知：{records:?}"));
+    assert_eq!(
+        notify["call_id"], "call_chain",
+        "call_id 应继承本次工具调用：{notify}"
+    );
+    let self_origin = std::path::absolute(&db)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        notify["origin"].as_str(),
+        Some(self_origin.as_str()),
+        "origin 应为运行中会话：{notify}"
+    );
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["id"] == notify["id"])
+            .count(),
+        1,
+        "通知应恰落库一次：{records:?}"
+    );
+}
+
+// ===== 阶段 5 终审 F-A：core 域缺陷回归 =====
+
+/// F1：父 shell 工具孵化子会话时，子会话 init 钩子的通知必须落子 `inbox/init/`，
+/// 不得继承父会话的 `YAA_NOTIFY` 投进父 `pending/`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nested_child_init_notify_stays_in_child_session() {
+    let env = TestEnv::new(0);
+    let config = format!(
+        r#"
+[hooks]
+init = '''
+"{}" --notify="系统提示词" -- printf 'SYS:%s' "$YAA_SESSION"
+'''
+
+[agent]
+max_steps = 10
+"#,
+        env!("CARGO_BIN_EXE_yaa")
+    );
+    env.write_config(&config);
+
+    let child_work = env._root.path().join("child-work");
+    std::fs::create_dir_all(&child_work).unwrap();
+    let command = format!(
+        "'{}' --cwd '{}' -- '子任务'",
+        env!("CARGO_BIN_EXE_yaa"),
+        child_work.display()
+    );
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_child", &command, None, None),
+        text_response("子答"),
+        text_response("父答"),
+    ])
+    .await;
+    env.write_llm(&llm_toml_with(addr.port(), "openai"));
+
+    let output = env.run(&["父任务"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let parent_db = env.session_db();
+    let child_db = env.session_db_for(&child_work);
+    let child_db_abs = std::path::absolute(&child_db)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let child_records = read_events(&child_db);
+    let init_notify = child_records
+        .iter()
+        .find(|record| {
+            record["type"] == "system"
+                && record["source"] == "notify"
+                && record["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("系统提示词"))
+        })
+        .unwrap_or_else(|| panic!("子会话应落库 init 通知：{child_records:?}"));
+    assert!(
+        init_notify["content"]
+            .as_str()
+            .unwrap()
+            .contains(&child_db_abs),
+        "init 通知应来自子会话自身：{init_notify}"
+    );
+    assert!(
+        read_inbox_at(&child_db, "init").is_empty(),
+        "子 init/ 应在 run 内被消费"
+    );
+    assert!(
+        read_inbox_at(&parent_db, "pending").is_empty(),
+        "父 pending 不得收到子 init 通知：{:?}",
+        read_inbox_at(&parent_db, "pending")
+    );
+}
+
+/// F2：进程环境继承父工具调用的 `YAA_NOTIFY_CALL_ID` 时，init 钩子发布的通知
+/// 必须清空归因，不得把父 call_id 写进子会话记录。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn init_hook_clears_inherited_call_id() {
+    let (addr, _state) = start_server(vec![text_response("好")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(CUSTOM_INIT_CONFIG);
+
+    let output = env
+        .command()
+        .env("YAA_NOTIFY_CALL_ID", "call_parent")
+        .arg("任务")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = read_events(&env.session_db());
+    let notifies: Vec<_> = records
+        .iter()
+        .filter(|record| record["type"] == "system" && record["source"] == "notify")
+        .collect();
+    assert_eq!(notifies.len(), 3, "init 钩子应发布三条通知：{records:?}");
+    for notify in notifies {
+        assert!(
+            notify.get("call_id").is_none(),
+            "init 通知不得继承父 call_id：{notify}"
+        );
+    }
+}
+
+/// F5 + F8：`--to` 用符号链接或 `..` 表达时与 `--session` 判等通过，且通知落到
+/// 真实会话根（不是链接所在目录）。
+#[cfg(unix)]
+#[test]
+fn notify_to_symlink_and_dotdot_forms_are_same_session() {
+    let env = TestEnv::new(0);
+    let real_dir = env._root.path().join("real");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    let real_db = real_dir.join("session.db");
+    seed(&real_db, &[yaa_msg::Record::user("既有")]);
+
+    let link_db = env._root.path().join("link.db");
+    std::os::unix::fs::symlink(&real_db, &link_db).unwrap();
+
+    let output = env.run(&[
+        "--to",
+        link_db.to_str().unwrap(),
+        "--session",
+        real_db.to_str().unwrap(),
+        "--notify=符号链接",
+        "--",
+        "printf",
+        "L",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "符号链接与真实路径应判等：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        read_inbox_at(&real_db, "pending").len(),
+        1,
+        "通知应落真实会话 inbox"
+    );
+    assert!(
+        !env._root.path().join("inbox").exists(),
+        "不得写到链接所在目录"
+    );
+
+    let sub = real_dir.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let dotdot = sub.join("..").join("session.db");
+    let output = env.run(&[
+        "--to",
+        dotdot.to_str().unwrap(),
+        "--session",
+        real_db.to_str().unwrap(),
+        "--notify=点点",
+        "--",
+        "printf",
+        "D",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`..` 形式应判等：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(read_inbox_at(&real_db, "pending").len(), 2);
+}
+
+/// F7：`--to` 指向 FIFO 时必须在 1 秒内退出 1，绝不因 `File::open` 阻塞而挂起。
+#[cfg(unix)]
+#[test]
+fn notify_to_fifo_is_rejected_without_hanging() {
+    let env = TestEnv::new(0);
+    let fifo = env._root.path().join("pipe");
+    let status = Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(status.success(), "mkfifo 失败");
+
+    let started = std::time::Instant::now();
+    let mut child = env
+        .command()
+        .args([
+            "--to",
+            fifo.to_str().unwrap(),
+            "--notify=x",
+            "--",
+            "printf",
+            "y",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("FIFO 目标不得挂起（1s 内应退出）");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(1),
+        "应在 1s 内退出"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("不是 yaa 会话数据库"),
+        "stderr：{}",
+        stderr_of(&output)
+    );
+}
+
+/// 构造一条带显式 id 的 notify 记录（用于精确控制 spool/inbox 的排序）。
+fn notify_with_id(id: &str, content: &str) -> yaa_msg::Record {
+    yaa_msg::Record::System(yaa_msg::System {
+        id: id.to_owned(),
+        ts: 1,
+        source: "notify".to_owned(),
+        origin: None,
+        call_id: None,
+        command: None,
+        output_files: None,
+        content: content.to_owned(),
+    })
+}
+
+/// F11：spool 补投只消费 spool 自身，不得把遗留的 `init/` 提前合并消费。
+///
+/// 构造：上一轮遗留的 `init/` 消息 + 一条 id 更大的 spool 消息。修复后 spool 先落库，
+/// `init/` 仍在 init 钩子之后按既有 id 顺序消费；旧实现会按 id 把 init 排到 spool 前。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spool_replay_does_not_consume_init_inbox() {
+    let (addr, _state) = start_server(vec![text_response("答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let session = yaa_store::Session::new(env.session_db());
+
+    let init_a = notify_with_id("01H000000000000000000000A", "<注释>\nINIT-A\n</注释>");
+    let init_b = notify_with_id("01H000000000000000000000B", "<注释>\nINIT-B\n</注释>");
+    let spooled = notify_with_id("01H000000000000000000000Z", "<注释>\nSPOOL\n</注释>");
+    yaa_store::publish_inbox(&session, yaa_store::InboxPhase::Init, &init_a).unwrap();
+    yaa_store::publish_inbox(&session, yaa_store::InboxPhase::Init, &init_b).unwrap();
+    yaa_store::publish_spool(&session, &spooled).unwrap();
+
+    let output = env.run(&["任务"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let records = read_events(&env.session_db());
+    let position = |id: &str| {
+        records
+            .iter()
+            .position(|record| record["id"] == id)
+            .unwrap_or_else(|| panic!("缺少记录 {id}：{records:?}"))
+    };
+    let spool_pos = position(spooled.id());
+    let init_a_pos = position(init_a.id());
+    let init_b_pos = position(init_b.id());
+    assert!(
+        spool_pos < init_a_pos && spool_pos < init_b_pos,
+        "spool 应在 init 消息之前落库：spool={spool_pos} initA={init_a_pos} initB={init_b_pos}"
+    );
+    assert!(
+        init_a_pos < init_b_pos,
+        "init/ 内部顺序不得被打乱：{records:?}"
+    );
+    assert!(read_inbox_at(&env.session_db(), "init").is_empty());
+    assert!(yaa_store::scan_spool(&session).unwrap().is_empty());
+}
+
+/// F12：删除 spool 文件失败只提示，不阻断本轮 run；文件留待下一轮幂等消费。
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spool_remove_failure_does_not_abort_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (addr, _state) = start_server(vec![text_response("答一"), text_response("答二")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    let session = yaa_store::Session::new(db.clone());
+    let spooled = notify_with_id("01H000000000000000000000C", "<注释>\n滞留\n</注释>");
+    let spool_path = yaa_store::publish_spool(&session, &spooled).unwrap();
+    let id = spooled.id().to_owned();
+
+    let spool_dir = session.spool_dir();
+    std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let first = env.run(&["任务"]);
+    // 立即恢复权限，保证临时目录可清理。
+    std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        first.status.success(),
+        "删除 spool 失败不得阻断 run：{}",
+        stderr_of(&first)
+    );
+    assert!(
+        stderr_of(&first).contains("删除 spool 文件失败"),
+        "应发出 Notice：{}",
+        stderr_of(&first)
+    );
+    assert!(spool_path.exists(), "删除失败时文件应留待下一轮");
+
+    let second = env.run(&["继续"]);
+    assert!(second.status.success(), "stderr：{}", stderr_of(&second));
+    assert!(!spool_path.exists(), "下一轮应成功删除");
+    let records = read_events(&db);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["id"] == id.as_str())
+            .count(),
+        1,
+        "重放应幂等：{records:?}"
+    );
+}
+
+// ===== 阶段 5 终审 F-B：CLI 域缺陷回归 =====
+
+/// F4：`origin` 是可选归因；cwd 默认会话存在旧 `default.jsonl` 导致发布者解析失败时，
+/// 显式 `--to` 的合法目标仍应成功发布，只是省略 `origin`。
+#[test]
+fn notify_to_explicit_target_succeeds_when_origin_resolution_fails() {
+    let env = TestEnv::new(0);
+    let target_db = env._root.path().join("target").join("session.db");
+    seed(&target_db, &[yaa_msg::Record::user("既有")]);
+
+    // 让 cwd 默认会话目录存在旧 `default.jsonl` 且没有 `session.db`：
+    // `resolve_session_target` 会拒绝解析，但 `--to` 的目标本身合法。
+    let default_dir = env.session_db().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&default_dir).unwrap();
+    std::fs::write(default_dir.join("default.jsonl"), b"{}\n").unwrap();
+
+    let output = env.run(&[
+        "--to",
+        target_db.to_str().unwrap(),
+        "--notify=无归因",
+        "--",
+        "printf",
+        "X",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "origin 解析失败不得阻断显式 --to：{}",
+        stderr_of(&output)
+    );
+
+    let pending = read_inbox_at(&target_db, "pending");
+    assert_eq!(pending.len(), 1, "通知应落目标 inbox：{pending:?}");
+    assert!(
+        pending[0].get("origin").is_none(),
+        "origin 解析失败时应省略该可选字段：{}",
+        pending[0]
+    );
+}
+
+/// F9：目标库被长事务阻塞时，notify 预检 BUSY 降级写 spool，命令退出码不变；
+/// 下次 run 恰好补投一次。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_precheck_busy_falls_back_to_spool_and_replays_once() {
+    let (addr, _state) = start_server(vec![text_response("答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let target_db = env._root.path().join("target").join("session.db");
+    seed(&target_db, &[yaa_msg::Record::user("既有")]);
+
+    // 用独立线程持 EXCLUSIVE 事务。切到 rollback journal 模式，使读路径也会被阻塞。
+    // 命令先 touch 标记：标记出现说明预检已 BUSY 失败、命令已开始；此时再释放锁，
+    // 让随后的 spool 写入能读到 generation，避免用固定 sleep 赌时序。
+    let marker = env._root.path().join("precheck-failed");
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let locked_db = target_db.clone();
+    let locker = std::thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&locked_db).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("测试应在预检失败后释放锁");
+        conn.execute_batch("ROLLBACK").unwrap();
+    });
+
+    let command = format!("touch '{}'; printf X", marker.display());
+    let child = env
+        .command()
+        .args([
+            "--session",
+            target_db.to_str().unwrap(),
+            "--notify=忙碌",
+            "--",
+            "sh",
+            "-c",
+            &command,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "预检未在预期时间内因 BUSY 失败"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    release_tx.send(()).unwrap();
+
+    let notify = child.wait_with_output().unwrap();
+    locker.join().unwrap();
+    assert_eq!(
+        notify.status.code(),
+        Some(0),
+        "预检 BUSY 不得改变命令退出码：{}",
+        stderr_of(&notify)
+    );
+    assert!(
+        stderr_of(&notify).contains("spool"),
+        "应提示已写入 spool：{}",
+        stderr_of(&notify)
+    );
+
+    let session = yaa_store::Session::new(target_db.clone());
+    let spooled = yaa_store::scan_spool(&session).unwrap();
+    assert_eq!(spooled.len(), 1, "预检 BUSY 应降级写 spool");
+    let spooled_id = spooled[0].id().to_owned();
+
+    let replay = env.run(&["--session", target_db.to_str().unwrap(), "任务"]);
+    assert!(replay.status.success(), "stderr：{}", stderr_of(&replay));
+    let records = read_events(&target_db);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record["id"] == spooled_id.as_str())
+            .count(),
+        1,
+        "spool 应恰好补投一次：{records:?}"
+    );
+    assert!(yaa_store::scan_spool(&session).unwrap().is_empty());
+}
+
+/// F13/F14/F15：`--notify` 与 `--clear`/`--status`/`--get-prompt`/位置提示词组合
+/// 一律退出 2，并给出明确文案，不得静默忽略后者。
+#[test]
+fn conflicting_notify_combinations_exit_two() {
+    let env = TestEnv::new(0);
+    for args in [
+        vec!["--notify=x", "--clear"],
+        vec!["--notify=x", "--status"],
+        vec!["--notify=x", "--get-prompt", "system"],
+        vec!["--notify=x", "提示词"],
+    ] {
+        let output = env.run(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} 应为用法错误：{}",
+            stderr_of(&output)
+        );
+        let stderr = stderr_of(&output);
+        assert!(!stderr.trim().is_empty(), "{args:?} 应有明确文案");
+        assert!(
+            stderr.contains("--notify"),
+            "{args:?} 文案应指明 --notify：{stderr}"
+        );
+    }
+}
+
+// ===== 阶段 5 终审 F-C：提示词后台范式回归 =====
+
+/// F3：提示词推荐的后台范式必须在 shell 工具内可用。
+///
+/// 整条后台作业重定向 stdout/stderr 后，工具应立即返回（<1s）且无读取超时占位；
+/// 后台 `yaa --notify` 约 2s 后把通知投到目标 inbox。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_notify_paradigm_returns_fast_and_delivers() {
+    let env = TestEnv::new(0);
+    env.write_config(PLAIN_CONFIG);
+    let db = env.session_db();
+    let command = format!(
+        "{{ sleep 2; '{}' --notify=\"后台到达\" --to \"$YAA_SESSION\" -- printf 'BG'; }} >/dev/null 2>&1 &",
+        env!("CARGO_BIN_EXE_yaa")
+    );
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_bg", &command, None, None),
+        text_response("完成"),
+    ])
+    .await;
+    env.write_llm(&llm_toml_with(addr.port(), "openai"));
+
+    let started = std::time::Instant::now();
+    let child = env
+        .command()
+        .arg("任务")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // 轮询 events 直到本次工具结果落库：1s 内必须返回。
+    let session = yaa_store::Session::new(db.clone());
+    let deadline = started + std::time::Duration::from_secs(1);
+    let mut tool_result: Option<yaa_msg::ToolResult> = None;
+    while std::time::Instant::now() < deadline {
+        if let Ok(records) = yaa_store::load(&session)
+            && let Some(result) = records.into_iter().find_map(|record| match record {
+                yaa_msg::Record::ToolResult(result) if result.call_id == "call_bg" => Some(result),
+                _ => None,
+            })
+        {
+            tool_result = Some(result);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let tool_result = tool_result.expect("shell 工具应在 1s 内返回");
+    assert_eq!(tool_result.code, 0, "后台作业的 shell 应以 0 返回");
+    assert!(
+        !tool_result.stdout.contains("读取超时") && !tool_result.stderr.contains("读取超时"),
+        "不得出现读取超时占位：stdout={:?} stderr={:?}",
+        tool_result.stdout,
+        tool_result.stderr
+    );
+
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    // 后台通知约 2s 后到达；轮询 pending 与 events，上限 4s。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let mut pending = Vec::new();
+    while std::time::Instant::now() < deadline {
+        pending = read_inbox_at(&db, "pending");
+        if !pending.is_empty() || delivered_notify(&db) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        !pending.is_empty() || delivered_notify(&db),
+        "后台通知应在 ~3s 内到达 inbox 或落库：pending={pending:?}"
+    );
+}
+
+/// events 中是否已有「后台到达」通知（runner 可能已消费）。
+fn delivered_notify(db: &Path) -> bool {
+    read_events(db).iter().any(|record| {
+        record["type"] == "system"
+            && record["source"] == "notify"
+            && record["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("后台到达"))
+    })
 }

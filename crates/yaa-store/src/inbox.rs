@@ -10,15 +10,16 @@
 //! 同一文件系统内 `rename` 原子，故无锁即可多进程安全；消费后直接删除文件，崩溃在
 //! “已 append、未删除”之间时文件会重现，由调用方以 `append_idempotent` 按 id 去重。
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::path::PathBuf;
+use std::time::Duration;
 
 use yaa_msg::Record;
 
-use crate::{Result, Session, StoreError};
+use crate::file_queue::{self, REJECTED_DIR, TMP_DIR};
+use crate::{Result, Session};
+
+#[cfg(test)]
+use crate::file_queue::{MAX_ID_BYTES, MAX_PAYLOAD_BYTES as MAX_INBOX_BYTES};
 
 /// inbox 阶段目录。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,127 +58,43 @@ impl InboxMessage {
     }
 }
 
-const TMP_DIR: &str = "tmp";
-const REJECTED_DIR: &str = "rejected";
-const EXTENSION: &str = "json";
-/// 单个 inbox 文件的大小上限：超限视为非法载荷。
-const MAX_INBOX_BYTES: u64 = 1024 * 1024;
-/// 消息 id 允许的最大字节数。
-const MAX_ID_BYTES: usize = 128;
-
-/// 进程内临时文件序号：即便并发发布同一条记录也不撞名。
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// 发布一条记录到指定阶段。
 ///
 /// 先把序列化载荷原子地落到 `tmp/`，再 `rename` 到 `<phase>/<id>.json`；任何一步失败
 /// 都会清理临时文件后返回错误。多进程无锁并发安全。
 ///
-/// `record.id()` 必须匹配 `[A-Za-z0-9_-]{1,128}`，否则直接报 [`StoreError::Inbox`]，
+/// `record.id()` 必须匹配 `[A-Za-z0-9_-]{1,128}`，否则直接报 [`crate::StoreError::Inbox`]，
 /// 不拼接任何路径，避免 id 逃逸出 phase 目录。
 pub fn publish_inbox(session: &Session, phase: InboxPhase, record: &Record) -> Result<()> {
-    if !is_valid_id(record.id()) {
-        return Err(StoreError::Inbox(format!(
-            "非法 inbox 消息 id：{:?}",
-            record.id()
-        )));
-    }
-
     let inbox = session.inbox_dir();
-    let tmp_dir = inbox.join(TMP_DIR);
-    let phase_dir = inbox.join(phase.dir_name());
-    fs::create_dir_all(&tmp_dir)?;
-    fs::create_dir_all(&phase_dir)?;
-
-    let payload = serde_json::to_vec(record)
-        .map_err(|err| StoreError::Inbox(format!("记录序列化失败：{err}")))?;
-
-    let tmp_path = tmp_dir.join(tmp_file_name(record.id()));
-    write_synced(&tmp_path, &payload)?;
-    let target = phase_dir.join(format!("{}.{EXTENSION}", record.id()));
-    if let Err(err) = fs::rename(&tmp_path, &target) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err.into());
-    }
-    fsync_dir(&phase_dir)?;
-    Ok(())
+    file_queue::publish_atomic(&inbox.join(phase.dir_name()), &inbox.join(TMP_DIR), record)
 }
 
 /// 扫描指定阶段的可消费消息，按文件名（ULID）升序返回。
 ///
-/// 载荷必须是 `Record::User` 或 `Record::System { source == "notify" }`，且文件名
+/// 载荷必须是 `Record::User` 或可注入的 `System`（`source == "notify"`），且文件名
 /// （去 `.json` 扩展名）必须等于 `record.id()`。解析失败或任一校验不符的文件会被尽力
 /// 移动到 `rejected/` 并跳过——不返回、不报错。`tmp/` 不参与扫描。目录不存在时返回空。
 pub fn scan_inbox(session: &Session, phase: InboxPhase) -> Result<Vec<InboxMessage>> {
     let inbox = session.inbox_dir();
     let phase_dir = inbox.join(phase.dir_name());
-    let entries = match fs::read_dir(&phase_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => return Err(err.into()),
-    };
-
-    let mut messages = Vec::new();
-    let mut rejected_ready = false;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !entry
-            .file_type()
-            .map(|file_type| file_type.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let oversized = entry
-            .metadata()
-            .map(|metadata| metadata.len() > MAX_INBOX_BYTES)
-            .unwrap_or(false);
-        if oversized {
-            reject(&inbox, &path, &mut rejected_ready);
-            continue;
-        }
-        let Some(record) = parse_candidate(&path) else {
-            reject(&inbox, &path, &mut rejected_ready);
-            continue;
-        };
-        if !is_acceptable_payload(&record)
-            || !is_valid_id(record.id())
-            || record.id() != file_stem(&path)
-        {
-            reject(&inbox, &path, &mut rejected_ready);
-            continue;
-        }
-        messages.push(InboxMessage {
-            path,
-            phase,
-            record,
-        });
-    }
-    messages.sort_by(|left, right| left.path.file_name().cmp(&right.path.file_name()));
-    Ok(messages)
+    Ok(
+        file_queue::scan_payloads(&phase_dir, &inbox.join(REJECTED_DIR))?
+            .into_iter()
+            .map(|(path, record)| InboxMessage {
+                path,
+                phase,
+                record,
+            })
+            .collect(),
+    )
 }
 
 /// 只读统计指定阶段中 `*.json` 文件的个数。
 ///
 /// 不解析、不 reject、不创建目录（目录不存在返回 0），供 `--status` 等只读路径使用。
 pub fn count_inbox(session: &Session, phase: InboxPhase) -> Result<usize> {
-    let phase_dir = session.inbox_dir().join(phase.dir_name());
-    let entries = match fs::read_dir(&phase_dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(err) => return Err(err.into()),
-    };
-    let count = entries
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_type()
-                .map(|file_type| file_type.is_file())
-                .unwrap_or(false)
-                && entry.path().extension().and_then(|ext| ext.to_str()) == Some(EXTENSION)
-        })
-        .count();
-    Ok(count)
+    file_queue::count_payloads(&session.inbox_dir().join(phase.dir_name()))
 }
 
 /// 删除一条已消费的消息文件。
@@ -185,121 +102,27 @@ pub fn count_inbox(session: &Session, phase: InboxPhase) -> Result<usize> {
 /// 文件已不存在时视为成功（幂等）：崩溃可能发生在 `append` 之后、删除之前，重新扫描
 /// 时由调用方按 id 去重，故重复删除不报错。
 pub fn remove_inbox(message: &InboxMessage) -> Result<()> {
-    match fs::remove_file(&message.path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err.into()),
-    }
+    file_queue::remove_payload(&message.path)
 }
 
 /// 尽力清理 `tmp/` 中修改时间早于 `max_age` 的文件。
 ///
 /// 只处理 `tmp/`，不触碰 `pending/`、`init/`、`rejected/`；任何错误静默忽略。
 pub fn cleanup_inbox_tmp(session: &Session, max_age: Duration) {
-    let tmp_dir = session.inbox_dir().join(TMP_DIR);
-    let Ok(entries) = fs::read_dir(&tmp_dir) else {
-        return;
-    };
-    let now = SystemTime::now();
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let Ok(age) = now.duration_since(modified) else {
-            continue;
-        };
-        if age >= max_age {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-}
-
-/// 解析文件为 `Record`；要求 `.json` 扩展名且内容合法。
-fn parse_candidate(path: &Path) -> Option<Record> {
-    if path.extension().and_then(|ext| ext.to_str()) != Some(EXTENSION) {
-        return None;
-    }
-    let bytes = fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
-/// 文件名去掉 `.json` 扩展名。
-fn file_stem(path: &Path) -> &str {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("")
-}
-
-/// 载荷是否允许注入。
-fn is_acceptable_payload(record: &Record) -> bool {
-    match record {
-        Record::User(_) => true,
-        Record::System(system) => system.source == "notify",
-        _ => false,
-    }
-}
-
-/// 消息 id 是否满足 `[A-Za-z0-9_-]{1,128}`。
-fn is_valid_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= MAX_ID_BYTES
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
-/// 尽力把非法文件移入 `rejected/`；失败静默忽略。
-fn reject(inbox: &Path, path: &Path, ready: &mut bool) {
-    let rejected = inbox.join(REJECTED_DIR);
-    if !*ready {
-        if fs::create_dir_all(&rejected).is_err() {
-            return;
-        }
-        *ready = true;
-    }
-    if let Some(name) = path.file_name() {
-        let _ = fs::rename(path, rejected.join(name));
-    }
-}
-
-/// 临时文件名：`<id>.<pid>.<counter>.json`，保证并发发布不撞名。
-fn tmp_file_name(id: &str) -> String {
-    let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{id}.{}.{counter}.{EXTENSION}", std::process::id())
-}
-
-/// 落盘并 `sync_all`。
-fn write_synced(path: &Path, payload: &[u8]) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(payload)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-/// fsync 目录项，保证 rename 后的目录元数据落盘。
-fn fsync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
-    Ok(())
+    file_queue::cleanup_tmp(&session.inbox_dir().join(TMP_DIR), max_age);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::Path;
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use yaa_msg::User;
 
     use super::*;
+    use crate::StoreError;
 
     fn session_in(dir: &Path) -> Session {
         Session::new(dir.join("session.db"))

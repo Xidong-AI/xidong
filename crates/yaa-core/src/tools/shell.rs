@@ -55,12 +55,23 @@ pub fn schema_hash() -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// 供系统提示词拼装的工具说明，必须提及工具名与参数名。
+/// 供系统提示词拼装的工具说明，必须提及工具名、参数名与后台回注范式。
 pub fn prompt_section() -> &'static str {
-    "可用工具只有 `shell` 一个函数。调用时参数为：
+    r#"可用工具只有 `shell` 一个函数。调用时参数为：
 
 - `command`（必填）：要执行的 shell 命令字符串。
-- `description`（可选）：一句话说明命令用途。"
+- `description`（可选）：一句话说明命令用途。
+
+后台任务与跨会话回注：
+
+- `$YAA_SESSION` 是本会话，`$YAA_PARENT` 是父会话，`$YAA_NOTIFY` 是省略 `--to` 时的默认通知目标。
+- 后台作业必须关闭或重定向 stdout/stderr（如 `>/dev/null 2>&1`）：shell 工具在直接子进程退出后会读取输出管道，后台进程若继续持有管道，读取宽限期（约 2 秒）后会被整组终止，内层通知永远不到达。
+- 后台作业的结果经 `yaa --notify` 写入目标会话的 inbox，由运行中的会话在安全点消费。
+- 子智能体范式（推荐）：
+  `{ yaa --quiet --cwd <dir> -- "作为子智能体完成 <任务>" | yaa --notify="<注释>" --to "$YAA_SESSION"; } >/dev/null 2>&1 &`
+- 需要脱离工具进程组时：
+  `setsid sh -c 'yaa --quiet --cwd <dir> -- "作为子智能体完成 <任务>" | yaa --notify="<注释>" --to "$YAA_SESSION"' >/dev/null 2>&1 &`
+- 回本会话用 `--to "$YAA_SESSION"`，回父会话用 `--to "$YAA_PARENT"`。"#
 }
 
 /// 解析后的工具调用参数。
@@ -278,6 +289,29 @@ mod tests {
         for needle in ["shell", "command", "description"] {
             assert!(section.contains(needle), "提示词 section 缺少 {needle}");
         }
+    }
+
+    #[test]
+    fn prompt_section_documents_background_notify_paradigm() {
+        let section = prompt_section();
+        for needle in [
+            "YAA_SESSION",
+            "YAA_PARENT",
+            "YAA_NOTIFY",
+            "--notify",
+            "inbox",
+            "后台",
+        ] {
+            assert!(section.contains(needle), "提示词 section 缺少 {needle}");
+        }
+        assert!(
+            section.contains(r#"--to "$YAA_SESSION""#) && section.contains(r#"--to "$YAA_PARENT""#),
+            "应给出回本会话与回父会话两种目标：{section}"
+        );
+        assert!(
+            section.contains(r#"&`"#),
+            "应说明用 `&` 放后台避免阻塞：{section}"
+        );
     }
 
     #[test]

@@ -33,9 +33,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_prompt_mentions_tool_and_parameters() {
+    fn system_prompt_mentions_tool_parameters_and_notify_paradigm() {
         let text = system_prompt();
-        for needle in ["shell", "command", "description"] {
+        for needle in [
+            "shell",
+            "command",
+            "description",
+            "YAA_SESSION",
+            "YAA_PARENT",
+            "YAA_NOTIFY",
+            "inbox",
+        ] {
             assert!(text.contains(needle), "系统提示词缺少 {needle}");
         }
     }

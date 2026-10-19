@@ -74,6 +74,12 @@ impl std::error::Error for CliError {}
 async fn main() {
     let cli = Cli::parse();
 
+    // clap 无法表达的组合（F14）：在短路/加载配置之前按用法错误退出。
+    if let Err(message) = cli.validate_combinations() {
+        eprintln!("错误：{message}");
+        std::process::exit(2);
+    }
+
     // `--get-prompt` 必须在加载配置、解析会话与执行任何钩子之前短路，否则默认
     // `init` 钩子内部调用 `yaa --get-prompt system` 会形成递归环。
     if let Some(name) = cli.get_prompt.as_deref() {
@@ -124,7 +130,9 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
     // `--notify` 是短路写入路径：不进入 agent loop、不触发 init；仅按需读取 `[shell]`
     // 限额（读取失败只告警，绝不让 notify 失败）。
     if cli.notify.is_some() {
-        return notify(&cli, &env, &home, &data_root)
+        // 目标解析先于任何目录创建：显式 `--to` 的用法/严格校验失败不得留下文件。
+        let target = resolve_notify_target_for_cli(&cli, &env, &data_root)?;
+        return notify(&cli, &env, &home, &data_root, target)
             .await
             .map_err(CliError::from);
     }
@@ -141,8 +149,8 @@ async fn dispatch(cli: Cli) -> Result<i32, CliError> {
 
 /// 把命令输出或 stdin 作为通知原子写入目标会话。
 ///
-/// 目标解析顺序：`--session` → 环境变量 `YAA_SESSION`（非空才算） → 当前 cwd
-/// 默认会话（见 `docs/plan.md` D25 与规则 8）。
+/// 目标已由 [`resolve_notify_target_for_cli`] 按 spec 第 2 节解析：显式 `--to` →
+/// `--session` → `YAA_NOTIFY` → `YAA_SESSION` → cwd 默认。
 ///
 /// `--` 形态复用 `yaa-exec`：截断超长输出、完整输出落盘、退出码沿用、stderr 透传，
 /// 并把 `shell_quote` 转义后的命令记入 `command`（可重放）。
@@ -151,58 +159,81 @@ async fn notify(
     env: &impl Fn(&str) -> Option<String>,
     home: &Path,
     data_root: &Path,
+    target: yaa_core::session::NotifyTarget,
 ) -> anyhow::Result<i32> {
-    let session = notify_session(cli, env, data_root)?;
+    let session = &target.resolved.session;
     // 目标不存在时明确告警后照常创建（design.md：发现目标不存在时 stderr 警告）。
     // `YAA_SESSION` 来自钩子内部调用时，首次创建是预期行为，不打扰用户。
-    if !session.db.exists() && env("YAA_SESSION").is_none() {
+    // 显式 `--to` 已在解析阶段严格校验存在性，既不会走到这里，也绝不创建。
+    if !target.explicit && !session.db.exists() && env("YAA_SESSION").is_none() {
         eprintln!("警告：目标会话不存在，将创建：{}", session.db.display());
     }
-    // clear.lock 需要父目录存在；写入本来也会创建会话目录。
-    std::fs::create_dir_all(&session.root)?;
+    // clear.lock 需要父目录存在；写入本来也会创建会话目录。显式目标必须已存在，
+    // 这里跳过创建以兑现「绝不创建目标目录」。
+    if !target.explicit {
+        std::fs::create_dir_all(&session.root)?;
+    }
     // 尽力清理崩溃残留的发布临时文件（1 小时阈值，与 run 路径一致）。
-    yaa_store::cleanup_inbox_tmp(&session, std::time::Duration::from_secs(3600));
+    yaa_store::cleanup_inbox_tmp(session, std::time::Duration::from_secs(3600));
+    yaa_store::cleanup_spool_tmp(session, std::time::Duration::from_secs(3600));
     // 归档预检：短暂持 clear.lock 共享锁并串行 init，取出即放，绝不覆盖命令执行。
-    // 这样 notify 命令内嵌 `yaa --clear` 时不会形成「子等父释放 SH、父等子结束」的死锁。
+    // 这样 notify 命令内嵌 `yaa --clear` 时不会形成「子等父释放 SH、父等父结束」的死锁。
     // 同时捕获发布时用于校验的 generation：命令执行期间若发生真归档，发布会失败。
-    let expected_generation = {
+    //
+    // 预检失败若属可重试类别（BUSY/IO），不阻断通知：记录后在发布阶段直接降级 spool，
+    // 命令退出码保持不变（F9）。归档等终态仍然报错。
+    let precheck = (|| -> Result<Option<i64>, yaa_store::StoreError> {
         let _clear_guard = yaa_store::FileLock::shared(&session.clear_lock_path())?;
         let init_guard = yaa_store::FileLock::exclusive(&session.init_lock_path())?;
-        let archived = yaa_store::is_archived(&session)?;
-        let generation = yaa_store::generation(&session)?;
+        let archived = yaa_store::is_archived(session)?;
+        let generation = yaa_store::generation(session)?;
         drop(init_guard);
         if archived {
+            return Ok(None);
+        }
+        Ok(Some(generation))
+    })();
+    let guard = match precheck {
+        Ok(Some(generation)) => NotifyGuard::Generation(generation),
+        Ok(None) => {
             eprintln!("错误：会话已归档，不可写入：{}", session.db.display());
             return Ok(1);
         }
-        generation
+        Err(err) if err.is_retryable() => NotifyGuard::PrecheckFailed(err),
+        Err(err) => return Err(err.into()),
     };
     // 缺注释或注释为空串时统一用「由用户执行」。
     let comment = match cli.notify.as_deref() {
         Some(text) if !text.is_empty() => text,
         _ => "由用户执行",
     };
+    // 归因：`origin` 总是写发布者会话库绝对路径；`call_id` 仅在继承值合法时写。
+    // `origin` 是可选字段：解析失败（如 cwd 存在旧 `default.jsonl`）只省略归因，
+    // 绝不让合法的显式 `--to` 发布失败（F4）。
+    let origin = publisher_origin(cli, env, data_root);
+    let call_id = notify_call_id(env("YAA_NOTIFY_CALL_ID").as_deref());
 
     let limits = notify_limits(cli, env, home);
 
     if cli.command.is_empty() {
         // stdin 形态：复用 `yaa-exec` 的截断/落盘策略，与 `--` 形态完全一致：
         // 超限时正文为头尾拼接并带标记，完整输入落盘并记入 `output_files`。
-        let outputs_dir = yaa_core::session::outputs_dir(&session);
+        let outputs_dir = yaa_core::session::outputs_dir(session);
         let captured = yaa_exec::capture_reader(std::io::stdin(), &limits, &outputs_dir).await?;
         let output_files = captured.file.as_deref().map(|path| yaa_msg::OutputFiles {
             stdout: Some(yaa_core::tools::shell::relativize(path, data_root)),
             stderr: None,
         });
         let content = envelope(comment, &captured.text);
-        let record = Record::system("notify", content, None, output_files);
-        publish_notify(&session, env, &record, expected_generation)?;
+        let record =
+            Record::system_with_attribution("notify", content, None, output_files, origin, call_id);
+        publish_notify(session, env, &record, guard, target.is_self)?;
         return Ok(0);
     }
 
     // `--` 形态：与 `shell` 工具同一条执行路径。
     let command = shell_quote(&cli.command);
-    let outputs_dir = yaa_core::session::outputs_dir(&session);
+    let outputs_dir = yaa_core::session::outputs_dir(session);
     let output = yaa_exec::run(
         &yaa_exec::ShellCommand {
             call_id: String::new(),
@@ -226,14 +257,67 @@ async fn notify(
 
     let output_files = notify_output_files(&output, data_root);
     let content = envelope(comment, &output.stdout);
-    let record = Record::system("notify", content, Some(command), output_files);
-    publish_notify(&session, env, &record, expected_generation)?;
+    let record = Record::system_with_attribution(
+        "notify",
+        content,
+        Some(command),
+        output_files,
+        origin,
+        call_id,
+    );
+    publish_notify(session, env, &record, guard, target.is_self)?;
     Ok(exit)
+}
+
+/// 发布者会话库的绝对路径，作为通知的 `origin`。
+///
+/// 继承了 `YAA_SESSION` 时直接使用其值（钩子/工具调用链中的自身会话）；否则用
+/// [`resolve_session_target`] 解析出的自发会话（`--session` → cwd 默认）。
+///
+/// 本函数是 best-effort：解析失败（如 cwd 默认会话目录存在旧 `default.jsonl`）时
+/// 返回 `None`，由调用方省略可选的 `origin` 字段，绝不阻断通知发布（F4）。
+fn publisher_origin(
+    cli: &Cli,
+    env: &impl Fn(&str) -> Option<String>,
+    data_root: &Path,
+) -> Option<String> {
+    if let Some(path) = env("YAA_SESSION").filter(|value| !value.is_empty()) {
+        let absolute = std::path::absolute(Path::new(&path)).ok()?;
+        return Some(absolute.to_string_lossy().into_owned());
+    }
+    let resolved = resolve_session_target(cli, env, data_root).ok()?;
+    let absolute = std::path::absolute(&resolved.session.db).ok()?;
+    Some(absolute.to_string_lossy().into_owned())
+}
+
+/// 从 `YAA_NOTIFY_CALL_ID` 取出合法调用 id：非空且匹配 `[A-Za-z0-9_-]{1,128}`。
+///
+/// 非法值静默忽略（不报错、不写字段），避免把外部输入带进记录。
+fn notify_call_id(raw: Option<&str>) -> Option<String> {
+    let value = raw?;
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return None;
+    }
+    Some(value.to_owned())
+}
+
+/// 发布前的 generation 守卫状态。
+enum NotifyGuard {
+    /// 预检成功：发布时校验该 generation。
+    Generation(i64),
+    /// 预检因 BUSY/IO 失败：无法安全校验 generation，直接降级 spool（F9）。
+    PrecheckFailed(yaa_store::StoreError),
 }
 
 /// 把通知发布到文件 inbox（阶段 4 刀 2）。不再直接写 events：消息由 runner 在安全点消费落库。
 ///
-/// phase 由 `YAA_INBOX_PHASE == "init"` 决定（init 钩子内注入），否则为普通 `Pending`。
+/// phase 由 `YAA_INBOX_PHASE == "init"` 决定（init 钩子内注入），且仅对自发发布
+/// （目标 == 自身会话）生效；跨会话目标（含显式 `--to`）一律写 `pending/`。
 /// 发布走 [`yaa_store::publish_with_generation`]：内部持 `clear.lock` 共享锁并与
 /// `--clear` 的排他锁互斥，原子校验预检时捕获的 `expected` generation。命令执行期间
 /// 发生真归档（generation 变化且非 0→1 建库）时拒绝发布，避免把通知写进新 generation。
@@ -242,19 +326,60 @@ fn publish_notify(
     session: &yaa_store::Session,
     env: &impl Fn(&str) -> Option<String>,
     record: &Record,
-    expected_generation: i64,
+    guard: NotifyGuard,
+    is_self: bool,
 ) -> anyhow::Result<()> {
-    let phase = if env("YAA_INBOX_PHASE").as_deref() == Some("init") {
+    let phase = if is_self && env("YAA_INBOX_PHASE").as_deref() == Some("init") {
         yaa_store::InboxPhase::Init
     } else {
         yaa_store::InboxPhase::Pending
     };
-    match yaa_store::publish_with_generation(session, phase, record, Some(expected_generation)) {
-        Ok(()) => Ok(()),
-        Err(yaa_store::StoreError::GenerationChanged { .. }) => {
+    match guard {
+        NotifyGuard::Generation(expected) => {
+            match yaa_store::publish_with_generation(session, phase, record, Some(expected)) {
+                Ok(()) => Ok(()),
+                Err(yaa_store::StoreError::GenerationChanged { .. }) => {
+                    anyhow::bail!("会话已归档，通知未写入。")
+                }
+                // 可重试类失败（BUSY/IO）：保底写 spool，下轮运行补投。命令退出码保持不变。
+                Err(err) if err.is_retryable() => {
+                    spool_notify(session, record, Some(expected), &err.to_string())
+                }
+                Err(err) => Err(err.into()),
+            }
+        }
+        NotifyGuard::PrecheckFailed(err) => {
+            // 预检 BUSY/IO：不阻断命令，发布阶段直接降级 spool（F9）。
+            spool_notify(session, record, None, &err.to_string())
+        }
+    }
+}
+
+/// 把通知写入 spool；失败时区分「已归档」终态与 spool 写入错误。
+///
+/// `expected` 传给 [`yaa_store::publish_spool_with_generation`]，与 inbox 发布共用
+/// generation/archived 守卫，避免 spool 绕过 `--clear` 的检查（F10）。
+fn spool_notify(
+    session: &yaa_store::Session,
+    record: &Record,
+    expected: Option<i64>,
+    cause: &str,
+) -> anyhow::Result<()> {
+    match yaa_store::publish_spool_with_generation(session, record, expected) {
+        Ok(_) => {
+            eprintln!(
+                "警告：通知发布失败（{cause}），已写入 spool，将在下次运行时补投：{}",
+                session.spool_dir().display()
+            );
+            Ok(())
+        }
+        Err(yaa_store::StoreError::GenerationChanged { .. })
+        | Err(yaa_store::StoreError::Archived { .. }) => {
             anyhow::bail!("会话已归档，通知未写入。")
         }
-        Err(err) => Err(err.into()),
+        Err(spool_err) => Err(anyhow::anyhow!(
+            "通知发布失败（{cause}），写入 spool 亦失败：{spool_err}"
+        )),
     }
 }
 
@@ -360,18 +485,32 @@ fn is_simple_token(token: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,^".contains(c))
 }
 
-/// 解析 `--notify` 的目标会话；显式路径按当前 cwd 补全为绝对路径。
-fn notify_session(
+/// 解析 `--notify` 的目标，并把用法错误（退出码 2）与目标错误（退出码 1）分开。
+fn resolve_notify_target_for_cli(
     cli: &Cli,
     env: &impl Fn(&str) -> Option<String>,
     data_root: &Path,
-) -> anyhow::Result<yaa_store::Session> {
-    Ok(resolve_session_target(cli, env, data_root)?.session)
+) -> Result<yaa_core::session::NotifyTarget, CliError> {
+    use yaa_core::session::{NotifyTargetError, resolve_notify_target};
+
+    let cwd = std::env::current_dir()?;
+    resolve_notify_target(
+        &cwd,
+        cli.to.as_deref(),
+        cli.session.as_deref(),
+        data_root,
+        env,
+    )
+    .map_err(|err| match err {
+        NotifyTargetError::Usage(message) => CliError::usage(anyhow!(message)),
+        NotifyTargetError::Other(err) => CliError::from(err),
+    })
 }
 
 /// 解析会话目标：`--session` → `YAA_SESSION`（非空才算）→ 当前 cwd 默认会话。
 ///
-/// 供 `--notify` 与 `--approve` 共用，保证两者的目标解析链完全一致（规则 8）。
+/// 供 `--approve` 使用；`--notify` 走 [`resolve_notify_target_for_cli`] 的扩展链
+/// （`--to`/`YAA_NOTIFY`），`--approve` 不认 `--to`。
 fn resolve_session_target(
     cli: &Cli,
     env: &impl Fn(&str) -> Option<String>,
@@ -422,9 +561,9 @@ fn clear(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
     if !resolved.session.db.exists() {
         // 库不存在也要检查 inbox：仅剩待处理消息时归档会静默丢消息，必须拒绝。
-        let (pending, init) = inbox_counts(&resolved.session)?;
-        if pending + init > 0 {
-            report_pending_inbox(pending, init);
+        let (pending, init, spool) = pending_counts(&resolved.session)?;
+        if pending + init + spool > 0 {
+            report_pending(pending, init, spool);
             return Ok(1);
         }
         eprintln!(
@@ -453,9 +592,9 @@ fn clear(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
     };
     // 持两把锁后检查待处理消息：notify 发布持 clear.lock SH，clear 取 EX，
     // 因此检查期间不会有新发布插入；有消息则拒绝归档并保留 inbox。
-    let (pending, init) = inbox_counts(&resolved.session)?;
-    if pending + init > 0 {
-        report_pending_inbox(pending, init);
+    let (pending, init, spool) = pending_counts(&resolved.session)?;
+    if pending + init + spool > 0 {
+        report_pending(pending, init, spool);
         return Ok(1);
     }
     let target = yaa_store::archive(&resolved.session, &history_root, now_ms())?;
@@ -463,29 +602,35 @@ fn clear(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
     Ok(0)
 }
 
-/// 统计 `pending/` 与 `init/` 中的待处理消息数（只读：目录不存在视为 0）。
-fn inbox_counts(session: &yaa_store::Session) -> anyhow::Result<(usize, usize)> {
+/// 统计 `pending/`、`init/` 与 spool 中的待处理消息数（只读：目录不存在视为 0）。
+fn pending_counts(session: &yaa_store::Session) -> anyhow::Result<(usize, usize, usize)> {
     // 只读计数：不解析、不移动文件。malformed/超限文件同样阻止归档（与 --status 一致），
     // 且 clear 在拒绝路径上不得产生 rejected/ 等副作用。
     let pending = yaa_store::count_inbox(session, yaa_store::InboxPhase::Pending)?;
     let init = yaa_store::count_inbox(session, yaa_store::InboxPhase::Init)?;
-    Ok((pending, init))
+    let spool = yaa_store::count_spool(session)?;
+    Ok((pending, init, spool))
 }
 
 /// 报告待处理消息并提示处理方式（调用方负责返回退出码 1）。
-fn report_pending_inbox(pending: usize, init: usize) {
+fn report_pending(pending: usize, init: usize, spool: usize) {
     eprintln!(
-        "错误：会话有待处理消息（{} 条），请先运行 yaa 处理或手动移除 inbox。",
-        pending + init
+        "错误：会话有待处理消息（{} 条，pending {pending} / init {init} / spool {spool}），请先运行 yaa 处理或手动移除。",
+        pending + init + spool
     );
 }
 
-/// 打印待处理消息计数（`--status` 摘要的一行）。
+/// 打印待处理消息计数（`--status` 摘要的一行；格式保持阶段 4 不变）。
 fn print_pending_inbox(pending: usize, init: usize) {
     println!(
         "待处理消息：{} 条（pending {pending} / init {init}）",
         pending + init
     );
+}
+
+/// 打印 spool 滞留计数（`--status` 摘要的一行）。
+fn print_spool_count(spool: usize) {
+    println!("滞留 spool：{spool} 条");
 }
 
 /// 路径是否以 `.jsonl` 结尾（旧版会话格式）。
@@ -502,13 +647,13 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
     let resolved = yaa_core::session::resolve(&cwd, cli.session.as_deref(), data_root)?;
     if !resolved.session.db.exists() {
         // 只读计数：不解析、不 reject、不创建目录（B8）。
-        let pending = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Pending)?;
-        let init = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Init)?;
+        let (pending, init, spool) = pending_counts(&resolved.session)?;
         eprintln!("提示：会话文件不存在：{}", resolved.session.db.display());
-        // 库缺失但 inbox 有消息时仍显示计数，避免待处理消息完全不可见。
+        // 库缺失但 inbox/spool 有消息时仍显示计数，避免待处理消息完全不可见。
         if pending + init > 0 {
             print_pending_inbox(pending, init);
         }
+        print_spool_count(spool);
         return Ok(0);
     }
 
@@ -540,9 +685,9 @@ fn status(cli: &Cli, data_root: &Path) -> anyhow::Result<i32> {
         println!("最近 ai：{}", snippet(text, 80));
     }
     println!("最近时间戳：{last_ts}");
-    let pending = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Pending)?;
-    let init = yaa_store::count_inbox(&resolved.session, yaa_store::InboxPhase::Init)?;
+    let (pending, init, spool) = pending_counts(&resolved.session)?;
     print_pending_inbox(pending, init);
+    print_spool_count(spool);
     Ok(0)
 }
 
@@ -632,6 +777,7 @@ async fn run_agent(
     // 水位，再发布 own；随后**释放 SH** 才抢 runner.lock（避免与 `--clear` 的 EX 死锁）。
     // 这样 follower 的基线不会与 clear 的归档交错，也不会把首次建库误判为归档（B1/B2）。
     yaa_store::cleanup_inbox_tmp(&resolved.session, std::time::Duration::from_secs(3600));
+    yaa_store::cleanup_spool_tmp(&resolved.session, std::time::Duration::from_secs(3600));
     let own = Record::user(prompt);
     let own_id = own.id().to_owned();
     let watermark = {

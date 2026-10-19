@@ -106,7 +106,7 @@ impl Record {
         })
     }
 
-    /// 系统消息（通知、初始化簿记等）。
+    /// 系统消息（通知、初始化簿记等），不带归因。
     ///
     /// `command` 可选：展示层以 `% 命令` 呈现，上下文投影时以 `[执行命令] <command>`
     /// 前缀加入；`output_files` 可选，承载被截断时落盘的完整输出（相对数据根），与
@@ -117,10 +117,27 @@ impl Record {
         command: Option<String>,
         output_files: Option<OutputFiles>,
     ) -> Self {
+        Self::system_with_attribution(source, content, command, output_files, None, None)
+    }
+
+    /// 带归因的系统消息。
+    ///
+    /// `origin` 为发布者会话库绝对路径，`call_id` 为产生本次通知的工具调用 id
+    /// （阶段 5）。两者均缺省省略，旧记录解析为 `None`。
+    pub fn system_with_attribution(
+        source: impl Into<String>,
+        content: impl Into<String>,
+        command: Option<String>,
+        output_files: Option<OutputFiles>,
+        origin: Option<String>,
+        call_id: Option<String>,
+    ) -> Self {
         Record::System(System {
             id: new_id(),
             ts: now_ms(),
             source: source.into(),
+            origin,
+            call_id,
             command,
             output_files,
             content: content.into(),
@@ -229,18 +246,32 @@ pub struct OutputFiles {
 
 /// 系统记录。
 ///
-/// `command` 展示层以 `% 命令` 呈现，上下文投影时以 `[执行命令] <command>` 前缀加入；
-/// `output_files` 承载被截断时落盘的完整输出（相对数据根），旧记录缺该字段时为 `None`。
+/// `origin`/`call_id` 是阶段 5 的归因字段（发布者会话库绝对路径、产生通知的工具调用
+/// id），旧记录缺该字段时为 `None`。`command` 展示层以 `% 命令` 呈现，上下文投影时以
+/// `[执行命令] <command>` 前缀加入；`output_files` 承载被截断时落盘的完整输出（相对
+/// 数据根）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct System {
     pub id: String,
     pub ts: i64,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_files: Option<OutputFiles>,
     pub content: String,
+}
+
+/// `System` 是否可注入模型上下文/展示。
+///
+/// 当前只有 `source == "notify"` 的通知可注入；`init` 簿记等其余来源一律排除。
+/// display、render 与 inbox 白名单共用本判定，避免三处漂移（F12）。
+pub fn is_injectable_system(system: &System) -> bool {
+    system.source == "notify"
 }
 
 /// 审批决策。
@@ -464,6 +495,8 @@ mod tests {
             id: "01JSYS".into(),
             ts: 5,
             source: "notify".into(),
+            origin: None,
+            call_id: None,
             command: Some("git status".into()),
             output_files: None,
             content: "……".into(),
@@ -482,6 +515,8 @@ mod tests {
             id: "01JSYS".into(),
             ts: 5,
             source: "init".into(),
+            origin: None,
+            call_id: None,
             command: None,
             output_files: None,
             content: String::new(),
@@ -500,6 +535,8 @@ mod tests {
             id: "01JSYS".into(),
             ts: 5,
             source: "notify".into(),
+            origin: None,
+            call_id: None,
             command: Some("seq 1 9".into()),
             output_files: Some(OutputFiles {
                 stdout: Some("sessions/sid/outputs/01JFILE.stdout.out".into()),
@@ -513,6 +550,66 @@ mod tests {
             r#"{"type":"system","id":"01JSYS","ts":5,"source":"notify","command":"seq 1 9","output_files":{"stdout":"sessions/sid/outputs/01JFILE.stdout.out"},"content":"<注释>\n头尾\n</注释>\n[truncated] …"}"#
         );
         assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn system_golden_with_attribution() {
+        let r = Record::System(System {
+            id: "01JSYS".into(),
+            ts: 5,
+            source: "notify".into(),
+            origin: Some("/data/self/session.db".into()),
+            call_id: Some("call_abc".into()),
+            command: Some("git status".into()),
+            output_files: None,
+            content: "<注释>\n正文\n</注释>".into(),
+        });
+        let line = serde_json::to_string(&r).expect("serialize");
+        assert_eq!(
+            line,
+            r#"{"type":"system","id":"01JSYS","ts":5,"source":"notify","origin":"/data/self/session.db","call_id":"call_abc","command":"git status","content":"<注释>\n正文\n</注释>"}"#
+        );
+        assert_eq!(round_trip(&r), r);
+    }
+
+    #[test]
+    fn system_old_json_without_attribution_deserializes_to_none() {
+        // 兼容性：阶段 5 之前的记录没有 `origin`/`call_id`，必须解析为 `None`。
+        let line = r#"{"type":"system","id":"01JSYS","ts":5,"source":"notify","command":"echo hi","content":"<注释>\n正文\n</注释>"}"#;
+        let record: Record = serde_json::from_str(line).expect("旧记录应可解析");
+        let Record::System(system) = record else {
+            panic!("应解析为 system");
+        };
+        assert_eq!(system.origin, None);
+        assert_eq!(system.call_id, None);
+        assert_eq!(system.command.as_deref(), Some("echo hi"));
+    }
+
+    #[test]
+    fn only_notify_system_is_injectable() {
+        let notify = System {
+            id: "a".into(),
+            ts: 1,
+            source: "notify".into(),
+            origin: None,
+            call_id: None,
+            command: None,
+            output_files: None,
+            content: "x".into(),
+        };
+        assert!(is_injectable_system(&notify));
+
+        let init = System {
+            source: "init".into(),
+            ..notify.clone()
+        };
+        assert!(!is_injectable_system(&init));
+
+        let other = System {
+            source: "other".into(),
+            ..notify
+        };
+        assert!(!is_injectable_system(&other));
     }
 
     #[test]

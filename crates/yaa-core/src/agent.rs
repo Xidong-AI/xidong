@@ -196,11 +196,12 @@ impl Runner<'_> {
     ///
     /// 消费顺序（阶段 4 刀 3）：
     /// 1. 作废旧待批、崩溃恢复（与阶段 1 的 `run` 一致）；
-    /// 2. 无 `system(source=init)` 簿记则执行 `init` 钩子（钩子内 `--notify` 发到
+    /// 2. spool 补投：只消费 spool 自身，不合并、不提前消费 inbox；
+    /// 3. 无 `system(source=init)` 簿记则执行 `init` 钩子（钩子内 `--notify` 发到
     ///    `inbox/init/`），随后消费 `init/`、写簿记；init 失败仍消费 `init/` 并落 `own`；
-    /// 3. 消费文件名（ULID）小于 `own.id()` 的 `pending/` 注入；
-    /// 4. 消费 `own`；
-    /// 5. `llm` 钩子后进入 [`Runner::run_loop`]（每轮开头安全点继续消费 inbox）。
+    /// 4. 消费文件名（ULID）小于 `own.id()` 的 `pending/` 注入；
+    /// 5. 消费 `own`；
+    /// 6. `llm` 钩子后进入 [`Runner::run_loop`]（每轮开头安全点继续消费 inbox）。
     ///
     /// `make_model` 在 `llm` 钩子解析成功后恰好被调用一次。
     ///
@@ -253,11 +254,16 @@ impl Runner<'_> {
         }
         self.recover_orphan_tool_calls(&mut watermark).await?;
 
+        // 3. spool 补投：发布失败降级的通知在 init 之前只消费 spool 自身，不触碰
+        //    inbox，保持 `init/` 与 `pending/` 的既有消费顺序。失败时保留文件，下一轮
+        //    继续重试。
+        self.replay_spool(&mut watermark).await?;
+
         let initialized = existing
             .iter()
             .any(|record| matches!(record, Record::System(system) if system.source == "init"));
 
-        // 3. 无初始化簿记才执行 `init`；成功后消费 init/ 注入并写簿记，失败仍消费 init/、
+        // 4. 无初始化簿记才执行 `init`；成功后消费 init/ 注入并写簿记，失败仍消费 init/、
         //    落 own 并按配置错误退出（不消费其他 pending）。
         if !initialized {
             match self.run_init_hook().await {
@@ -275,12 +281,12 @@ impl Runner<'_> {
             }
         }
 
-        // 4. 先消费 own 之前（ULID 更小）的 pending 注入，再消费 own。
+        // 5. 先消费 own 之前（ULID 更小）的 pending 注入，再消费 own。
         let earlier = self.gather_phase_before(InboxPhase::Pending, own.id())?;
         self.consume_messages(earlier, &mut watermark).await?;
         self.consume_own(&own, &mut watermark).await?;
 
-        // 5. llm 钩子（每次运行一次，不写记录），并用解析出的配置构造模型。
+        // 6. llm 钩子（每次运行一次，不写记录），并用解析出的配置构造模型。
         let llm_config = match self.resolve_llm_hook().await {
             Ok(config) => config,
             Err(exit) => return Ok(exit),
@@ -352,6 +358,30 @@ impl Runner<'_> {
         Ok(saw_user)
     }
 
+    /// 补投 spool 中的通知：只消费 spool 自身，绝不合并或提前消费 inbox。
+    ///
+    /// 位置在 recover 之后、init 之前：上一轮发布失败的通知先落库，随后 init 钩子
+    /// 与 `init/` 消息仍按既有顺序消费。只由 leader/接管调用；follower 不补投，只在
+    /// 检测到滞留时提示。追加成功但删除失败时文件会留在下一轮，由
+    /// `append_idempotent` 按 id 去重；删除失败只提示，不阻断本轮运行（F12）。
+    async fn replay_spool(&self, watermark: &mut usize) -> anyhow::Result<()> {
+        let spool = yaa_store::scan_spool(&self.session)?;
+        if spool.is_empty() {
+            return Ok(());
+        }
+        let records: Vec<Record> = spool.iter().map(|message| message.record.clone()).collect();
+        self.append_idempotent_and_emit(&records, watermark).await?;
+        for message in &spool {
+            if let Err(err) = yaa_store::remove_spool(message) {
+                self.sink.emit(DisplayItem::Notice(format!(
+                    "警告：删除 spool 文件失败（{err}），将在下一轮重试：{}",
+                    message.path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// 跟随模式：`own` 已发布但未抢到 `runner.lock`（另一 runner 正在跑）。
     ///
     /// 只读跟随：不写 events、不跑钩子、不执行工具。启动水位 `(baseline_gen, start_seq)`
@@ -391,6 +421,7 @@ impl Runner<'_> {
         let mut projector = DisplayProjector::from_records(&prefix[..prefix_len]);
         let mut backoff = Duration::from_millis(20);
         let mut pending_notice_sent = false;
+        let mut spool_notice_sent = false;
 
         loop {
             let (rows, new_seq, read_generation) =
@@ -406,6 +437,16 @@ impl Runner<'_> {
                     .emit(DisplayItem::Notice("会话已归档，停止跟随。".to_string()));
                 return Ok(ExitCode::Success);
             }
+            // follower 不补投 spool；只提示滞留数量，避免静默丢通知。
+            // 在抢 runner.lock 之前检查：leader 持锁期间也要能看到滞留。
+            let spool_count = yaa_store::count_spool(&self.session)?;
+            if spool_count > 0 && !spool_notice_sent {
+                self.sink.emit(DisplayItem::Notice(format!(
+                    "有 {spool_count} 条通知暂存在 spool，将在下次非跟随运行时补投。"
+                )));
+                spool_notice_sent = true;
+            }
+
             if rows.is_empty() {
                 tokio::time::sleep(jitter(backoff)).await;
                 backoff = (backoff * 2).min(Duration::from_millis(250));
@@ -415,6 +456,8 @@ impl Runner<'_> {
                 backoff = Duration::from_millis(20);
             }
 
+            // follower 不补投 spool；只提示滞留数量，避免静默丢通知。此检查必须在
+            // 抢 `runner.lock` 之前：锁被 leader 持有时本次循环根本走不到后面。
             let Some(guard) = yaa_store::FileLock::try_exclusive(&self.session.runner_lock_path())?
             else {
                 continue;
@@ -583,7 +626,6 @@ impl Runner<'_> {
             //    先执行后落 resolved 的顺序与 `design.md` 一致（结果先于决策可见）。
             let limits = self.config.shell.to_limits();
             let outputs_dir = session::outputs_dir(&self.session);
-            let extra_env = [("YAA_SESSION".to_string(), session_path(&self.session))];
             let parsed = tools::shell::ParsedCall {
                 command: pending.command.clone(),
                 description: None,
@@ -596,7 +638,6 @@ impl Runner<'_> {
                     &parsed,
                     &limits,
                     &outputs_dir,
-                    &extra_env,
                 )
                 .await;
             yaa_store::append(&self.session, &[result])?;
@@ -624,8 +665,6 @@ impl Runner<'_> {
         let schema_hash = tools::shell::schema_hash();
         let limits = self.config.shell.to_limits();
         let outputs_dir = session::outputs_dir(&self.session);
-        // 工具子进程注入本会话路径，使 `cmd | yaa --notify` 写回本会话（D25）。
-        let extra_env = [("YAA_SESSION".to_string(), session_path(&self.session))];
         // 本次运行的摘要链尾：生成一次后后续步骤复用，避免重复调用摘要模型。
         let mut compaction_state: Option<compaction::cache::SummaryEntry> = None;
 
@@ -730,14 +769,7 @@ impl Runner<'_> {
             let mut pending_any = false;
             for (call, parsed) in tool_calls.iter().zip(&parsed_calls) {
                 if self
-                    .gate_tool_call(
-                        call,
-                        parsed,
-                        &limits,
-                        &outputs_dir,
-                        &extra_env,
-                        &mut watermark,
-                    )
+                    .gate_tool_call(call, parsed, &limits, &outputs_dir, &mut watermark)
                     .await?
                 {
                     pending_any = true;
@@ -810,7 +842,6 @@ impl Runner<'_> {
         parsed: &tools::shell::ParsedCall,
         limits: &yaa_exec::ShellLimits,
         outputs_dir: &Path,
-        extra_env: &[(String, String)],
         watermark: &mut usize,
     ) -> anyhow::Result<bool> {
         // R1：参数非法、工具名不符或命令为空者根本不可执行，绝不进入审批分支
@@ -830,7 +861,7 @@ impl Runner<'_> {
         match verdict.action {
             Action::Allow => {
                 let result = self
-                    .execute_call(&call.name, &call.id, parsed, limits, outputs_dir, extra_env)
+                    .execute_call(&call.name, &call.id, parsed, limits, outputs_dir)
                     .await;
                 self.append_and_emit(std::slice::from_ref(&result), watermark)
                     .await?;
@@ -864,7 +895,7 @@ impl Runner<'_> {
                 ];
                 self.append_and_emit(&batch, watermark).await?;
                 let result = self
-                    .execute_call(&call.name, &call.id, parsed, limits, outputs_dir, extra_env)
+                    .execute_call(&call.name, &call.id, parsed, limits, outputs_dir)
                     .await;
                 self.append_and_emit(std::slice::from_ref(&result), watermark)
                     .await?;
@@ -894,6 +925,10 @@ impl Runner<'_> {
     }
 
     /// 执行一次 shell 工具调用并返回记录（错误也编码为记录）。
+    ///
+    /// 子进程环境由 [`session::yaa_env`] 统一构造：`YAA_SESSION`/`YAA_NOTIFY`/`YAA_PARENT`
+    /// 来自环境链，`YAA_NOTIFY_CALL_ID` 为本条 `call_id`；`YAA_NOTIFY_*` 限额由
+    /// [`tools::shell::execute`] 追加（单一来源，不在此重复拼接）。
     async fn execute_call(
         &self,
         name: &str,
@@ -901,8 +936,11 @@ impl Runner<'_> {
         parsed: &tools::shell::ParsedCall,
         limits: &yaa_exec::ShellLimits,
         outputs_dir: &Path,
-        extra_env: &[(String, String)],
     ) -> Record {
+        let extra_env: Vec<(String, String)> =
+            session::yaa_env(&self.session.db, &process_env, Some(call_id))
+                .into_iter()
+                .collect();
         tools::shell::execute(
             name,
             call_id,
@@ -910,7 +948,7 @@ impl Runner<'_> {
             limits,
             outputs_dir,
             self.data_root,
-            extra_env,
+            &extra_env,
         )
         .await
     }
@@ -1020,6 +1058,12 @@ impl Runner<'_> {
         // 钩子内的 `yaa --notify` 发到 `inbox/init/`：runner 在 init 之后优先消费，
         // 保持「notify → 簿记 → user」的既有顺序。
         let mut env = self.hook_env();
+        // F1：init 通知必须落本会话的 `init/`，不能继承父会话的 `YAA_NOTIFY`
+        // （否则嵌套子会话的系统提示词会被投进父会话 pending）。仍保留 `YAA_PARENT`，
+        // 钩子需要回父时可显式 `--to "$YAA_PARENT"`。
+        if let Some(self_db) = env.get("YAA_SESSION").cloned() {
+            env.insert("YAA_NOTIFY".to_string(), self_db);
+        }
         env.insert("YAA_INBOX_PHASE".to_string(), "init".to_string());
         let command = self.config.hooks.init.as_str();
         match crate::hook::run(command, self.cwd, &env, self.config.hooks.timeout_secs).await {
@@ -1106,9 +1150,21 @@ impl Runner<'_> {
         }
     }
 
-    /// 钩子进程的环境变量。
+    /// 钩子进程的环境变量（继承当前进程环境）。
     fn hook_env(&self) -> BTreeMap<String, String> {
-        let mut env = BTreeMap::new();
+        self.hook_env_with(&process_env)
+    }
+
+    /// [`Runner::hook_env`] 的实现；`incoming` 为环境继承 getter，便于测试注入。
+    fn hook_env_with(
+        &self,
+        incoming: &impl Fn(&str) -> Option<String>,
+    ) -> BTreeMap<String, String> {
+        // 会话变量由 `yaa_env` 统一构造：钩子不携带 shell 工具专有的
+        // `YAA_NOTIFY_CALL_ID`，并把继承值显式清空（F2），避免父工具调用的 call_id
+        // 泄漏进钩子发布的通知归因。
+        let mut env = session::yaa_env(&self.session.db, incoming, None);
+        env.insert("YAA_NOTIFY_CALL_ID".to_string(), String::new());
         let config = self.config_root.to_string_lossy().into_owned();
         env.insert("GLB_CFG".to_string(), config.clone());
         env.insert("YAA_CONFIG_HOME".to_string(), config);
@@ -1116,8 +1172,6 @@ impl Runner<'_> {
             "YAA_DATA_HOME".to_string(),
             self.data_root.to_string_lossy().into_owned(),
         );
-        // `init` 钩子内的 `yaa --notify` 子进程默认写回本会话（D25）。
-        env.insert("YAA_SESSION".to_string(), session_path(&self.session));
         // 把 `[shell]` 限额以 `YAA_NOTIFY_*` 注入钩子：钩子内的 `yaa --notify` 据此
         // 采用与主进程相同的截断/超时参数，避免 `--config` 在外层生效、内层却回退默认（A6）。
         env.insert(
@@ -1144,12 +1198,11 @@ impl Runner<'_> {
     }
 }
 
-/// 会话数据库的绝对路径；`absolute` 失败时退回原路径。
-fn session_path(session: &yaa_store::Session) -> String {
-    std::path::absolute(&session.db)
-        .unwrap_or_else(|_| session.db.clone())
-        .to_string_lossy()
-        .into_owned()
+/// 读取进程环境变量；缺失返回 `None`。
+///
+/// 作为 [`session::yaa_env`] 的 `incoming` getter，使环境链从当前进程继承。
+fn process_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
 }
 
 /// 在 `base` 上叠加 ±20% 抖动，避免多 follower 同步轮询。
@@ -1760,6 +1813,38 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(written, expected, "init 钩子应收到 YAA_SESSION 绝对路径");
+    }
+
+    /// 阶段 5 环境链：钩子 env 带 `YAA_NOTIFY`；嵌套时带 `YAA_PARENT`；
+    /// `YAA_NOTIFY_CALL_ID` 显式清空（F2：不得继承父工具调用的 call_id）。
+    #[test]
+    fn hook_env_carries_notify_and_nested_parent() {
+        let harness = Harness::new(test_config("true"));
+        let sink = NullSink;
+        let runner = harness.runner(&sink);
+        let expected = std::path::absolute(&harness.session.db)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let env = runner.hook_env_with(&|_| None);
+        assert_eq!(env["YAA_SESSION"], expected);
+        assert_eq!(
+            env["YAA_NOTIFY"], expected,
+            "无继承时 YAA_NOTIFY 默认为自己"
+        );
+        assert!(!env.contains_key("YAA_PARENT"), "无继承不应有 YAA_PARENT");
+        assert_eq!(
+            env["YAA_NOTIFY_CALL_ID"], "",
+            "钩子必须把继承的 YAA_NOTIFY_CALL_ID 清空"
+        );
+
+        let parent = "/data/parent/session.db";
+        let incoming = |key: &str| (key == "YAA_SESSION").then(|| parent.to_string());
+        let env = runner.hook_env_with(&incoming);
+        assert_eq!(env["YAA_SESSION"], expected, "YAA_SESSION 无条件重设");
+        assert_eq!(env["YAA_PARENT"], parent, "继承的 YAA_SESSION 记为父会话");
+        assert_eq!(env["YAA_NOTIFY_CALL_ID"], "", "继承的 call_id 必须清空");
     }
 
     #[tokio::test]
