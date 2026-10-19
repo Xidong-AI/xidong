@@ -8,13 +8,13 @@
 
 ## yaa
 
-`yaa` means Yet Another Agent. A minimal command-line agent: **its only tool is the shell**, history is appended to JSONL, and the context is just a rendered view of that history.
+`yaa` means Yet Another Agent. A minimal command-line agent: **its only tool is the shell**, history lives in a per-session SQLite event database (insert-only; the context is just a rendered projection of it).
 
 ## Highlights
 
 - **The shell is the only tool**: no built-in file, search, or web tools. Write whatever commands you need; external commands (such as your own `webfetch`) are callable as long as they are on `PATH`.
 - **Minimal hooks**: only an `init` hook for empty-session initialization and an `llm` hook for the model provider configuration; initialization injections enter the context through `yaa --notify`, and can be wired to `cat`, `pass`, `op`, and friends.
-- **Auditable history**: each session is an append-only JSONL file; at render time records are mapped to model-interface messages.
+- **Auditable history**: each session is an append-only SQLite event database (`sessions/<sid>/session.db`); at render time records are mapped to model-interface messages.
 - **Per-directory sessions**: the session id is a hash of the canonical working directory, so running `yaa` again in the same directory resumes the session.
 - **Non-interactive**: one `yaa "..."` runs multiple steps internally until the model stops calling tools.
 
@@ -60,7 +60,7 @@ yaa --notify="comment" -- cmd      # run cmd and write its stdout as a notificat
 cmd | yaa --notify="comment"       # read stdin and write it as a notification
 yaa --notify-timeout 30 --notify="comment" -- cmd  # override the notification command timeout (seconds)
 yaa --cwd /path/to/project 你好    # set the working directory
-yaa --session /path/to/default.jsonl 你好
+yaa --session /path/to/session.db 你好
 yaa --config /path/to/config.toml 你好
 yaa --verbose                     # also show reasoning and command output
 yaa --quiet                       # print only the final reply
@@ -86,7 +86,7 @@ Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook 
 | ----------- | --------------------------------------------------------------- |
 | `yaa-cli`   | `yaa` binary: argument parsing, entry point, stdout/stderr policy |
 | `yaa-core`  | Config and paths, tool definition, model calls, rendering and display projection, agent loop |
-| `yaa-store` | Session JSONL read/write, offset reads, archiving                |
+| `yaa-store` | Session SQLite event database read/write, reads by sequence, archiving, file locks |
 | `yaa-exec`  | Shell execution mechanism: process group, timeout, streaming truncation, full-output files |
 | `yaa-msg`   | Record types and serialization                                   |
 
@@ -108,6 +108,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | clap         | [MIT OR Apache-2.0](https://github.com/clap-rs/clap)             |
 | libc         | [MIT OR Apache-2.0](https://github.com/rust-lang/libc)           |
 | reqwest      | [MIT OR Apache-2.0](https://github.com/seanmonstar/reqwest)      |
+| rusqlite     | [MIT](https://github.com/rusqlite/rusqlite)                      |
 | serde        | [MIT OR Apache-2.0](https://github.com/serde-rs/serde)           |
 | serde_json   | [MIT OR Apache-2.0](https://github.com/serde-rs/json)            |
 | sha2         | [MIT OR Apache-2.0](https://github.com/RustCrypto/hashes)        |
@@ -117,3 +118,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md).
 | ulid         | [MIT](https://github.com/dylanhart/ulid-rs)                      |
 
 Test-only: `axum` ([MIT](https://github.com/tokio-rs/axum)), `tempfile` ([MIT OR Apache-2.0](https://github.com/Stebalien/tempfile)).
+
+`rusqlite` statically links SQLite through its `bundled` feature; its build depends on `libsqlite3-sys` ([MIT](https://github.com/rusqlite/rusqlite)) and the public-domain SQLite sources.

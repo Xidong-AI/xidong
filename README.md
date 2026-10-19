@@ -8,13 +8,13 @@
 
 ## yaa
 
-`yaa` 的意思是 Yet Another Agent。一个极致轻量的命令行智能体：**唯一的工具是 Shell**，历史以 JSONL 追加保存，上下文只是历史记录的一份渲染视图。
+`yaa` 的意思是 Yet Another Agent。一个极致轻量的命令行智能体：**唯一的工具是 Shell**，历史以每会话 SQLite 事件库追加保存（只插入、不修改，渲染是它的投影），上下文只是历史记录的一份渲染视图。
 
 ## 特点
 
 - **Shell 即唯一工具**：不内置文件、搜索、网页等工具。需要什么就写什么命令，外部命令（如自备的 `webfetch`）只要在 `PATH` 中即可被调用。
 - **钩子极简**：只有空会话初始化的 `init` 钩子与取模型供应配置的 `llm` 钩子；初始化注入经 `yaa --notify` 写入上下文，可与 `cat`、`pass`、`op` 自由对接。
-- **可审计历史**：每个会话是一个 JSONL 文件，记录只追加、不修改；渲染时按记录类型映射为模型接口消息。
+- **可审计历史**：每个会话是一个 SQLite 事件库（`sessions/<sid>/session.db`），记录只追加、不修改；渲染时按记录类型映射为模型接口消息。
 - **会话按目录隔离**：会话 id 由工作目录规范化后哈希得到，在同一目录再次运行默认续接。
 - **非交互**：一次 `yaa "……"` 在内部循环多步，直到模型不再调用工具。
 
@@ -60,7 +60,7 @@ yaa --notify="注释" -- cmd         # 执行 cmd，把 stdout 作为通知写�
 cmd | yaa --notify="注释"          # 从 stdin 读内容并写入通知
 yaa --notify-timeout 30 --notify="注释" -- cmd  # 覆盖该通知命令的超时（秒）
 yaa --cwd /path/to/project 你好    # 指定工作目录
-yaa --session /path/to/default.jsonl 你好
+yaa --session /path/to/session.db 你好
 yaa --config /path/to/config.toml 你好
 yaa --verbose                     # 追加思考内容与命令输出
 yaa --quiet                       # 只打印最终回复
@@ -86,7 +86,7 @@ yaa --quiet                       # 只打印最终回复
 | ----------- | ---------------------------------------------------------- |
 | `yaa-cli`   | 二进制 `yaa`：参数解析、入口、stdout/stderr 策略           |
 | `yaa-core`  | 配置与路径、工具定义、模型调用、渲染与展示投影、agent loop |
-| `yaa-store` | 会话 JSONL 读写、按偏移读、归档                             |
+| `yaa-store` | 会话 SQLite 事件库读写、按序号读、归档、文件锁             |
 | `yaa-exec`  | Shell 执行机制：进程组、超时、流式截断、完整输出落盘       |
 | `yaa-msg`   | 记录类型与序列化                                            |
 
@@ -108,6 +108,7 @@ yaa --quiet                       # 只打印最终回复
 | clap         | [MIT OR Apache-2.0](https://github.com/clap-rs/clap)             |
 | libc         | [MIT OR Apache-2.0](https://github.com/rust-lang/libc)           |
 | reqwest      | [MIT OR Apache-2.0](https://github.com/seanmonstar/reqwest)      |
+| rusqlite     | [MIT](https://github.com/rusqlite/rusqlite)                      |
 | serde        | [MIT OR Apache-2.0](https://github.com/serde-rs/serde)           |
 | serde_json   | [MIT OR Apache-2.0](https://github.com/serde-rs/json)            |
 | sha2         | [MIT OR Apache-2.0](https://github.com/RustCrypto/hashes)        |
@@ -117,3 +118,5 @@ yaa --quiet                       # 只打印最终回复
 | ulid         | [MIT](https://github.com/dylanhart/ulid-rs)                      |
 
 仅测试使用：`axum`（[MIT](https://github.com/tokio-rs/axum)）、`tempfile`（[MIT OR Apache-2.0](https://github.com/Stebalien/tempfile)）。
+
+`rusqlite` 以 `bundled` 特性静态链接 SQLite；其构建依赖 `libsqlite3-sys`（[MIT](https://github.com/rusqlite/rusqlite)）与公有领域的 SQLite 源码。

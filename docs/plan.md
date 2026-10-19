@@ -20,7 +20,7 @@
 | D12 | `ai` 与 `tool_call` 保持分离记录，以单批缓冲原子追加 | 用户选择；忠于 `design.md:31-33` |
 | D13 | 过程记录默认打到 stderr（`# 描述` / `% 命令` / 块间 `---`，含非末步模型正文）；`--verbose` 追加思考与命令输出；删除 `--trace` | 用户要求对齐 `design.md` 示例观感；`--quiet` 保留为仅最终回复 |
 | D14 | 工具知识内聚：function schema、提示词 section、参数解析、错误文案、调用编排与结果转换全部归 `yaa-core::tools::shell`；`yaa-shell` 降为纯 Shell 执行机制并改名 `yaa-exec` | 现状同一事实硬编码多处（工具名 4 处、参数名 5 处、描述两处措辞不一），schema 与提示词容易漂移；外部调研结论：单工具不引入 trait/registry/模板引擎，采用「多处呈现、一处数据源」 |
-| D15 | 展示采用「同一事件日志派生」：模型消息与用户展示都从会话 JSONL 投影，不维护第二套执行事件流 | 消除展示与模型上下文的漂移（Codex `/status` 的 `Agents.md: <none>` 系列 issue 为反例：两条独立计算路径必然漂移）；用户要求「用户看到的就是模型看到的」 |
+| D15 | 展示采用「同一事件日志派生」：模型消息与用户展示都从会话事件库投影，不维护第二套执行事件流 | 消除展示与模型上下文的漂移（Codex `/status` 的 `Agents.md: <none>` 系列 issue 为反例：两条独立计算路径必然漂移）；用户要求「用户看到的就是模型看到的」 |
 | D16 | 展示不设专用格式：初始化注入与外部通知按与工具调用一致的块样式展示（默认 `# 注释` + `% 命令` 摘要，`--verbose` 追加内容全文）；`--quiet` 抑制全部过程输出 | 上一版「标签 · 来源 · 行数 · 大小 + 首行」的专用格式被用户判为多余；摘要与 `--verbose` 全文保留以便调试 |
 | D17 | 内置模板只保留 `system`，删除 `USER_TEMPLATE`；`--get-prompt` 只认 `system`，输出「产品前导 + 工具 section」 | `user` 模板无运行时消费者，按「不定义无消费者的死分支」原则删除；工具说明随工具走 |
 | D18 | 展示文案与渲染角色由 `yaa-core` 投影层决定，`yaa-cli` 只负责样式与 stdout/stderr 分流 | 消除 CLI 硬编码映射；展示语义属上下文投影，不属于终端样式 |
@@ -39,7 +39,7 @@
 | D31 | 通知的 `command` 进入模型上下文：投影 `system` 时在最前拼 `[执行命令] <command>` | 命令是通知的因果来源，模型需要知道它从何而来；展示层仍以 `% 命令` 呈现，同一字段因此同时服务展示与上下文 |
 | D32 | `system` 记录新增可选 `output_files`（与 `tool_result` 同构，字段顺序 `command?` 之后、`content` 之前） | `--notify` 的命令与 stdin 两种形态复用 `yaa-exec` 的截断/落盘后都需要一个与 `tool_result` 一致的路径载体；旧记录缺该字段解析为 `None`，不得报错 |
 | D33 | `--notify` 的 `--` 形态复用 `yaa-exec`：截断 + 完整输出落盘 + 退出码沿用 + stderr 透传；`command` 改为 **shell 转义后的可重放命令** | 原实现 `Command::new(program).args` 绕过 shell、不截断也不落盘，`command` 只是展示摘要；统一执行路径后通知与工具行为一致，且命令可重放，`output_files` 得以成立 |
-| D34 | `archive` 的 `sessions-<ts>.jsonl` 已存在时改为 `sessions-<ts>-<n>.jsonl`（n 从 1 递增） | 同毫秒连续归档会静默覆盖，破坏「归档即不可变历史」 |
+| D34 | `archive` 的 `sessions-<ts>.jsonl` 已存在时改为 `sessions-<ts>-<n>.jsonl`（n 从 1 递增；现仅用于旧 JSONL 的文件级归档） | 同毫秒连续归档会静默覆盖，破坏「归档即不可变历史」 |
 | D35 | `timed_out` 只表示真正超出时限；读取宽限内放弃流只回填占位提示，不再 promote 为超时 | 逃逸进程组攥住管道与命令超时是两回事，误报会让调用方以为命令被超时击杀 |
 | D36 | `--notify` 的 stdin 形态复用 `yaa-exec::capture_reader`（同一 `Sink`/`FullOutput`） | 与 `--` 形态保持同一截断标记与落盘语义，避免两套实现漂移；超限时同样产生 `output_files.stdout`，内存仍有界 |
 | D37 | 模型请求超时 `[agent] request_timeout_secs`（默认 300 秒，0 值非法）；请求超时**不重试** | 端点接受连接却不响应时，无超时会无限挂起；重试只应覆盖「已收到响应」的可重试错误，超时重试会把等待拖成多轮 |
@@ -55,7 +55,7 @@
 | D47 | 审批轮顺带修复 A4（畸形 `tool_call` 不再静默丢弃）、A5（非末步正文不上 stdout）、A6（`--config` 沿钩子链传递） | 同属「不静默降级 / 展示正确性」主题，避免二次开工 |
 | D48 | 阶段 3 交付 = 压缩 + `--json` + `--no-store`；`outputs/` 保留策略顺延 | 三项各自独立可验收；混阶段会让验收标准互相稀释 |
 | D49 | 压缩策略（比率、pruner 预算、`retries`）归 `[compaction]`；模型上下文窗口 `context_window` 随 `llm` 钩子输出（供应侧，与 `model` 同源，换模型只改一处），缺失即整支禁用（静默，不报错） | 窗口是模型属性而非策略；DSH 同样从路由适配器解析 capacity。策略与预算在 `[compaction]` 与 `[shell]`/`[agent]` 并列 |
-| D50 | 压缩只发生在渲染期、**不改 `default.jsonl`**；摘要产物写 `sessions/<sid>/summaries/<hash>.json` 侧车（`hash` = 被遮蔽记录 id 序列 + 模型） | 忠于 `design.md`「压缩只发生在渲染阶段，原始 JSONL 不变」；key 含记录 id 使缓存精确，同内容不同划分不误命中 |
+| D50 | 压缩只发生在渲染期、**不改 `session.db`**；摘要产物写 `sessions/<sid>/summaries/<hash>.json` 侧车（`hash` = 被遮蔽记录 id 序列 + 模型） | 忠于 `design.md`「压缩只发生在渲染阶段，原始事件库不变」；key 含记录 id 使缓存精确，同内容不同划分不误命中 |
 | D51 | 摘要**链式递进**：新摘要输入 = 旧摘要文本 + 新遮蔽区，`previous` 记录前驱；渲染时只应用链尾摘要 | 无状态重算会让长会话第二次压缩把已蔽原文整段重喂、可能直接超窗口；链式使每次摘要输入有界 |
 | D52 | token 估算按 `chars_per_token`（默认 4）对**投影消息文本**（`content` + `tool_calls` 参数 + `reasoning`）计，不含工具 schema | 对齐 DSH 的固定密度启发式；工具 schema 固定且小，省略可接受，且避免把 schema 传进渲染层 |
 | D53 | pruner 用独立 `[compaction]` 预算（默认 8192/4096/1024），只修剪 `tool` 消息正文、跳过 `system`；标记 `\n\n[... tool result middle pruned ...]\n\n`；按 Unicode 码点 | 与 `[shell]` 的执行期截断语义不同（历史再修剪 vs 执行即截断），复用会把两种阈值混为一谈；跳过 `system` 避免裁掉稳定前缀 |
@@ -64,12 +64,21 @@
 | D56 | 展示仍从原始记录增量投影（D15 不移）；压缩发生时额外展示一条摘要条目；D29 豁免新增「压缩摘要与被修剪的工具正文」 | 历史不可重写且展示增量，逐字一致在时间轴上不可能；以显式豁免取代静默漂移 |
 | D57 | `--json`：`DisplayItem` 逐条序列化为 JSONL 到 stdout（含最终回复与诊断）；与 `--quiet`/`--verbose` 冲突 | 机器接口需要单一稳定流；人类模式的双流（过程 stderr / 回复 stdout）不适合结构化消费 |
 | D58 | `--no-store`：本次运行指向临时目录会话，退出即淘；与 `--session` 冲突 | 「不留痕」要求连 `outputs/` 一并消失；临时目录复用全部既有写入路径，零特例 |
+| D59 | 存储改为每会话 SQLite：`sessions/<sid>/session.db` 的 `events` 表 append-only 为唯一事实源；`payload` 存完整记录 JSON，`type`/`ts` 为生成列 | 每会话单库、可审计且事务原子；支持按 `seq` 增量读，拒绝全局单库与双存储 |
+| D60 | 用 `rusqlite`（`bundled`）实现；打开时校验 `application_id=0x59414131` 与 `user_version=1`，非 yaa 库拒绝 | 绝不误写普通 SQLite 库；捆绑 SQLite 满足 WAL-reset 修复的最低版本（≥ 3.51.3） |
+| D61 | WAL + `synchronous=FULL`；写路径用 `BEGIN IMMEDIATE` 短事务批量提交；`busy_timeout` 5 秒（`--notify` 外层预算约 30 秒），BUSY 按 50/100/200 ms 退避、最多 3 次额外尝试 | 断电不丢已提交批次；写者串行化；重试总是重跑完整事务，绝不重试已开始的事务 |
+| D62 | 锁契约：`runner.lock`（run/approve/clear 互斥）、`clear.lock`（clear 排他 / `--notify` 写入共享）、`init.lock`（首次建库串行化）；锁文件永久保留 | 单 runner 选举与归档/通知互斥；固定顺序 runner → clear，notify 只拿 clear，无死锁 |
+| D63 | `--clear` = `VACUUM INTO` 快照 → 完整性/计数校验 → rename 为 `history/<sid>/sessions-<ts>.db` → 清空 events → `generation+1`；任何一步失败都不清空主库 | 归档是自包含快照；generation 区分清空前后，`seq` 可从 1 重新使用 |
+| D64 | 崩溃恢复职责在 core、store 保持哑：runner 锁内、`init`/`user` 之前补中断 `tool_result`；普通 run 作废旧 pending，`--approve` 只补孤儿；渲染器内存兜底保留 | store 不猜测业务语义；恢复幂等，重复运行不会重复补写 |
+| D65 | 旧 JSONL 不自动迁移：`--session *.jsonl` 明确报错并提示 `--clear`；`--clear --session x.jsonl` 走文件级 rename 归档为 `history/<sid>/sessions-<ts>.jsonl` | 避免静默误写旧数据；用户显式归档后可重新开始 |
+| D66 | `--session` 路径统一绝对化：目录 → `<目录>/session.db`；`.jsonl` → 旧格式错误；其余按数据库路径 | 规则单一可预测；裸文件名时 sid 回退为绝对路径 sha256 前 32 位 |
+| D67 | 归档库标记 `archived=1`，`append` 拒绝写入；`--status` 仍可读 | 归档即不可变历史，只读访问保留审计价值 |
 
-> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认。
+> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认。
 
 ## 对 design.md 的更正
 
-第 1–7 条必须在动代码前确认，因为它们决定了不可变的 JSONL schema；第 8–11 条为实现阶段 1 时发现、事后补记，不改变已冻结的 schema，但修正 design.md 对行为的描述；第 12–13 条为本次重设计讨论中确认，与 D23–D24、D28 对应。
+第 1–7 条必须在动代码前确认，因为它们决定了不可变的记录 schema；第 8–11 条为实现阶段 1 时发现、事后补记，不改变已冻结的 schema，但修正 design.md 对行为的描述；第 12–13 条为本次重设计讨论中确认，与 D23–D24、D28 对应。
 
 1. **压缩并非无模型调用**（`design.md:44`）。`@deepseek-ai/dsh-compaction-basic` 出厂必发一次摘要 LLM 调用；真正无模型的是伴生包 `dsh-compaction-tool-result-pruner`（纯头尾截断）。按 D3 两者都实现。
 2. **压缩归属**：`design.md:19` 把「压缩摘要」列在 `yaa-store`，但 `design.md:45` 说压缩只发生在渲染阶段。更正为：**压缩属 `yaa-core` 的渲染管线，`yaa-store` 只负责存储**。
@@ -79,9 +88,9 @@
 6. **截断产物无载体**：`design.md:50` 未定义完整输出的路径字段。更正为 `tool_result` 增加可选 `output_files`（stdout/stderr 分两个文件）与 `truncated`。
 7. **`client_id`/`turn_id`**（`design.md:301`）预留进 schema，阶段 4 使用。
 8. **钩子不经 `shell` 工具执行**（`design.md:12`）。design 说系统生命周期钩子「触发 Shell 工具调用」实现。更正为：`init`/`llm` 钩子由 `yaa-core` 的独立执行器（`crates/yaa-core/src/hook.rs`）以 `sh -c` 运行，与 `shell` 工具**不共用策略**——钩子单流超过 1 MiB 直接报错退出，不截断、不产生 `output_files`；「钩子就是同一个 Shell 工具」的表述不成立。
-9. **初始化注入排在 `user` 之前**（`design.md:27-31`）。design 的 JSONL 顺序在新设计下成立：`init` 只在无 `system(source=init)` 簿记时于写入 `user` 之前执行，注入内容由命令内的 `yaa --notify` 写入，因而物理上位于 `user` 之前。`init` 失败时仍写入 `user` 并按配置错误退出。
+9. **初始化注入排在 `user` 之前**（`design.md:27-31`）。design 的记录顺序在新设计下成立：`init` 只在无 `system(source=init)` 簿记时于写入 `user` 之前执行，注入内容由命令内的 `yaa --notify` 写入，因而物理上位于 `user` 之前。`init` 失败时仍写入 `user` 并按配置错误退出。
 10. **注入不再有专用文案**。旧设计「钩子 `tool_call` 不写 `description`、由展示层现算文案」随 D19 一并移除：注入内容现在是 `system(source=notify)` 事件，展示用与工具调用一致的块样式，标题即信封中的注释。
-11. **中断 `tool_result` 有两种互补补法**（`design.md:427-431`、本文件「渲染管线」失配兜底）。阶段 1 由渲染器在内存中合成中断 `tool` 消息，保证请求体合法，**不写回** JSONL；阶段 6 的「补中断 `tool_result`」则是把它作为记录持久化落盘。两者不冲突：前者保证任意时刻请求合法，后者让历史事实源自身自洽。
+11. **中断 `tool_result` 有两种互补补法**（`design.md:427-431`、本文件「渲染管线」失配兜底）。渲染器在内存中合成中断 `tool` 消息，保证请求体合法，**不写回事件库**；阶段 6 的「补中断 `tool_result`」则是把它作为记录持久化落盘。两者不冲突：前者保证任意时刻请求合法，后者让历史事实源自身自洽。
 12. **`ai` 记录含 `reasoning`，思考内容按端点格式回传**（`design.md:38,42` 的示例未列）。`design.md:63` 把压缩参考 DSH，而 DSH 的思考模型适配证明该字段必须可回传。更正为：`ai` 新增可选 `reasoning`，落盘、可展示；`[llm] endpoint_format` 决定它是否作为 assistant 消息顶层 `reasoning_content` 回传——`deepseek`/`kimi`/`qwen`/`glm` 在请求带 `tools` 时即使思考为空也必须发 `""`，`openai` 不回传。
 13. **注入分组的方向**。`design.md:57` 只说「与相邻 `user` 事件合并」，未定义方向。更正为**双向最大连续段**：首条 `user` 起，`user` 与 `system(notify)` 的最大连续段合并为一条 `user`（`\n\n` 分隔，物理顺序）。
 14. **通知的 `command` 进入上下文**（`design.md:48` 称「只用于展示，不进入上下文」）。更正为：投影 `system` 时把 `command` 以 `[执行命令] <command>` 前缀置于正文最前（D31）；`command` 现为 shell 转义后的**可重放命令**，不再是「仅展示摘要」。展示层仍以 `% 命令` 呈现，且不重复拼该前缀。
@@ -93,7 +102,7 @@
 Cargo.toml                      # workspace
 crates/
   yaa-msg/                      # 记录类型与 serde，无内部依赖
-  yaa-store/                    # JSONL 同步读写、会话解析、归档、按偏移读
+  yaa-store/                    # 会话 SQLite 事件库同步读写、会话解析、归档、文件锁
   yaa-exec/                     # Shell 执行机制：进程组、超时、流式截断、完整输出落盘
   yaa-core/                     # config、工具定义（tools）、agent loop、渲染投影、钩子、模型调用、压缩（后期）
   yaa-cli/                      # 二进制 yaa：clap 参数、展示渲染、stdout/stderr 策略、--notify 短路写入
@@ -120,15 +129,17 @@ $YAA_CONFIG_HOME   默认 ${XDG_CONFIG_HOME:-$HOME/.config}/yaa
   AGENTS.md                    # 默认 init 钩子读取（可选）
 
 $YAA_DATA_HOME     默认 ${XDG_DATA_HOME:-$HOME/.local/share}/yaa
-  sessions/<sid>/default.jsonl
+  sessions/<sid>/session.db                        # 事件库（WAL 副产物 -wal/-shm 同目录）
+  sessions/<sid>/{runner,clear,init}.lock          # runner 选举 / clear 互斥 / 建库串行化
   sessions/<sid>/outputs/<ulid>.{stdout,stderr}.out
-  sessions/<sid>/summaries/<key>.json      # 阶段 3 摘要缓存
-  history/<sid>/sessions-<ts>.jsonl
+  sessions/<sid>/summaries/<key>.json       # 阶段 3 摘要缓存
+  history/<sid>/sessions-<ts>.db                   # 归档快照（VACUUM INTO）
 ```
 
 - 启动时导出 `YAA_CONFIG_HOME`、`YAA_DATA_HOME`，并令 `GLB_CFG=$YAA_CONFIG_HOME` 兼容 `design.md` 的钩子写法。
-- **会话根 = JSONL 文件的父目录**，`outputs/` 挂在会话根下。`output_files` 存相对**数据根**的路径，归档后仍可解析。
-- `<sid>` = `hex(sha256(canonical_cwd))` 前 32 位十六进制（128 位）。
+- **会话根 = 数据库文件的父目录**，`outputs/` 与锁文件挂在会话根下。`output_files` 存相对**数据根**的路径，归档后仍可解析。
+- `--session` 统一绝对化后解释：目录 → `<目录>/session.db`；`.jsonl` 视为旧格式并报错（`--clear` 可做文件级归档）；其余按数据库路径。
+- `<sid>` = `hex(sha256(canonical_cwd))` 前 32 位十六进制（128 位）；裸文件名数据库路径回退为绝对路径哈希。
 - `--cwd <path>` 的语义固定为：**改变进程工作目录**，同时用于 sid 计算、钩子 cwd 与 Shell cwd（三处一致）。不存在时明确报错。
 - `canonicalize` 失败（目录已删、符号链接断裂）时回退词法规范化并给出警告，不静默。
 - 会话不承诺跨机可迁移：`init` 注入的系统提示词含机器相关信息（工作目录等），移动目录或换机后新注入会不同；已有历史不重写。
@@ -184,7 +195,7 @@ context_window = 128000
 
 规则与不变量：
 
-1. 钩子以 `sh -c "<命令>"` 执行，cwd 为进程工作目录，环境含 `GLB_CFG`、`YAA_CONFIG_HOME`、`YAA_DATA_HOME`、`YAA_SESSION`（本会话 JSONL 绝对路径）与 `YAA_BIN`（当前 `yaa` 可执行文件路径，使默认钩子不依赖 `PATH`）。
+1. 钩子以 `sh -c "<命令>"` 执行，cwd 为进程工作目录，环境含 `GLB_CFG`、`YAA_CONFIG_HOME`、`YAA_DATA_HOME`、`YAA_SESSION`（本会话数据库绝对路径）与 `YAA_BIN`（当前 `yaa` 可执行文件路径，使默认钩子不依赖 `PATH`）。
 2. **`init` 钩子只做副作用**：yaa 运行它并忽略 stdout；写入上下文的唯一方式是在命令里调用 `yaa --notify`。默认配置用三条 notify 拼出「系统提示词 / 用户总提示词 / 当前环境」；内置模板的「工具 section」由 `yaa-core::tools::shell` 提供（见 D14、D17）。
 3. **`llm` 钩子不落历史、不渲染、不展示**：其 stdout 含密钥，且每次运行都需执行以取得配置；结果只留在进程内，不写任何事件（见 D19）。
 4. **`init` 幂等由簿记保证**：触发条件是「会话中不存在 `system(source=init)` 记录」，成功后追加一条 `system(source=init, content="")` 簿记；即使钩子不产出内容，下次也不会重跑。失败时不写簿记、仍写入 `user` 并按配置错误退出，已写入的 `notify` 记录保留；因此下次运行会自动重试。
@@ -224,7 +235,9 @@ approval_resolved { type, id, ts, call_id, decision: approve|deny }
 
 ### 追加的原子性
 
-`yaa-store::append(&[Record])` 把整批记录序列化到一个 `Vec<u8>`，一次 `write_all`（`O_APPEND`）+ `fsync`。禁止对文件句柄逐条 `serde::to_writer`（多 syscall 会在同会话并发时交织出半行）。断电只会留下撕裂的尾行；**`append` 在写入前先修补尾行**：尾段能解析则补一个换行保留，否则截断到最后一个换行之后。`load` 同样容忍撕裂尾行。
+**BEFORE（JSONL，已废弃）**：整批序列化后一次 `O_APPEND` + `fsync`；断电可能留下撕裂尾行，`load`/`append` 需修补残段。
+
+**AFTER（SQLite）**：`yaa-store::append(&[Record])` 在一个 `BEGIN IMMEDIATE` 事务中把整批记录逐条 `INSERT` 到 `events`，随后 `COMMIT`。一批记录要么全部可见、要么全部不可见，半行撕裂问题由事务消除；WAL + `synchronous=FULL` 保证已提交批次在断电后仍在。重复 `id` 使整批回滚并报 `DuplicateId`，`append_idempotent` 用 `ON CONFLICT(id) DO NOTHING` 供恢复/消费路径幂等补写；空批直接返回且不创建任何文件。BUSY 时从 `BEGIN IMMEDIATE` 重试整个事务，绝不续写已开始的事务。
 
 ## 渲染管线与分层装配
 
@@ -283,7 +296,7 @@ approval_resolved { type, id, ts, call_id, decision: approve|deny }
 
 ## Agent loop 与并发形状（阶段 1）
 
-即使阶段 1 无锁，入口形状必须现在就是「先发布消息 → 再决定 runner/follow」，否则阶段 4 要重写入入口。
+入口形状保持「先发布消息 → 再决定 runner/follow」；当前已用 `runner.lock` 实现逻辑单 runner，inbox 文件协议属阶段 4。
 
 ```rust
 async fn main_flow(cfg) -> Result<ExitCode> {
@@ -296,7 +309,7 @@ async fn main_flow(cfg) -> Result<ExitCode> {
     let user = build_user_record(prompt);
     store::append(&session, &[user]);              // 阶段 1：直接追加；阶段 4：改为 inbox 发布
 
-    let guard = try_acquire_runner(&session);      // 阶段 1：恒成功，无锁
+    let guard = try_acquire_runner(&session);      // 当前：runner.lock 非阻塞选举
     match guard {
         Some(g) => run_agent_loop(&session, &cfg, g).await,
         None    => follow(&session).await,         // 阶段 1：不可达
@@ -322,8 +335,8 @@ async fn run_agent_loop(session, cfg, guard) -> Result<ExitCode> {
 }
 ```
 
-- `yaa-store` 保持**同步 API**（追加、按偏移读、归档）。在 core 调用点用 `spawn_blocking` 包装，不做成假 async。
-- store 预留 `read_from(&session, offset) -> (Vec<Record>, new_offset)` 供阶段 4 跟随使用；`load` 容忍撕裂尾行。
+- `yaa-store` 保持**同步 API**（批量追加、按 `seq` 增量读、归档）。在 core 调用点用 `spawn_blocking` 包装，不做成假 async。
+- `read_after(&session, after_seq) -> (Vec<(seq, Record)>, new_seq)` 为跟随/增量展示预留；当前 core 仍以 `load` 全量读取并按记录下标推进水位。`load` 按 `seq` 顺序读取全部事件。存储层只认 `Path`，不依赖配置类型。
 - `load` 每步重读，阶段 4 的 inbox 插入与 `yaa --notify` 追加才能在下一轮被看到。
 - **无初始化簿记才初始化**：会话中不存在 `system(source=init)` 记录时执行 `init` 钩子（D20）；钩子内经由 `yaa --notify` 写入的通知先落盘，随后才是 `init` 簿记与 `user` 记录。`init` 失败仍写入 `user`，再按配置错误退出；因不写簿记，下次运行自动重试。
 - **`llm` 不写事件**：只解析配置供进程使用；解析失败按配置错误退出（见 D19）。
@@ -409,12 +422,12 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 验收：
 
-1. `yaa "你好"` 在空会话先执行 `init`：`default.jsonl` 依次留下三条 `system(source=notify)`、一条 `system(source=init)`、`user`、`ai`；无工具调用时打印模型回复。
+1. `yaa "你好"` 在空会话先执行 `init`：`session.db` 的 `events` 表依次留下三条 `system(source=notify)`、一条 `system(source=init)`、`user`、`ai`；无工具调用时打印模型回复。
 2. 再次 `yaa "继续"` 不重跑 `init`（无新增 notify 记录），能读到上一轮并正确渲染续接；**断言第二跳请求体**符合 OpenAI 消息序列。
 3. 渲染分层：首条 `user` 之前的通知合并为一条 `system` 消息；`yaa --notify` 在首条 `user` 之后写入的通知与相邻 `user` 合并为一条 `user` 消息（信封保留）。
 4. 构造需要 Shell 的多步任务，工具结果回填并循环至最终回答。
-5. `--clear` 把 `default.jsonl` 移入 `history/<sid>/sessions-<ts>.jsonl` 后开新历史；`outputs/` 留在原地，归档记录的相对路径仍有效；同一 `ts` 再次归档时目标改为 `sessions-<ts>-<n>.jsonl`（n 从 1 递增），不覆盖既有归档。
-6. 集成测试用本地假 OpenAI 服务器，断言 JSONL 序列与 Shell 副作用；**断言请求体与 JSONL 均不含 `api_key`**。
+5. `--clear` 把当前事件库快照到 `history/<sid>/sessions-<ts>.db`，清空 `events` 并令 `generation+1`；`outputs/` 留在原地，归档记录的相对路径仍有效；同一 `ts` 再次归档时目标改为 `sessions-<ts>-<n>.db`（n 从 1 递增），不覆盖既有归档。
+6. 集成测试用本地假 OpenAI 服务器，断言事件序列与 Shell 副作用；**断言请求体与事件库均不含 `api_key`**。
 7. 递归防护测试：`init` 钩子内部调用 `yaa --get-prompt system` 能正常返回而非递归。
 8. 中断测试：模型返回 `tool_calls` 后进程被杀，下次运行渲染器合成中断 `tool` 消息，请求体合法。
 9. 展示一致性：对同一份记录，展示中属于上下文的文本集合与模型消息的文本集合完全一致（`reasoning` 与展示专用的块标记/标题豁免；通知的 `command`、工具调用的 `description` 两侧都有，计入，D29/D31）。
@@ -423,7 +436,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 12. `--get-prompt user` 为用法错误（退出码 2）；`--get-prompt system` 输出的工具 section 与 `tools::shell` 的 schema 名称/参数一致（防漂移）。
 13. `--notify` 两形态与限额：`yaa --notify="注释" -- cmd` 写入 `system(source=notify)`，`command` 为 shell 转义后的可重放命令，超限时经 `yaa-exec` 截断、正文含头尾标记且 `output_files.stdout` 为相对数据根的路径；`cmd | yaa --notify="注释"` 写入同名记录但不含 `command`、复用同一截断/落盘策略（超限时正文含头尾标记且完整输入落盘为 `output_files.stdout`，短输入无 `output_files`）；两者正文均为 `<注释>…</注释>`。再断言：`--notify-timeout` 生效（超时按 1 退出并提示）、环境变量与 `[shell]` 的限额解析链生效、命令对模型可见（第二跳请求含 `[执行命令]` 前缀）、旧 `system` 记录缺 `output_files` 仍可解析。
 14. 思考回传：`--verbose` 展示 `ai.reasoning`；`endpoint_format="deepseek"` 时第二跳请求体中带 `tool_calls` 的 assistant 消息含 `reasoning_content`（思考为空时值为 `""`），`endpoint_format="openai"` 时不含该字段。
-15. 会话目标：`yaa --session <path>` 在空会话触发 `init`，三条 notify 经 `YAA_SESSION` 写入该 `<path>`；旧 schema 会话由 `yaa --status` 报明确错误并提示 `--clear`（D26）。
+15. 会话目标：`yaa --session <path>` 在空会话触发 `init`，三条 notify 经 `YAA_SESSION` 写入该 `<path>`；旧 `.jsonl` 会话由 `yaa --status` 报旧格式错误并提示 `--clear`（D65）。
 
 ### 阶段 2：审批
 
@@ -434,7 +447,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 验收：
 
 1. 裁决单测：deny 短路（含 `*: ask` 尾随不覆盖具体 deny）；最具体优先（`git push *` 胜过 `git *`）；同分取后者；无匹配默认 allow；`?` 与 `*` 语义；命令拆分（`a && b`、`VAR=x b`）后按段聚合。
-2. `ask` 拦截：命中 `ask` 时 `default.jsonl` 出现 `approval_pending`、stderr 打印可重放命令与 `matched_rule`、进程以 `6` 退出、且**不写** `tool_result`。
+2. `ask` 拦截：命中 `ask` 时事件库出现 `approval_pending`、stderr 打印可重放命令与 `matched_rule`、进程以 `6` 退出、且**不写** `tool_result`。
 3. `--approve`：对上述会话执行 `yaa --approve`，命令被执行并写 `approval_resolved: approve` + `tool_result`，随后继续循环直至最终回复；不写 `user`、不重跑 `init`；多个 pending 时每次只放行最旧一条。
 4. `--auto`：`yaa --auto "……"` 自动放行命中 `ask` 的调用并完成循环；显式 `deny` 仍被拒。
 5. `deny`：命中即写 `approval_pending` + `approval_resolved: deny` + 失败 `tool_result`，进程不退出，模型在下一跳能看到被拒结果。
@@ -451,7 +464,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 范围与行为（D48–D58）：
 
-- **压缩**在渲染期进行，不改 `default.jsonl`。触发链：投影 token ≥ `floor(context_window × threshold_ratio)` → 先 pruner（只修剪 `tool` 消息正文，跳过 `system`）→ 重测 → 仍超才摘要。
+- **压缩**在渲染期进行，不改 `session.db`。触发链：投影 token ≥ `floor(context_window × threshold_ratio)` → 先 pruner（只修剪 `tool` 消息正文，跳过 `system`）→ 重测 → 仍超才摘要。
 - **选区间照搬 DSH**：跳过稳定 `system` 头；从尾部累计 token 到 `retain_tokens`（= `floor(context_window × retain_ratio)`）；切点向头部回退到工具配对平衡处（不切分 `assistant.tool_calls` 与配对 `tool`）。
 - **摘要链式递进**：输入 = 稳定前缀（可选）+ 被遮蔽区消息（含旧摘要消息）+ 指令；产物写侧车。渲染时只应用链尾摘要；`previous` 指向前驱，`covers` 为被遮蔽记录 id 序列。
 - 摘要成功但**不比原文小**、或调用失败/超时/空输出 → 警告并降级（D55）。
@@ -464,7 +477,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 3. pruner：仅 `tool` 消息被修剪、`system` 不受影响；未超 `prune_threshold_chars` 不动；修剪后码点数 ≤ 阈值且严格小于原文；按 Unicode 码点（不拆代理项对）。
 4. 选区间：稳定 `system` 头永不入区间；尾部按 `retain_tokens` 保留；切点回退到工具配对平衡；无可用区间返回 `None`（不产生空摘要）。
 5. 触发：投影低于阈值不压缩、不产生侧车文件；跨过阈值先 pruner，修剪后已低于阈值则跳过摘要。
-6. 摘要与侧车：`summaries/<hash>.json` 生成且含 `covers`/`previous`/`model`/`summary`；**断言 `default.jsonl` 本次未新增压缩记录**；摘要不比原文小时不采用。
+6. 摘要与侧车：`summaries/<hash>.json` 生成且含 `covers`/`previous`/`model`/`summary`；**断言 `session.db` 本次未新增压缩记录**；摘要不比原文小时不采用。
 7. 链式：第二次压缩的摘要请求体含旧摘要文本、**不含**已被旧摘要遮蔽的原文。
 8. 降级：摘要端点返回错误时，stderr 有警告、模型调用仍携带完整历史继续（退出码不为 4/3）。
 9. 展示：压缩触发时 stderr 出现一条摘要条目（默认摘要，`--verbose` 全文）；展示不重放被遮蔽原文；D15 不变量测试在「无压缩生效」时逐字一致。
@@ -475,7 +488,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 ### 阶段 4：单 runner 与多客户端注入
 
-`runner.lock` 选举、`inbox/{tmp,pending,consumed}` 无锁发布、`consume_inbox`（append → fsync → rename 顺序）、跟随与按偏移读取、安全点消费。`--clear` 在 runner 运行中的语义在此定义。
+`runner.lock` 选举（已实现：run/approve/clear 互斥）、`inbox/{tmp,pending,consumed}` 无锁发布（阶段 4 未做）、`consume_inbox`（幂等 append → rename）、跟随与 `read_after` 增量读取、安全点消费。`--clear` 在 runner 运行中拿不到 `runner.lock` 即明确报错（已实现）。
 
 ### 阶段 5：notify 与后台任务
 
@@ -483,11 +496,11 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 ### 阶段 6：断电恢复与不变量
 
-截断半行、补中断 `tool_result`、补 `approval_resolved: deny`、按 `id` 去重；不变量测试。
+SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pending 已由 core 的恢复逻辑实现；按 `id` 去重；不变量测试。
 
 ## 测试与验证策略
 
-- 单元测试：记录序列化往返与 golden JSONL（含 `system.output_files` 与旧记录缺字段的兼容）；渲染分层（稳定前缀合并、双向最大连续段并入 `user`、失配兜底、`origin=user`、`system` 的 `[执行命令]` 前缀与截断提示）；`ai.reasoning` 与 `endpoint_format` 的出站序列化；store 追加/加载/归档（含同 ts 序号）/撕裂尾行/无法解析行报错；Shell 进程组、超时、流式截断、逃逸进程组放弃输出但不误报超时。
+- 单元测试：记录序列化往返与 golden JSON（含 `system.output_files` 与旧记录缺字段的兼容）；渲染分层（稳定前缀合并、双向最大连续段并入 `user`、失配兜底、`origin=user`、`system` 的 `[执行命令]` 前缀与截断提示）；`ai.reasoning` 与 `endpoint_format` 的出站序列化；store 追加/加载/`read_after`/归档（含同 ts 序号与 `archived` 只读）/损坏 payload 报错/并发追加与 BUSY 重试；Shell 进程组、超时、流式截断、逃逸进程组放弃输出但不误报超时。
 - 思考回传测试：`endpoint_format` 为 `deepseek` 等时 assistant 消息含 `reasoning_content`（带 `tool_calls` 且思考为空时为 `""`），为 `openai` 时不含。
 - 通知测试：`--notify` 两种形态写入 `system(source=notify)` 与信封正文；`--` 形态记**转义后可重放**的 `command`、stdin 形态不记；注释缺省「由用户执行」；stderr 透传与退出码沿用；两种形态超限截断与 `output_files` 落盘（命令流与 stdin 同一 `Sink`）；`--notify-timeout` 与环境变量/`[shell]` 限额解析链；`shell_quote` 重放等价；`tools::shell` 注入 `YAA_NOTIFY_*`。
 - 会话目标测试：hook 环境注入 `YAA_SESSION`；`--notify` 解析顺序 `--session` → `YAA_SESSION` → cwd 默认。
@@ -502,21 +515,23 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 ## 已知限制
 
-1. 无锁：同会话并发运行的写入可能交织（虽然单次 `write_all` 保证不出现半行，但顺序不可控）；阶段 4 解决。
-2. 仅 POSIX（`sh -c`、`killpg`）；Windows 不在阶段 1 范围。
-3. `outputs/` 无保留策略，磁盘可能无界增长。
-4. 会话不承诺跨机迁移。
-5. token 估算按固定密度（`chars_per_token`，默认 4），仍低估 CJK（D52）。
-6. `reasoning` 落盘：思考内容进入会话文件，增大存储与隐私面（D23）。
-7. 思考回传仅覆盖 `reasoning_content` 系端点（DeepSeek/Kimi/Qwen/GLM）；Anthropic/Responses/Gemini 的签名类结构化 metadata 不支持（D24）。
-8. 旧 schema 会话不兼容，需 `--clear`（D26）。
-9. **（F12）展示与渲染对 `system` 的谓词不对称**：展示只看 `source == "notify"`，渲染看「非 `init` 且（`content` 非空或 `output_files` 存在）」。将来出现新 `source`（如阶段 5 的后台结果）时必须统一谓词；阶段 1 暂不修，以免在只有两种 `source` 时引入无消费者的抽象。
-10. **逃逸进程组攥管道时输出仍可能被放弃**：后台进程若 `setsid` 脱离工具进程组并继续持有 stdout/stderr 管道，读取会在宽限后被放弃，输出以占位提示自解释；但这**不再误报**为 `timed_out`（D35）。长任务应用 `nohup <cmd> >/dev/null 2>&1 &` 主动脱离工具管道，而不是依赖读取宽限。
-11. **SIGINT 只清理 `shell` 工具进程组**：`init`/`llm` 钩子的进程组未纳入信号转发；钩子自身有硬超时兜底。
-12. **审批不是安全边界**（阶段 2）：命令资源为 best-effort 文本拆分，包装器（`xargs`/`find -exec`/`sudo`）、重定向目标、变量展开等仍可绕过；收紧应使用窄 `allow` + 精准 `deny`，不要指望审批流拦截一切（D42）。
-13. **压缩使 KV cache 部分失效**：摘要替换稳定前缀之后的早期消息，provider 从第一个被替换 token 起的复用失效（压缩的本质代价，DSH 同样如此）。
-14. **摘要会再次发送被遮蔽内容**：摘要调用把被遮蔽消息发给模型，隐私面与主调用相同，不新增泄露面，但敏感历史会被多送一次。
-15. **`outputs/` 仍无保留策略**：磁盘可能无界增长（D48 顺延）。
+1. **网络文件系统不支持 WAL**：`session.db` 必须位于本地文件系统；NFS/SMB 等挂载上的 WAL 与 `flock` 语义不可靠。
+2. **单条 `payload` 建议 ≤64 KiB**：现状由 `yaa-exec` 的流式截断保证；更大的记录会放大事务与 WAL 开销。
+3. **归档崩溃残留**：可能留下 0 字节归档占位与 `.tmp.<pid>` 临时文件；超过 1 小时的临时文件由下次归档尽力清理，占位需人工确认后删除。
+4. **`append` 每次调用约 1 ms 固定开销**：打开连接、设置 PRAGMA 与事务提交的成本，不适合逐条高频写入；批量追加可摊薄。
+5. 仅 POSIX（`sh -c`、`killpg`）；Windows 不在阶段 1 范围。
+6. `outputs/` 无保留策略，磁盘可能无界增长。
+7. 会话不承诺跨机迁移。
+8. token 估算按固定密度（`chars_per_token`，默认 4），仍低估 CJK（D52）。
+9. `reasoning` 落盘：思考内容进入会话文件，增大存储与隐私面（D23）。
+10. 思考回传仅覆盖 `reasoning_content` 系端点（DeepSeek/Kimi/Qwen/GLM）；Anthropic/Responses/Gemini 的签名类结构化 metadata 不支持（D24）。
+11. **（F12）展示与渲染对 `system` 的谓词不对称**：展示只看 `source == "notify"`，渲染看「非 `init` 且（`content` 非空或 `output_files` 存在）」。将来出现新 `source`（如阶段 5 的后台结果）时必须统一谓词；阶段 1 暂不修，以免在只有两种 `source` 时引入无消费者的抽象。
+12. **逃逸进程组攥管道时输出仍可能被放弃**：后台进程若 `setsid` 脱离工具进程组并继续持有 stdout/stderr 管道，读取会在宽限后被放弃，输出以占位提示自解释；但这**不再误报**为 `timed_out`（D35）。长任务应用 `nohup <cmd> >/dev/null 2>&1 &` 主动脱离工具管道，而不是依赖读取宽限。
+13. **SIGINT 只清理 `shell` 工具进程组**：`init`/`llm` 钩子的进程组未纳入信号转发；钩子自身有硬超时兜底。
+14. **审批不是安全边界**（阶段 2）：命令资源为 best-effort 文本拆分，包装器（`xargs`/`find -exec`/`sudo`）、重定向目标、变量展开等仍可绕过；收紧应使用窄 `allow` + 精准 `deny`，不要指望审批流拦截一切（D42）。
+15. **压缩使 KV cache 部分失效**：摘要替换稳定前缀之后的早期消息，provider 从第一个被替换 token 起的复用失效（压缩的本质代价，DSH 同样如此）。
+16. **摘要会再次发送被遮蔽内容**：摘要调用把被遮蔽消息发给模型，隐私面与主调用相同，不新增泄露面，但敏感历史会被多送一次。
+17. **`outputs/` 仍无保留策略**：磁盘可能无界增长（D48 顺延）。
 
 ## 已确认项与默认假设
 

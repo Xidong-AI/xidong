@@ -17,7 +17,7 @@
 
 - `yaa-cli`：参数解析、入口、展示渲染、stdout/stderr 策略；`yaa --notify` 的写入路径也在此短路。
 - `yaa-core`：智能体循环（Agent loop）、工具定义（`tools`）、模型调用、消息模型、渲染与展示投影、上下文分层装配（见 [`dsh-context.md`](dsh-context.md)）。
-- `yaa-store`：会话 JSONL、归档、加载。
+- `yaa-store`：会话 SQLite 事件库、归档、加载。
 - `yaa-exec`：Shell 执行机制，负责进程组、超时、流式截断、完整输出落盘；不含工具定义。
 - `yaa-msg`：消息类型。
 
@@ -27,9 +27,9 @@
 
 ## 历史消息
 
-历史消息管理框架模块以消息队列的形式存储历史消息。
+历史消息管理框架模块把历史消息作为事件序列存储：每会话一个 SQLite 库，`events` 表 append-only，每行 `payload` 保存一条完整记录的 JSON，`type`/`ts` 由 SQLite 生成列从 `payload` 派生。
 
-```jsonl
+```json
 {"type":"system","ts":...,"id":"01J...","source":"notify","command":"\"$YAA_BIN\" --get-prompt system","content":"<系统提示词>\n当前智能体环境是 YAA，一个以 Shell 为唯一工具的智能体。……\n</系统提示词>"}
 {"type":"system","ts":...,"id":"01J...","source":"notify","command":"cat \"$GLB_CFG/AGENTS.md\"","content":"<用户总提示词>\n……AGENTS.md 内容……\n</用户总提示词>"}
 {"type":"system","ts":...,"id":"01J...","source":"notify","command":"echo \"工作目录：$(pwd)\"","content":"<当前环境>\n工作目录：/home/pj568/项目/yaa\n</当前环境>"}
@@ -43,6 +43,8 @@
 {"type":"system","ts":...,"id":"01J...","source":"notify","command":"git status --short","content":"<由用户执行>\n……外部通知……\n</由用户执行>"}
 ```
 
+> 上面是各事件的 `payload` 内容，在库中按 `events.seq` 顺序存放；`seq` 单调递增，是事件在会话内的唯一位置。
+>
 > `ts` 为 Unix 毫秒；`id` 为 ULID，全记录唯一；`tool_result` 用 `call_id` 与 `tool_call` 配对。
 >
 > `system` 事件是内容进入上下文的唯一通道：`source=notify` 承载 `yaa --notify` 写入的通知，正文内联 `<注释>` 信封（呈献给模型时即此文本）；`source=init` 是空会话初始化的簿记，`content` 为空、不渲染。可选 `command` 保存产生该通知的命令，**只用于展示，不进入上下文**；stdin 形态与簿记没有此项。注入内容的渲染角色由事件在日志中的**物理位置**决定，不依赖额外字段。
@@ -61,7 +63,7 @@
 渲染视图是模型消息与用户展示的共同事实源：两者都从同一份事件日志派生，不维护第二套执行事件流。`llm` 配置加载不写事件，既不渲染、也不展示。
 
 上下文压缩参考 DSH (DeepSeek Harness) 的 `compaction-basic`：先跑无模型的头尾 pruner，仍超阈值再发一次摘要 LLM 调用。
-压缩只发生在渲染阶段，原始 JSONL 不变。
+压缩只发生在渲染阶段，原始事件库不变。
 压缩保留未完成工具调用。
 
 每一次执行 `yaa "……"` 都默认接着当前目录下已存在的会话历史消息继续，除非 `yaa --clear`。
@@ -72,14 +74,15 @@
 
 ```plaintext
 $YAA_CONFIG_HOME/config.toml                                      # 配置根
-$YAA_DATA_HOME/sessions/<sid>/default.jsonl                       # 主历史，主要由前台 yaa 维护
+$YAA_DATA_HOME/sessions/<sid>/session.db                          # 主历史事件库（WAL 副产物 -wal/-shm 同目录）
+$YAA_DATA_HOME/sessions/<sid>/{runner,clear,init}.lock            # runner 选举 / clear 互斥 / 建库串行化
 $YAA_DATA_HOME/sessions/<sid>/outputs/<ulid>.{stdout,stderr}.out  # 截断后的完整输出
-$YAA_DATA_HOME/history/<sid>/sessions-<ts>.jsonl                  # 主历史归档后存放的位置
+$YAA_DATA_HOME/history/<sid>/sessions-<ts>.db                     # 主历史归档快照（VACUUM INTO）
 ```
 
 > 状态根按 XDG 拆分：配置根 `$YAA_CONFIG_HOME`，数据根 `$YAA_DATA_HOME`（见 plan.md D10）。
 >
-> 主循环每一步重读会话文件；写入以整批单次 `O_APPEND` + `fsync` 完成，不逐条写。
+> 主循环每一步重读会话库；写入以一个 `BEGIN IMMEDIATE` 事务批量提交（WAL + `synchronous=FULL`），不逐条写。事务保证一批记录要么全部可见、要么全部不可见，因此不存在半行撕裂。
 >
 > 当前工作目录规范化后哈希得 `<sid>`。
 
@@ -108,7 +111,7 @@ $ yaa 不用了，只是确认是否能正常回复。
 
 $ yaa --clear
 # 归档历史消息（内部完成，不调用工具或钩子）
-$YAA_DATA_HOME/history/<sid>/sessions-<ts>.jsonl
+$YAA_DATA_HOME/history/<sid>/sessions-<ts>.db
 
 $ cd /home/pj568/桌面
 $ yaa 不用子智能体，帮我查未来五天的天气并写入到文件 \`/home/pj568/桌面/temp.txt\`。
@@ -194,7 +197,7 @@ $ yaa --approve
 yaa [PROMPT]...              # 多个位置参数以空格连接；空则从 stdin 读
 yaa -- "[PROMPT]"            # 同上
 yaa --status                 # 看会话摘要
-yaa --session $path_to/session.jsonl
+yaa --session $path_to/session.db
 yaa --clear                  # 归档当前目录的会话；若已有 runner 在跑，此时再运行 `yaa "内容"` 会把消息排入 inbox 并跟随输出到循环结束（阶段 4）。
 yaa --verbose                # 追加思考内容与命令输出
 yaa --quiet                  # 仅打印最终结果输出
@@ -270,7 +273,7 @@ some-cmd | yaa --notify="注释" --to "$YAA_PARENT" &
 
 ### 主循环召回
 
-`yaa --notify` 写入时也对文件拿锁（flock 或 `O_APPEND`）写一行，写完释放。
+`yaa --notify` 写入时持 `clear.lock` 共享锁，在一个短事务里追加事件，写完释放；`--clear` 持该锁的排他锁，因此归档与通知写入不会交错。
 
 | 状态         | 收到 `system` 消息的时机 |
 | ------------ | ------------------------ |
@@ -292,16 +295,16 @@ some-cmd | yaa --notify="注释" --to "$YAA_PARENT" &
 
 ```plaintext
 $YAA_DATA_HOME/sessions/<sid>/
-  default.jsonl          # 主历史，只由 runner 写
-  runner.lock            # runner 长期 flock/fcntl 锁
+  session.db             # 主历史事件库，只由 runner 写
+  runner.lock            # runner 长期 flock 锁（已实现）
   outputs/               # 截断工具的完整输出
-  inbox/
+  inbox/                 # 文件 inbox（阶段 4 未做）
     tmp/                 # 临时文件，不参与消费
     pending/             # 待消费消息，每个消息一个文件
     consumed/            # 已消费消息
 ```
 
-`runner.lock` 文件永久保留，不删除，不用“文件是否存在”判断 runner。只使用 `flock` / `fcntl` 排他锁判断。
+`runner.lock` 文件永久保留，不删除，不用“文件是否存在”判断 runner。只使用 `flock` 排他锁判断。
 
 ### 启动流程
 
@@ -316,11 +319,11 @@ fn start(prompt) {
 
     match lock.try_lock_exclusive() {
         Ok(guard) => {
-            recover_default_jsonl(session.default_jsonl);
+            recover(session);
             run_agent_loop(session, guard);
         }
         Err(WouldBlock) => {
-            follow(session.default_jsonl, start_offset, user_msg.id);
+            follow(session.db, start_seq, user_msg.id);
         }
     }
 }
@@ -360,10 +363,10 @@ fn start(prompt) {
 ```rust
 fn run_agent_loop(session, runner_guard) {
     loop {
-        // 安全点：消费 inbox，追加到 default.jsonl
+        // 安全点：消费 inbox，追加到 session.db
         consume_inbox(session);
 
-        let history = read_jsonl(session.default_jsonl);
+        let history = load(session);
 
         if is_idle(history) && pending_is_empty(session) {
             // 释放 runner.lock 后退出；若之后有注入，跟随者会接管
@@ -395,7 +398,7 @@ fn run_agent_loop(session, runner_guard) {
 - runner 执行工具时，第二个 `yaa` 把消息写入 `inbox/pending/`。
 - runner 不在工具中间插入消息。
 - 当前工具批次全部 `tool_result` 写完后，下一轮循环开头消费 inbox。
-- 新 user 消息被追加到 `default.jsonl` 的 `tool_result` 之后。
+- 新 user 消息被追加到 `session.db` 的 `tool_result` 之后。
 - 下一次模型调用自然看到它，继续输出。
 
 ### inbox 消费
@@ -408,9 +411,8 @@ fn consume_inbox(session) {
     for file in files {
         let msg = read_json(file);
 
-        if !history_contains_id(session.default_jsonl, msg.id) {
-            append_jsonl(session.default_jsonl, msg.into_history());
-            fsync(session.default_jsonl);
+        if !history_contains_id(session.db, msg.id) {
+            append(session, &[msg.into_history()]);
         }
 
         rename(file, session.inbox.consumed.join(file.name));
@@ -421,17 +423,16 @@ fn consume_inbox(session) {
 
 顺序：
 
-1. append 到 `default.jsonl`；
-2. `fsync`；
-3. rename 到 `consumed/`。
+1. 用幂等事务把消息 append 到 `session.db`（WAL + `synchronous=FULL`，提交即持久）；
+2. rename 到 `consumed/`。
 
-若在 1 和 3 之间断电，重启后会重复消费，但 `id` 去重保证不会重复插入。
+若在 1 和 2 之间断电，重启后会重复消费，但 `id` 去重保证不会重复插入。
 
 ### 跟随与接管
 
 已有 runner 时，第二个 `yaa` 进入跟随模式：
 
-- 从启动时记录的 `default.jsonl` 偏移开始 tail；
+- 从启动时记录的 `seq` 水位开始 `read_after`；
 - 增量读取并渲染新消息；
 - 周期性尝试非阻塞获取 `runner.lock`；
 - 若获取成功，说明旧 runner 已退出，自己成为新 runner，调用 `run_agent_loop` 接管；
@@ -459,30 +460,29 @@ runner 退出条件：
 
 ### 断电恢复（阶段 6）
 
-阶段 1 只做到「容忍撕裂尾行」：`load`/`append` 会把最后一个换行之后的残段解析或截断，缺失的配对由渲染器在内存中合成中断 `tool` 消息以保证请求体合法（见 plan.md 更正 11）。下面的落盘补写属阶段 6。
+SQLite 事务消除了「撕裂尾行」问题：一批记录要么全部提交、要么全部不可见，断电只可能丢掉尚未提交的批次。缺失的配对仍由渲染器在内存中合成中断 `tool` 消息兜底（见 plan.md 更正 11）；持久化补写由 `yaa-core` 的恢复逻辑完成（store 保持哑，不猜测业务语义）。
 
 断电后所有进程死亡，内核自动释放 `flock`。`runner.lock` 文件残留无害。新 `yaa` 启动后：
 
-1. 写入自己的 inbox 消息。
-2. 尝试获取 `runner.lock`，成功则成为新 runner。
-3. 执行 `recover_default_jsonl`：
-   - 截断最后一个不完整行，保留最后一个换行之前的内容；
-   - 为缺失 `tool_result` 的 `tool_call` 补一条中断结果；
-   - 为未解决的 `approval_pending` 补 `approval_resolved: deny`。
-4. 消费 `inbox/pending/`，按 `id` 去重。
-5. 进入主循环。
+1. 尝试获取 `runner.lock`，成功则成为 runner（inbox 文件协议属阶段 4，尚未实现）。
+2. 在 `init` 钩子与写入 `user` 之前执行恢复：
+   - 为每个无对应 `tool_result` 的 `tool_call` 补一条中断结果（`stderr="runner interrupted"`，`code=-1`），幂等；
+   - 普通 run 先把未决 `approval_pending` 补成 `approval_resolved: deny` 与失败结果；`--approve` 只补孤儿 `tool_call`，把最旧 pending 留给本次放行。
+3. 进入主循环。
+
+补写仍走同一 `append` 批量事务；重复运行因记录 `id` 与配对关系天然幂等。
 
 补中断结果示例：
 
 ```json
-{"type":"tool_result","id":"01J...","call_id":"call_xxx","stdout":"","stderr":"runner interrupted by power loss","code":-1,"timed_out":false,"truncated":false,"ts":...}
+{"type":"tool_result","id":"01J...","call_id":"call_xxx","stdout":"","stderr":"runner interrupted","code":-1,"timed_out":false,"truncated":false,"ts":...}
 ```
 
 ### 不变量
 
-- `default.jsonl` 是唯一历史事实源，只由 runner 写。
+- `session.db` 是唯一历史事实源，只由 runner 写。
 - 历史消息不可变，上下文只是渲染视图。
-- 压缩只发生在渲染阶段，原始 JSONL 不变。
+- 压缩只发生在渲染阶段，原始事件库不变。
 - `inbox/` 多写无锁，每消息一文件，`rename` 原子发布。
 - 消息 `id` 全局唯一，消费幂等。
 - `runner.lock` 只用于 runner 选举，不用于数据保护。
