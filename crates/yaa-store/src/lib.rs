@@ -98,19 +98,29 @@ impl Session {
         Self { db, root, sid }
     }
 
-    /// 会话 artifact 文件名前缀：默认会话 `session.db` 为空，其余为 `<安全文件名>.`。
+    /// 会话 artifact 名：默认会话 `session.db` 为空串，其余为安全化后的**完整文件名**。
     ///
-    /// 把显式 `--session` 的锁与文件 inbox 唯一化到各自会话，避免同一目录下的多个
-    /// 显式会话共享 `runner.lock` / `inbox/`。前缀由**完整数据库文件名**派生（而非
-    /// `file_stem`），因此 `a.db` 与 `a.sqlite` 不会碰撞；非 [`A-Za-z0-9._-`] 字符
-    /// 替换为 `_`，超长名追加短 hash。前缀不额外存字段，因此 [`Session`] 的公开结构
-    /// 与相等性保持不变。
-    fn artifact_prefix(&self) -> String {
+    /// 把显式 `--session` 的派生物（锁、`inbox/`、`spool/`、`outputs/`、`summaries/`
+    /// 与归档 `history/`）唯一化到各自会话，避免同一目录下的多个显式会话互相混放。
+    /// 名字由**完整数据库文件名**派生（而非 `file_stem`），因此 `a.db` 与 `a.sqlite`
+    /// 不会碰撞；非 [`A-Za-z0-9._-`] 字符替换为 `_`，超长名追加短 hash。不额外存字段，
+    /// 因此 [`Session`] 的公开结构与相等性保持不变；默认会话返回空串时下游路径不变。
+    pub fn artifact_name(&self) -> String {
         match self.db.file_name() {
             Some(name) if name != std::ffi::OsStr::new("session.db") => {
-                format!("{}.", sanitize_artifact_name(name))
+                sanitize_artifact_name(name)
             }
             _ => String::new(),
+        }
+    }
+
+    /// 会话 artifact 文件名前缀：默认会话为空串，其余为 `<artifact_name>.`。
+    fn artifact_prefix(&self) -> String {
+        let name = self.artifact_name();
+        if name.is_empty() {
+            String::new()
+        } else {
+            format!("{name}.")
         }
     }
 
@@ -392,16 +402,19 @@ fn append_once(session: &Session, records: &[Record], idempotent: bool) -> Resul
     Ok(())
 }
 
-/// 归档会话：快照写入 `history_root/<sid>/sessions-<ts>.db`，然后清空主库事件并递增 generation。
+/// 归档会话：快照写入 `history_root/<sid>/[…/<artifact_name>/]sessions-<ts>.db`，
+/// 然后清空主库事件并递增 generation。
 ///
-/// 调用方应已持有 runner.lock EX 与 clear.lock EX。任何一步失败都不会清空主库。
+/// 默认会话落在 `<history_root>/<sid>/`；显式会话再嵌一层 [`Session::artifact_name`]，
+/// 使同一目录下多个显式会话的 history 互不混放。调用方应已持有 runner.lock EX 与
+/// clear.lock EX。任何一步失败都不会清空主库。
 pub fn archive(session: &Session, history_root: &Path, ts: i64) -> Result<PathBuf> {
     check_sqlite_version()?;
     let mut conn = open_existing_required(session, DEFAULT_BUSY_TIMEOUT_MS)?;
     validate_yaa(&conn, &session.db)?;
     let count = count_events(&conn)?;
 
-    let target_dir = history_root.join(&session.sid);
+    let target_dir = archive_dir(session, history_root);
     fs::create_dir_all(&target_dir)?;
     cleanup_stale_archive_temps(&target_dir, STALE_ARCHIVE_TEMP_AGE);
     let final_path = unique_archive_path(&target_dir, ts)?;
@@ -958,6 +971,17 @@ fn is_missing_or_empty(path: &Path) -> Result<bool> {
         Ok(meta) => Ok(meta.len() == 0),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(err) => Err(err.into()),
+    }
+}
+
+/// 归档目录：默认 `<history_root>/<sid>/`；显式会话再嵌一层 artifact 名。
+fn archive_dir(session: &Session, history_root: &Path) -> PathBuf {
+    let base = history_root.join(&session.sid);
+    let name = session.artifact_name();
+    if name.is_empty() {
+        base
+    } else {
+        base.join(name)
     }
 }
 
@@ -1985,6 +2009,7 @@ mod tests {
         assert_ne!(spaced.clear_lock_path(), underscored.clear_lock_path());
         assert_ne!(spaced.init_lock_path(), underscored.init_lock_path());
         assert_ne!(spaced.inbox_dir(), underscored.inbox_dir());
+        assert_ne!(spaced.artifact_name(), underscored.artifact_name());
         // 发生替换的名字必须带短 hash，不能与「本来就是下划线」的名字相同。
         assert!(
             spaced
@@ -1994,6 +2019,79 @@ mod tests {
             "替换后的 artifact 名应追加短 hash：{:?}",
             spaced.runner_lock_path()
         );
+    }
+
+    #[test]
+    fn default_session_artifact_name_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session_in(dir.path());
+
+        assert_eq!(session.artifact_name(), "");
+        assert_eq!(session.runner_lock_path(), dir.path().join("runner.lock"));
+    }
+
+    #[test]
+    fn explicit_session_artifact_name_uses_full_filename() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 由完整文件名（含扩展名）派生，`a.db` 与 `a.sqlite` 不碰撞。
+        assert_eq!(
+            Session::new(dir.path().join("a.db")).artifact_name(),
+            "a.db"
+        );
+        assert_eq!(
+            Session::new(dir.path().join("a.sqlite")).artifact_name(),
+            "a.sqlite"
+        );
+        assert!(
+            Session::new(dir.path().join("a b.db"))
+                .artifact_name()
+                .starts_with("a_b.db"),
+            "非安全字符应替换为下划线"
+        );
+    }
+
+    #[test]
+    fn explicit_sessions_archive_to_distinct_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Session::new(dir.path().join("a.db"));
+        let b = Session::new(dir.path().join("b.db"));
+        let history = dir.path().join("history");
+        append(&a, &[user_marker("A")]).unwrap();
+        append(&b, &[user_marker("B")]).unwrap();
+
+        let a_target = archive(&a, &history, 1234).unwrap();
+        let b_target = archive(&b, &history, 1234).unwrap();
+
+        // sid 相同（同父目录名），但 artifact 名区分，故互不混放。
+        assert_eq!(a.sid, b.sid);
+        assert_eq!(
+            a_target,
+            history.join(&a.sid).join("a.db").join("sessions-1234.db")
+        );
+        assert_eq!(
+            b_target,
+            history.join(&b.sid).join("b.db").join("sessions-1234.db")
+        );
+        assert_ne!(a_target, b_target);
+        assert_eq!(
+            load(&Session::new(a_target)).unwrap(),
+            vec![user_marker("A")]
+        );
+        assert_eq!(
+            load(&Session::new(b_target)).unwrap(),
+            vec![user_marker("B")]
+        );
+    }
+
+    /// 内容固定但 id 随机的 user 记录，仅用于按内容比较归档快照。
+    fn user_marker(content: &str) -> Record {
+        let mut record = user(content);
+        if let Record::User(user) = &mut record {
+            user.id = format!("fixed-{content}");
+            user.ts = 1;
+        }
+        record
     }
 
     #[test]

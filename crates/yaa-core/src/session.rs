@@ -138,21 +138,19 @@ pub fn resolve_target(
         });
     }
     if let Some(path) = env_session.filter(|value| !value.is_empty()) {
-        let session = session_from_path(Path::new(path))?;
-        let sid = sid_of(&session);
-        return Ok(Resolved {
-            session,
-            sid,
-            cwd_absolute: cwd.to_path_buf(),
-            warned: false,
-        });
+        // 与 notify 路径统一：相对 `YAA_SESSION` 按当前 cwd 绝对化，避免后续
+        // 子进程 cwd 变化时指向漂移。
+        return resolved_from_env_path(path, cwd);
     }
     resolve(cwd, None, data_root)
 }
 
 /// 把显式路径（`--session`）解析为 [`Resolved`]；`cwd_absolute` 按规范化工作目录计算。
+///
+/// 相对路径按传入的 `cwd` 解析为绝对（而非进程当前目录），保证 `--cwd` 与测试注入的
+/// 工作目录一致。
 fn resolved_from_session_path(path: &Path, cwd: &Path) -> anyhow::Result<Resolved> {
-    let session = session_from_path(path)?;
+    let session = session_from_path(&absolutize_from_cwd(path, cwd))?;
     let (cwd_absolute, warned) = absolute_cwd(cwd);
     Ok(Resolved {
         sid: sid_of(&session),
@@ -162,15 +160,33 @@ fn resolved_from_session_path(path: &Path, cwd: &Path) -> anyhow::Result<Resolve
     })
 }
 
-/// 把环境变量中的会话路径解析为 [`Resolved`]；环境变量不属于 cwd 规范化回退。
+/// 把环境变量中的会话路径解析为 [`Resolved`]；相对值按 `cwd` 解析为绝对。
+///
+/// 环境变量不属于 cwd 规范化回退，故 `warned = false`、`cwd_absolute` 取当前工作目录。
 fn resolved_from_env_path(path: &str, cwd: &Path) -> anyhow::Result<Resolved> {
-    let session = session_from_path(Path::new(path))?;
+    let session = session_from_path(&absolutize_from_cwd(Path::new(path), cwd))?;
     Ok(Resolved {
         sid: sid_of(&session),
         session,
         cwd_absolute: cwd.to_path_buf(),
         warned: false,
     })
+}
+
+/// 以 `cwd` 为基准把路径绝对化：绝对路径原样返回；相对路径拼到 `cwd` 后做词法归一化。
+///
+/// 入口绝对化（阶段 6 M5）：`YAA_NOTIFY`/`YAA_PARENT` 等环境变量或相对 `--to` 的
+/// 非空值不再依赖进程当前目录，避免 `--cwd` 与测试注入的工作目录产生歧义。
+fn absolutize_from_cwd(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let base = if cwd.is_absolute() {
+        cwd.to_path_buf()
+    } else {
+        std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+    };
+    lexical_normalize(&base.join(path))
 }
 
 /// `--notify` 的目标解析结果。
@@ -220,8 +236,11 @@ pub fn resolve_notify_target(
         if to.as_os_str().is_empty() {
             return Err(NotifyTargetError::Usage("`--to` 不能为空串。".into()));
         }
+        // 相对 `--to`（常见于 `--to "$YAA_PARENT"` 展开失败或手输）按 cwd 解析为绝对，
+        // 与 `YAA_NOTIFY`/`YAA_PARENT` 的入口绝对化一致，绝不静默拒绝。
+        let to = absolutize_from_cwd(to, cwd);
         if let Some(session) = session {
-            let to_db = lexical_db_path(to)?;
+            let to_db = lexical_db_path(&to)?;
             let session_db = lexical_db_path(session)?;
             if !same_session_path(&to_db, &session_db) {
                 return Err(NotifyTargetError::Usage(format!(
@@ -231,7 +250,7 @@ pub fn resolve_notify_target(
                 )));
             }
         }
-        let session = explicit_target_session(to)?;
+        let session = explicit_target_session(&to)?;
         let (cwd_absolute, warned) = absolute_cwd(cwd);
         let resolved = Resolved {
             sid: sid_of(&session),
@@ -249,16 +268,23 @@ pub fn resolve_notify_target(
 
     let self_env = env("YAA_SESSION").filter(|value| !value.is_empty());
     let notify_env = env("YAA_NOTIFY").filter(|value| !value.is_empty());
+    // 相对环境值按 cwd 解析后再比较，避免「相对/绝对指向同一会话」被误判为跨会话。
+    let self_env_path = self_env
+        .as_deref()
+        .map(|path| absolutize_from_cwd(Path::new(path), cwd));
+    let notify_is_self = match (notify_env.as_deref(), self_env_path.as_deref()) {
+        (Some(notify), Some(self_path)) => {
+            same_session_path(&absolutize_from_cwd(Path::new(notify), cwd), self_path)
+        }
+        _ => false,
+    };
 
     let (resolved, source) = if let Some(path) = session {
         (
             resolved_from_session_path(path, cwd)?,
             TargetSource::Session,
         )
-    } else if let Some(path) = notify_env
-        .as_deref()
-        .filter(|value| Some(*value) != self_env.as_deref())
-    {
+    } else if let Some(path) = notify_env.as_deref().filter(|_| !notify_is_self) {
         (resolved_from_env_path(path, cwd)?, TargetSource::NotifyEnv)
     } else if let Some(path) = self_env.as_deref() {
         (resolved_from_env_path(path, cwd)?, TargetSource::SessionEnv)
@@ -270,8 +296,8 @@ pub fn resolve_notify_target(
         // 显式 `--to` 已在上面返回；`YAA_NOTIFY` 只会在指向别的会话时胜出。
         TargetSource::NotifyEnv => false,
         TargetSource::Session | TargetSource::SessionEnv | TargetSource::Default => {
-            match self_env {
-                Some(self_path) => same_session_path(Path::new(&self_path), &resolved.session.db),
+            match self_env_path.as_deref() {
+                Some(self_path) => same_session_path(self_path, &resolved.session.db),
                 // 没有继承 `YAA_SESSION` 时，本次解析出的目标就是自身会话。
                 None => true,
             }
@@ -407,9 +433,16 @@ fn sid_of(session: &yaa_store::Session) -> String {
     session.sid.clone()
 }
 
-/// 会话输出目录：`<会话根>/outputs`。
+/// 会话输出目录：默认会话 `<会话根>/outputs`；显式会话再嵌一层 artifact 名
+/// （`<会话根>/outputs/<artifact_name>`），使同一目录下多个显式会话的落盘输出互不混放。
 pub fn outputs_dir(session: &yaa_store::Session) -> PathBuf {
-    session.root.join("outputs")
+    let base = session.root.join("outputs");
+    let name = session.artifact_name();
+    if name.is_empty() {
+        base
+    } else {
+        base.join(name)
+    }
 }
 
 /// 构造本进程对子进程注入的 yaa 环境变量（阶段 5 环境链，见 spec 第 1 节）。
@@ -668,6 +701,12 @@ mod tests {
         assert!(!resolved.warned);
         assert_eq!(resolved.cwd_absolute, cwd);
 
+        // 相对 `YAA_SESSION` 与 notify 路径一致：按传入 cwd 绝对化。
+        let resolved = resolve_target(&cwd, None, Some("env/from-env.db"), &data).unwrap();
+        assert_eq!(resolved.session.db, cwd.join("env").join("from-env.db"));
+        assert!(!resolved.warned);
+        assert_eq!(resolved.cwd_absolute, cwd);
+
         // 空串环境变量视为未设置，回退 cwd 默认会话。
         let resolved = resolve_target(&cwd, None, Some(""), &data).unwrap();
         assert_eq!(
@@ -705,6 +744,91 @@ mod tests {
     }
 
     const SELF: &str = "/data/self/session.db";
+
+    #[test]
+    fn explicit_session_outputs_dir_nests_artifact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let data = dir.path().join("data");
+        let root = dir.path().join("custom");
+        let a = resolve(&cwd, Some(&root.join("a.db")), &data).unwrap();
+        let b = resolve(&cwd, Some(&root.join("b.db")), &data).unwrap();
+
+        assert_eq!(outputs_dir(&a.session), root.join("outputs").join("a.db"));
+        assert_eq!(outputs_dir(&b.session), root.join("outputs").join("b.db"));
+        assert_ne!(outputs_dir(&a.session), outputs_dir(&b.session));
+
+        // 默认会话路径保持不变。
+        let default = resolve(&cwd, None, &data).unwrap();
+        assert_eq!(
+            outputs_dir(&default.session),
+            default.session.root.join("outputs")
+        );
+    }
+
+    #[test]
+    fn relative_notify_env_resolves_against_supplied_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = cwd.join("nested").join("notify.db");
+        make_session(&target);
+
+        // `YAA_NOTIFY` 是相对值：必须按传入的 cwd（而非进程当前目录）解析。
+        let env = |key: &str| (key == "YAA_NOTIFY").then(|| "nested/notify.db".to_string());
+        let resolved = resolve_notify_target(&cwd, None, None, &data, &env).unwrap();
+        assert_eq!(resolved.resolved.session.db, target);
+        assert!(!resolved.is_self);
+    }
+
+    #[test]
+    fn absolute_notify_env_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = dir.path().join("absolute.db");
+        make_session(&target);
+
+        let value = target.to_string_lossy().into_owned();
+        let env = |key: &str| (key == "YAA_NOTIFY").then(|| value.clone());
+        let resolved = resolve_notify_target(&cwd, None, None, &data, &env).unwrap();
+        assert_eq!(resolved.resolved.session.db, target);
+    }
+
+    #[test]
+    fn relative_notify_equal_to_relative_session_falls_back_to_self() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = cwd.join("self.db");
+        make_session(&target);
+
+        let env =
+            |key: &str| matches!(key, "YAA_NOTIFY" | "YAA_SESSION").then(|| "self.db".to_string());
+        let resolved = resolve_notify_target(&cwd, None, None, &data, &env).unwrap();
+        assert_eq!(resolved.resolved.session.db, target);
+        assert!(resolved.is_self, "NOTIFY 与 SESSION 指向同一相对会话");
+    }
+
+    #[test]
+    fn relative_to_resolves_against_supplied_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let target = cwd.join("target.db");
+        make_session(&target);
+
+        let resolved =
+            resolve_notify_target(&cwd, Some(Path::new("target.db")), None, &data, &no_env)
+                .unwrap();
+        assert_eq!(resolved.resolved.session.db, target);
+        assert!(resolved.explicit);
+    }
 
     #[test]
     fn yaa_env_without_inheritance_defaults_to_self() {

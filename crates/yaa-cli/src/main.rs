@@ -760,9 +760,7 @@ async fn run_agent(
         };
         spawn_interrupt_handler();
         // 运行前的水位：`--approve` 无 own，保持水位语义，只打印本次新产生的最末 `ai`。
-        let watermark = yaa_store::load(&resolved.session)
-            .map_err(anyhow::Error::from)?
-            .len();
+        let watermark = yaa_store::last_seq(&resolved.session).map_err(anyhow::Error::from)?;
         let client = client.clone();
         let exit = runner
             .approve_pending(move |cfg| yaa_core::agent::OpenAiModel { cfg, client })
@@ -880,17 +878,16 @@ fn print_outcome(
     Ok(())
 }
 
-/// 打印 `records[watermark..]` 中**最后一条** `ai` 记录的内容；为空则不打印。
+/// 打印 `seq > watermark` 的记录中**最后一条** `ai` 的内容；为空则不打印。
 ///
 /// 只看最后一条 `ai`（而非最后一条非空 `ai`），否则末步为空回复时会把本轮中间
-/// 步骤的正文当成本次结果打到 stdout（A5）。
-fn print_final_ai(session: &yaa_store::Session, watermark: usize) -> anyhow::Result<()> {
-    let records = yaa_store::load(session)?;
-    let start = watermark.min(records.len());
-    if let Some(Record::Ai(ai)) = records[start..]
+/// 步骤的正文当成本次结果打到 stdout（A5）。水位是记录的 `seq`，不是记录下标。
+fn print_final_ai(session: &yaa_store::Session, watermark: i64) -> anyhow::Result<()> {
+    let (rows, _) = yaa_store::read_after(session, watermark)?;
+    if let Some((_, Record::Ai(ai))) = rows
         .iter()
         .rev()
-        .find(|record| matches!(record, Record::Ai(_)))
+        .find(|(_, record)| matches!(record, Record::Ai(_)))
         && !ai.content.is_empty()
     {
         println!("{}", ai.content);

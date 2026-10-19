@@ -239,12 +239,13 @@ impl Runner<'_> {
         // 1. 写入前的水位：之后只展示水位之后的新记录。是否初始化改由「簿记」判定：
         //    只要历史里没有 `system(source=init)` 记录（含 `--notify` 先行发布与消费的
         //    场景），就执行一次 `init`；因此上轮 init 失败的会话下次运行会自动重试。
-        let existing = yaa_store::load(&self.session)?;
+        let existing = History::load(&self.session)?;
         // 归档库不可写入：必须在 init/作废/恢复/写 user 及执行任何命令之前拒绝。
         if self.reject_archived()? {
             return Ok(ExitCode::Error);
         }
-        let mut watermark = existing.len();
+        // 展示水位是记录的 `seq`，不是记录下标：`seq` 在归档重置后重新从 1 起算。
+        let mut watermark = existing.last_seq();
 
         // 2. 新提示词视为放弃旧待批（D45），再补崩溃孤儿；顺序同阶段 1，使未决 pending
         //    保留「已作废」文案而非被误判为运行中断。纯 follower 的 notify 接管（Keep）
@@ -260,6 +261,7 @@ impl Runner<'_> {
         self.replay_spool(&mut watermark).await?;
 
         let initialized = existing
+            .records()
             .iter()
             .any(|record| matches!(record, Record::System(system) if system.source == "init"));
 
@@ -297,7 +299,7 @@ impl Runner<'_> {
     }
 
     /// 消费一条 `own` 记录：幂等追加后删除对应 inbox 文件。
-    async fn consume_own(&self, own: &Record, watermark: &mut usize) -> anyhow::Result<()> {
+    async fn consume_own(&self, own: &Record, watermark: &mut i64) -> anyhow::Result<()> {
         self.append_idempotent_and_emit(std::slice::from_ref(own), watermark)
             .await?;
         for message in yaa_store::scan_inbox(&self.session, InboxPhase::Pending)? {
@@ -339,7 +341,7 @@ impl Runner<'_> {
     async fn consume_messages(
         &self,
         messages: Vec<yaa_store::InboxMessage>,
-        watermark: &mut usize,
+        watermark: &mut i64,
     ) -> anyhow::Result<bool> {
         if messages.is_empty() {
             return Ok(false);
@@ -364,7 +366,7 @@ impl Runner<'_> {
     /// 与 `init/` 消息仍按既有顺序消费。只由 leader/接管调用；follower 不补投，只在
     /// 检测到滞留时提示。追加成功但删除失败时文件会留在下一轮，由
     /// `append_idempotent` 按 id 去重；删除失败只提示，不阻断本轮运行（F12）。
-    async fn replay_spool(&self, watermark: &mut usize) -> anyhow::Result<()> {
+    async fn replay_spool(&self, watermark: &mut i64) -> anyhow::Result<()> {
         let spool = yaa_store::scan_spool(&self.session)?;
         if spool.is_empty() {
             return Ok(());
@@ -414,11 +416,11 @@ impl Runner<'_> {
         let mut generation = baseline_gen;
         let mut next_seq = start_seq;
         // B5：只把发布水位之前的历史交给投影器回填命令表；`load()` 一次，不重放。
-        let prefix = yaa_store::load(&self.session)?;
-        let prefix_len = usize::try_from(start_seq)
-            .unwrap_or(usize::MAX)
-            .min(prefix.len());
-        let mut projector = DisplayProjector::from_records(&prefix[..prefix_len]);
+        // 用 `seq` 过滤（而非「下标 == seq」的近似）：归档重置后水位可能超前，
+        // `start_after` 会按新 generation 从 0 起，避免把未展示的记录当成前缀。
+        let prefix = History::load(&self.session)?;
+        let prefix_len = prefix.start_after(start_seq);
+        let mut projector = DisplayProjector::from_records(&prefix.records()[..prefix_len]);
         let mut backoff = Duration::from_millis(20);
         let mut pending_notice_sent = false;
         let mut spool_notice_sent = false;
@@ -582,16 +584,17 @@ impl Runner<'_> {
 
         // 1. 先取最旧未决 pending；没有则提示并成功返回。此路径**不解析 llm 钩子**，
         //    否则钩子损坏时用户连「没有待批准」都看不到。
-        let records = yaa_store::load(&self.session)?;
+        let history = History::load(&self.session)?;
+        let records = history.records();
         // 归档库不可写入：必须在恢复补写、执行 pending 命令之前拒绝。
         if self.reject_archived()? {
             return Ok(ExitCode::Error);
         }
         // 1b. `--approve` 也做崩溃恢复，但只补真正的孤儿 `tool_call`；未决 pending
         //     不在此作废（本次就要放行最旧一条）。
-        let mut watermark = records.len();
+        let mut watermark = history.last_seq();
         self.recover_orphan_tool_calls(&mut watermark).await?;
-        let unresolved = unresolved_pending(&records);
+        let unresolved = unresolved_pending(records);
         let Some((pending_index, pending)) = unresolved.into_iter().next() else {
             self.sink
                 .emit(DisplayItem::Notice("没有待批准的命令。".to_string()));
@@ -659,7 +662,7 @@ impl Runner<'_> {
     async fn run_loop<M: Model>(
         &self,
         model: &M,
-        mut watermark: usize,
+        mut watermark: i64,
         consume: bool,
     ) -> anyhow::Result<ExitCode> {
         let schema_hash = tools::shell::schema_hash();
@@ -684,13 +687,13 @@ impl Runner<'_> {
                 break;
             }
 
-            let records = yaa_store::load(&self.session)?;
+            let history = History::load(&self.session)?;
             let plan = self
-                .plan_messages(&records, model, &mut compaction_state)
+                .plan_messages(history.records(), model, &mut compaction_state)
                 .await;
 
             // 先展示自上次以来新增的记录（注入、用户、工具批次），再推进水位。
-            self.emit_new(&records, &mut watermark);
+            self.emit_new(&history, &mut watermark);
             // 压缩是渲染期变换：警告与摘要条目在记录增量之外单独展示（D56）。
             if let Some(warning) = &plan.warning {
                 self.sink.emit(DisplayItem::Notice(warning.clone()));
@@ -717,7 +720,8 @@ impl Runner<'_> {
 
             // 清洗模型返回的 call_id：空串、批次内重复、或与历史冲突者一律重生成，
             // 否则 OpenAI 会因重复/空 `tool_call_id` 拒绝请求。
-            let tool_calls = tools::shell::sanitize_tool_calls(&records, &response.tool_calls);
+            let tool_calls =
+                tools::shell::sanitize_tool_calls(history.records(), &response.tool_calls);
             let parsed_calls: Vec<_> = tool_calls
                 .iter()
                 .map(|call| tools::shell::parse(&call.arguments))
@@ -741,10 +745,10 @@ impl Runner<'_> {
                 ));
             }
             yaa_store::append(&self.session, &batch)?;
-            // append 后重新 load 再按水位增量展示：不能简单 `watermark += batch.len()`，
+            // append 后重新 load 再按水位增量展示：不能简单推进到本批末尾，
             // 否则会跳过模型请求期间外部 `yaa --notify` 追加在水位与批次之间的记录，
             // 使其永久不被展示。重新 load 覆盖「批次之前有外部写入」的边界。
-            let after = yaa_store::load(&self.session)?;
+            let after = History::load(&self.session)?;
             self.emit_new(&after, &mut watermark);
 
             if tool_calls.is_empty() {
@@ -806,7 +810,7 @@ impl Runner<'_> {
             };
         };
         let estimator = compaction::Estimator::new(cfg.chars_per_token);
-        let cache = SummaryCache::new(&self.session.root);
+        let cache = SummaryCache::new(&self.session.root, &self.session.artifact_name());
         let previous = match state.clone() {
             Some(entry) => Some(entry),
             None => cache.load_latest().unwrap_or(None),
@@ -842,7 +846,7 @@ impl Runner<'_> {
         parsed: &tools::shell::ParsedCall,
         limits: &yaa_exec::ShellLimits,
         outputs_dir: &Path,
-        watermark: &mut usize,
+        watermark: &mut i64,
     ) -> anyhow::Result<bool> {
         // R1：参数非法、工具名不符或命令为空者根本不可执行，绝不进入审批分支
         // （否则 `--approve` 会把非法 pending 当合法命令执行，语义与 `--auto` 相反）。
@@ -954,13 +958,9 @@ impl Runner<'_> {
     }
 
     /// 追加一批记录并展示增量，保证每条恰好展示一次。
-    async fn append_and_emit(
-        &self,
-        records: &[Record],
-        watermark: &mut usize,
-    ) -> anyhow::Result<()> {
+    async fn append_and_emit(&self, records: &[Record], watermark: &mut i64) -> anyhow::Result<()> {
         yaa_store::append(&self.session, records)?;
-        let after = yaa_store::load(&self.session)?;
+        let after = History::load(&self.session)?;
         self.emit_new(&after, watermark);
         Ok(())
     }
@@ -969,10 +969,10 @@ impl Runner<'_> {
     async fn append_idempotent_and_emit(
         &self,
         records: &[Record],
-        watermark: &mut usize,
+        watermark: &mut i64,
     ) -> anyhow::Result<()> {
         yaa_store::append_idempotent(&self.session, records)?;
-        let after = yaa_store::load(&self.session)?;
+        let after = History::load(&self.session)?;
         self.emit_new(&after, watermark);
         Ok(())
     }
@@ -982,9 +982,10 @@ impl Runner<'_> {
     /// 若该 `call_id` 已有 `tool_result`（执行后、写 `resolved` 前被强杀的中断态），
     /// 则只补 `approval_resolved: deny`，不再追加失败结果——否则日志出现两条结果，
     /// 且渲染取首条成功结果会与「已拒绝」语义矛盾（与 `--approve` 的判定对称）。
-    async fn abandon_old_pending(&self, watermark: &mut usize) -> anyhow::Result<()> {
-        let records = yaa_store::load(&self.session)?;
-        for (_, pending) in unresolved_pending(&records) {
+    async fn abandon_old_pending(&self, watermark: &mut i64) -> anyhow::Result<()> {
+        let history = History::load(&self.session)?;
+        let records = history.records();
+        for (_, pending) in unresolved_pending(records) {
             let already_executed = records.iter().any(
                 |record| matches!(record, Record::ToolResult(result) if result.call_id == pending.call_id),
             );
@@ -1027,9 +1028,9 @@ impl Runner<'_> {
     /// 未决 `approval_pending` 不在此处理：普通 run 已由 [`Runner::abandon_old_pending`]
     /// 先作废，`--approve` 则要把最旧一条留给本次放行。已有结果或未决 pending 的
     /// `call_id` 一律跳过，因此重复运行是幂等的。
-    async fn recover_orphan_tool_calls(&self, watermark: &mut usize) -> anyhow::Result<()> {
-        let records = yaa_store::load(&self.session)?;
-        let orphan_calls = orphan_tool_calls(&records);
+    async fn recover_orphan_tool_calls(&self, watermark: &mut i64) -> anyhow::Result<()> {
+        let history = History::load(&self.session)?;
+        let orphan_calls = orphan_tool_calls(history.records());
         if orphan_calls.is_empty() {
             return Ok(());
         }
@@ -1133,14 +1134,15 @@ impl Runner<'_> {
         }
     }
 
-    /// 展示历史中水位之后的记录，并推进水位到当前长度。
+    /// 展示历史中 `seq > watermark` 的记录，并把水位推进到最后一条记录的 `seq`。
     ///
-    /// 传入的是**全量** `records` 与展示起点；`display::items_from` 需要全量记录才能
-    /// 从更早批次的 `tool_call` 为审批决策块回填命令。
-    fn emit_new(&self, records: &[Record], watermark: &mut usize) {
-        let start = (*watermark).min(records.len());
-        self.emit_items(records, start);
-        *watermark = records.len();
+    /// `history` 携带全量记录与平行 `seq` 列表：`display::items_from` 需要全量记录才能
+    /// 从更早批次的 `tool_call` 为审批决策块回填命令，而展示起点由 `seq` 定界，不再依赖
+    /// 「记录下标 == seq」的假设。没有新记录时水位不变。
+    fn emit_new(&self, history: &History, watermark: &mut i64) {
+        let start = history.start_after(*watermark);
+        self.emit_items(history.records(), start);
+        *watermark = history.last_seq();
     }
 
     /// 从 `start` 起投影记录为展示条目并逐条上报；`records` 须为全量记录。
@@ -1216,13 +1218,52 @@ fn jitter(base: Duration) -> Duration {
     base.mul_f64(factor)
 }
 
+/// 一次全量读取的会话历史：记录与其 `seq` 平行存放。
+///
+/// 读取仍是全量的（渲染与命令表需要完整历史），但展示水位以 `seq` 定界，不再假设
+/// 「记录下标 == seq」——归档重置后 `seq` 会重新从 1 开始。
+struct History {
+    records: Vec<Record>,
+    seqs: Vec<i64>,
+}
+
+impl History {
+    /// 全量读取当前 generation 的记录及 `seq`（与 [`yaa_store::load`] 同语义）。
+    fn load(session: &yaa_store::Session) -> anyhow::Result<Self> {
+        let (rows, _) = yaa_store::read_after(session, 0)?;
+        let (seqs, records) = rows.into_iter().unzip();
+        Ok(Self { records, seqs })
+    }
+
+    /// 全量记录，供渲染与命令表使用。
+    fn records(&self) -> &[Record] {
+        &self.records
+    }
+
+    /// 当前最大 `seq`；空会话为 0。
+    fn last_seq(&self) -> i64 {
+        self.seqs.last().copied().unwrap_or(0)
+    }
+
+    /// 第一条 `seq > watermark` 的下标；`watermark` 超前于当前最大 `seq` 时从 0 起。
+    ///
+    /// 同一 generation 内 `seq` 单调递增，故水位只可能因归档重置而超前；此时新
+    /// generation 的记录都未被展示过，必须从 0 起，避免把新内容误判为已展示。
+    fn start_after(&self, watermark: i64) -> usize {
+        if watermark > self.last_seq() {
+            return 0;
+        }
+        self.seqs.partition_point(|seq| *seq <= watermark)
+    }
+}
+
 /// 一条未决待批：有 `approval_pending` 而无同 `call_id` 的 `approval_resolved`。
 struct Pending {
     call_id: String,
     command: String,
 }
 
-/// 按记录顺序枚举未决 pending，附带其在记录中的下标（供 `--approve` 定位水位）。
+/// 按记录顺序枚举未决 pending，附带其在记录中的下标（供 `--approve` 定位展示切片）。
 fn unresolved_pending(records: &[Record]) -> Vec<(usize, Pending)> {
     let resolved: HashSet<&str> = records
         .iter()
@@ -1252,7 +1293,7 @@ fn unresolved_pending(records: &[Record]) -> Vec<(usize, Pending)> {
 /// 无对应 `tool_result` 且不属于未决待批的 `origin=ai` 工具调用 `call_id`。
 ///
 /// 保持记录顺序，供崩溃恢复按原批次补写中断结果。
-fn orphan_tool_calls(records: &[Record]) -> Vec<String> {
+pub(crate) fn orphan_tool_calls(records: &[Record]) -> Vec<String> {
     let results: HashSet<&str> = records
         .iter()
         .filter_map(|record| match record {
@@ -1276,6 +1317,16 @@ fn orphan_tool_calls(records: &[Record]) -> Vec<String> {
             }
             _ => None,
         })
+        .collect()
+}
+
+/// 未决 `approval_pending` 的 `call_id`（有 pending 而无同 id resolved），保持记录顺序。
+///
+/// 供 [`crate::test_support::check_converged`] 复用，避免检查器重写一份配对逻辑。
+pub(crate) fn unresolved_pending_call_ids(records: &[Record]) -> Vec<String> {
+    unresolved_pending(records)
+        .into_iter()
+        .map(|(_, pending)| pending.call_id)
         .collect()
 }
 
@@ -1518,6 +1569,53 @@ mod tests {
         assert_eq!(ExitCode::Model.code(), 4);
         assert_eq!(ExitCode::MaxSteps.code(), 5);
         assert_eq!(ExitCode::Pending.code(), 6);
+    }
+
+    /// 刀 2：展示水位按 `seq` 定界；归档重置 `seq` 后旧水位不得误展示旧内容或重复。
+    #[test]
+    fn emit_watermark_uses_seq_across_archive_reset() {
+        let harness = Harness::new(test_config("true"));
+        let sink = RecordingSink::default();
+        let runner = harness.runner(&sink);
+
+        let old: Vec<Record> = ["旧一", "旧二", "旧三"]
+            .into_iter()
+            .map(|content| Record::ai("fake-model", "hash", content, None))
+            .collect();
+        yaa_store::append(&harness.session, &old).unwrap();
+
+        let mut watermark = History::load(&harness.session).unwrap().last_seq();
+        assert_eq!(watermark, 3, "水位应为最后一条记录的 seq");
+
+        // 模拟 `--clear`：快照后主库 seq 重置，新 generation 从 1 重新起算。
+        yaa_store::archive(&harness.session, &harness.data_root.join("history"), 1).unwrap();
+        assert_eq!(yaa_store::last_seq(&harness.session).unwrap(), 0);
+        let fresh: Vec<Record> = ["新一", "新二"]
+            .into_iter()
+            .map(|content| Record::ai("fake-model", "hash", content, None))
+            .collect();
+        yaa_store::append(&harness.session, &fresh).unwrap();
+
+        let history = History::load(&harness.session).unwrap();
+        assert_eq!(history.last_seq(), 2);
+        runner.emit_new(&history, &mut watermark);
+        assert_eq!(watermark, 2, "水位应推进到新 generation 的末条 seq");
+        assert_eq!(text_contents(&sink.items()), vec!["新一", "新二"]);
+
+        // 同一快照再展示一次：无新记录，不得重复。
+        runner.emit_new(&history, &mut watermark);
+        assert_eq!(text_contents(&sink.items()), vec!["新一", "新二"]);
+    }
+
+    /// 从展示条目中提取 `ai` 正文，按产出顺序。
+    fn text_contents(items: &[DisplayItem]) -> Vec<String> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                DisplayItem::Text { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]

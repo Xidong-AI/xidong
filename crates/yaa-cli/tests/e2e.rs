@@ -776,6 +776,265 @@ async fn clear_archives_database_and_keeps_outputs_resolvable() {
     );
 }
 
+/// 阶段 6 刀 1：一次正常 run 结束后，会话应同时满足结构不变量与收敛不变量。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn converged_run_passes_invariant_checks() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_ok", "echo hi", None, None),
+        text_response("完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(PLAIN_CONFIG);
+
+    let output = env.run(&["你好"]);
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let session = yaa_store::Session::new(env.session_db());
+    let consistency = yaa_core::test_support::check_consistency(&session);
+    assert!(consistency.is_empty(), "{}", consistency.describe());
+    let converged = yaa_core::test_support::check_converged(&session);
+    assert!(converged.is_empty(), "{}", converged.describe());
+}
+
+/// 阶段 6 刀 3：同目录两个显式会话（`a.db`/`b.db`）的 `outputs/` 与 `history/`
+/// 互不混放；默认会话路径保持不变。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_sessions_keep_outputs_and_archives_separate() {
+    let (addr, _state) = start_server(vec![
+        tool_call_response("call_a", "seq 1 200", None, None),
+        text_response("A 完成"),
+        tool_call_response("call_b", "seq 1 200", None, None),
+        text_response("B 完成"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_config(TRUNCATION_CONFIG);
+
+    let a_db = env.work.join("a.db");
+    let b_db = env.work.join("b.db");
+    for (db, expected) in [(&a_db, "A 完成"), (&b_db, "B 完成")] {
+        let output = env.run(&["--session", db.to_str().unwrap(), "你好"]);
+        assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+        assert_eq!(stdout_of(&output).trim(), expected);
+    }
+
+    let a_outputs = env.work.join("outputs").join("a.db");
+    let b_outputs = env.work.join("outputs").join("b.db");
+    for (db, own, other) in [
+        (&a_db, &a_outputs, &b_outputs),
+        (&b_db, &b_outputs, &a_outputs),
+    ] {
+        let records = read_events(db);
+        let result = records
+            .iter()
+            .find(|record| record["type"] == "tool_result")
+            .expect("应有工具结果");
+        let recorded = result["output_files"]["stdout"]
+            .as_str()
+            .expect("截断应记录 stdout 文件");
+        let full = if Path::new(recorded).is_absolute() {
+            PathBuf::from(recorded)
+        } else {
+            env.data_home.join(recorded)
+        };
+        assert!(
+            full.starts_with(own),
+            "会话 {} 的完整输出应落在 {}：{}",
+            db.display(),
+            own.display(),
+            full.display()
+        );
+        assert!(
+            !full.starts_with(other),
+            "会话 {} 的输出不得落进另一个会话：{}",
+            db.display(),
+            full.display()
+        );
+        assert!(full.exists(), "完整输出文件应存在：{}", full.display());
+    }
+
+    // `--clear` 归档到各自 artifact 子目录，互不混放。
+    for db in [&a_db, &b_db] {
+        let cleared = env.run(&["--clear", "--session", db.to_str().unwrap()]);
+        assert!(cleared.status.success(), "stderr：{}", stderr_of(&cleared));
+    }
+    let sid = yaa_store::Session::new(a_db.clone()).sid;
+    let history_root = env.data_home.join("history").join(&sid);
+    let a_history = history_root.join("a.db");
+    let b_history = history_root.join("b.db");
+    assert!(
+        has_archive(&a_history),
+        "a.db 应归档到 {}",
+        a_history.display()
+    );
+    assert!(
+        has_archive(&b_history),
+        "b.db 应归档到 {}",
+        b_history.display()
+    );
+    assert!(
+        !has_archive(&history_root),
+        "归档不得直接落在共享的 history/<sid>/ 根下"
+    );
+
+    // 默认会话仍使用 `<history>/<sid>/sessions-<ts>.db`，不受 artifact 唯一化影响。
+    let (default_addr, _default_state) = start_server(vec![text_response("默认完成")]).await;
+    let default_env = TestEnv::new(default_addr.port());
+    default_env.write_config(PLAIN_CONFIG);
+    assert!(default_env.run(&["你好"]).status.success());
+    assert!(
+        default_env.run(&["--clear"]).status.success(),
+        "默认会话应可归档"
+    );
+    let default_sid = yaa_store::Session::new(default_env.session_db()).sid;
+    let default_history = default_env.data_home.join("history").join(&default_sid);
+    assert!(
+        has_archive(&default_history),
+        "默认会话归档应直接在 history/<sid>/：{}",
+        default_history.display()
+    );
+}
+
+/// 目录内是否存在 `sessions-*` 归档文件。
+fn has_archive(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("sessions-"))
+        })
+        .unwrap_or(false)
+}
+
+/// 阶段 6 刀 3：同目录两个显式会话的压缩摘要 `summaries/` 互不混放。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_sessions_keep_summaries_separate() {
+    let (addr, _state) = start_server(vec![
+        text_response("## Primary Request and Intent\n- 摘要 A"),
+        text_response("最终 A"),
+        text_response("## Primary Request and Intent\n- 摘要 B"),
+        text_response("最终 B"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_llm(&format!(
+        "{}context_window = 800\n",
+        llm_toml_with(addr.port(), "openai")
+    ));
+    env.write_config(
+        r#"
+[hooks]
+init = "true"
+
+[compaction]
+threshold_ratio = 0.5
+retain_ratio = 0.1
+chars_per_token = 1
+prune_threshold_chars = 1000000
+prune_head_chars = 1000
+prune_tail_chars = 500
+
+[agent]
+max_steps = 10
+"#,
+    );
+
+    let a_db = env.work.join("a.db");
+    let b_db = env.work.join("b.db");
+    for db in [&a_db, &b_db] {
+        seed(db, &compaction_history());
+    }
+    for (db, expected) in [(&a_db, "最终 A"), (&b_db, "最终 B")] {
+        let output = env.run(&["--session", db.to_str().unwrap(), "新问题"]);
+        assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+        assert_eq!(stdout_of(&output).trim(), expected);
+    }
+
+    let a_summaries = env.work.join("summaries").join("a.db");
+    let b_summaries = env.work.join("summaries").join("b.db");
+    let a_files = json_files(&a_summaries);
+    let b_files = json_files(&b_summaries);
+    assert_eq!(a_files.len(), 1, "a.db 应有 1 条摘要：{a_files:?}");
+    assert_eq!(b_files.len(), 1, "b.db 应有 1 条摘要：{b_files:?}");
+
+    let a_text = std::fs::read_to_string(&a_files[0]).unwrap();
+    let b_text = std::fs::read_to_string(&b_files[0]).unwrap();
+    assert!(a_text.contains("摘要 A"), "{a_text}");
+    assert!(
+        !a_text.contains("摘要 B"),
+        "a.db 摘要不得混入 b.db：{a_text}"
+    );
+    assert!(b_text.contains("摘要 B"), "{b_text}");
+    assert!(
+        !b_text.contains("摘要 A"),
+        "b.db 摘要不得混入 a.db：{b_text}"
+    );
+
+    // 根 `summaries/` 下只应有会话子目录，不得有共享的散落摘要文件。
+    let root_files: Vec<_> = std::fs::read_dir(env.work.join("summaries"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.path())
+        .collect();
+    assert!(
+        root_files.is_empty(),
+        "共享 summaries/ 根下不得出现摘要文件：{root_files:?}"
+    );
+}
+
+/// 超过压缩阈值的历史（20 个 user/ai 回合）。
+fn compaction_history() -> Vec<yaa_msg::Record> {
+    let mut records = Vec::new();
+    for index in 0..20 {
+        records.push(yaa_msg::Record::user(format!(
+            "问 {index} {}",
+            "x".repeat(60)
+        )));
+        records.push(yaa_msg::Record::ai("fake-model", "h", "y".repeat(60), None));
+    }
+    records
+}
+
+/// 目录下的 `.json` 文件（排序）。
+fn json_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+/// 阶段 6 刀 4：相对 `YAA_NOTIFY` 按当前工作目录解析为绝对，通知落到预期会话。
+#[test]
+fn relative_notify_env_lands_in_cwd_session() {
+    let env = TestEnv::new(0);
+    let output = env
+        .command()
+        .env("YAA_NOTIFY", "relative-target.db")
+        .args(["--notify=相对", "--", "echo", "hi"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "stderr：{}", stderr_of(&output));
+
+    let target = env.work.join("relative-target.db");
+    let messages = read_inbox_at(&target, "pending");
+    assert_eq!(messages.len(), 1, "相对 YAA_NOTIFY 应落到 cwd 下的目标会话");
+    assert!(
+        messages[0]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("hi")),
+        "通知正文应来自命令输出：{messages:?}"
+    );
+}
+
 /// 验收 6：请求体、JSONL 与 stderr 均不含 `llm.toml` 里的假密钥。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn api_key_never_leaks_to_requests_jsonl_or_stderr() {
@@ -995,6 +1254,9 @@ async fn restart_after_sigkill_recovers_interrupted_tool_call() {
             .contains("interrupted"),
         "第二跳 tool 消息应含中断标记：{tool_message:?}"
     );
+
+    let converged = yaa_core::test_support::check_converged(&session);
+    assert!(converged.is_empty(), "{}", converged.describe());
 }
 
 /// 验收 9：展示中属于上下文的注入正文与请求体一致。`--verbose` 下断言
@@ -5405,6 +5667,9 @@ async fn notify_falls_back_to_spool_and_next_run_replays_once() {
         1,
         "重复 run 不得重复落库：{records:?}"
     );
+
+    let converged = yaa_core::test_support::check_converged(&session);
+    assert!(converged.is_empty(), "{}", converged.describe());
 }
 
 /// 刀 3：同一条记录同时出现在 inbox 与 spool 时，补投按 id 幂等，events 恰一条。

@@ -12,4 +12,5 @@ pub mod paths;
 pub mod prompt;
 pub mod render;
 pub mod session;
+pub mod test_support;
 pub mod tools;

@@ -38,11 +38,14 @@ pub struct SummaryCache {
 }
 
 impl SummaryCache {
-    /// 以会话根构造；目录为 `<session_root>/summaries`（未必存在）。
-    pub fn new(session_root: &Path) -> Self {
-        Self {
-            dir: session_root.join("summaries"),
+    /// 以会话根与 artifact 名构造；目录为 `<session_root>/summaries[/<artifact_name>]`
+    /// （未必存在）。默认会话的 artifact 名为空串，路径保持 `<session_root>/summaries`。
+    pub fn new(session_root: &Path, artifact_name: &str) -> Self {
+        let mut dir = session_root.join("summaries");
+        if !artifact_name.is_empty() {
+            dir.push(artifact_name);
         }
+        Self { dir }
     }
 
     /// 缓存目录路径。
@@ -136,26 +139,35 @@ mod tests {
         let b = SummaryCache::key("m", &["a".to_string(), "bc".to_string()]);
         assert_ne!(a, b, "不同划分不得撞键");
         assert_eq!(a.len(), 32);
-        assert_eq!(a, SummaryCache::key("m", &["ab".to_string(), "c".to_string()]));
-        assert_ne!(a, SummaryCache::key("other", &["ab".to_string(), "c".to_string()]));
+        assert_eq!(
+            a,
+            SummaryCache::key("m", &["ab".to_string(), "c".to_string()])
+        );
+        assert_ne!(
+            a,
+            SummaryCache::key("other", &["ab".to_string(), "c".to_string()])
+        );
     }
 
     #[test]
     fn store_then_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = SummaryCache::new(dir.path());
+        let cache = SummaryCache::new(dir.path(), "");
         let first = entry("id1", 10, None);
         cache.store(&first).unwrap();
 
         let loaded = cache.load_latest().unwrap().unwrap();
         assert_eq!(loaded, first);
-        assert_eq!(cache.path_for("id1"), dir.path().join("summaries").join("id1.json"));
+        assert_eq!(
+            cache.path_for("id1"),
+            dir.path().join("summaries").join("id1.json")
+        );
     }
 
     #[test]
     fn load_latest_picks_newest_timestamp() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = SummaryCache::new(dir.path());
+        let cache = SummaryCache::new(dir.path(), "");
         cache.store(&entry("old", 10, None)).unwrap();
         cache.store(&entry("new", 20, Some("old"))).unwrap();
 
@@ -167,8 +179,11 @@ mod tests {
     #[test]
     fn missing_dir_is_none_and_bad_files_are_skipped() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = SummaryCache::new(dir.path());
-        assert!(cache.load_latest().unwrap().is_none(), "目录缺失应视为无缓存");
+        let cache = SummaryCache::new(dir.path(), "");
+        assert!(
+            cache.load_latest().unwrap().is_none(),
+            "目录缺失应视为无缓存"
+        );
 
         cache.store(&entry("good", 10, None)).unwrap();
         fs::write(cache.dir().join("broken.json"), "not json").unwrap();
@@ -177,9 +192,28 @@ mod tests {
     }
 
     #[test]
+    fn artifact_name_nests_summaries_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        // 默认会话（空串）保持既有目录。
+        assert_eq!(
+            SummaryCache::new(dir.path(), "").dir(),
+            dir.path().join("summaries")
+        );
+        // 显式会话按 artifact 名嵌套，互不混放。
+        assert_eq!(
+            SummaryCache::new(dir.path(), "a.db").dir(),
+            dir.path().join("summaries").join("a.db")
+        );
+        assert_ne!(
+            SummaryCache::new(dir.path(), "a.db").dir(),
+            SummaryCache::new(dir.path(), "b.db").dir()
+        );
+    }
+
+    #[test]
     fn store_leaves_no_temp_file() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = SummaryCache::new(dir.path());
+        let cache = SummaryCache::new(dir.path(), "");
         cache.store(&entry("id1", 10, None)).unwrap();
         let leftovers: Vec<_> = fs::read_dir(cache.dir())
             .unwrap()
