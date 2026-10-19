@@ -22,7 +22,7 @@ git config core.hooksPath .githooks
 crates/
   yaa-cli/    二进制 yaa：参数解析、入口、展示渲染、stdout/stderr 策略
   yaa-core/   配置与路径、工具定义、模型调用、渲染与展示投影、agent loop
-  yaa-store/  会话 SQLite 事件库读写、归档
+  yaa-store/  会话 SQLite 事件库读写、归档、文件锁与文件 inbox
   yaa-exec/   Shell 执行机制：进程组、超时、流式截断、完整输出落盘
   yaa-msg/    记录类型与序列化
 ```

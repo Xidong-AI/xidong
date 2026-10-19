@@ -73,8 +73,16 @@
 | D65 | 旧 JSONL 不自动迁移：`--session *.jsonl` 明确报错并提示 `--clear`；`--clear --session x.jsonl` 走文件级 rename 归档为 `history/<sid>/sessions-<ts>.jsonl` | 避免静默误写旧数据；用户显式归档后可重新开始 |
 | D66 | `--session` 路径统一绝对化：目录 → `<目录>/session.db`；`.jsonl` → 旧格式错误；其余按数据库路径 | 规则单一可预测；裸文件名时 sid 回退为绝对路径 sha256 前 32 位 |
 | D67 | 归档库标记 `archived=1`，`append` 拒绝写入；`--status` 仍可读 | 归档即不可变历史，只读访问保留审计价值 |
+| D68 | runner 生命周期为**排空式单进程**：一次 `run` 处理到「历史空闲 + inbox 空 + 无未决审批」才退出，不做 daemon/常驻 runner | 常驻进程需要额外守护、信号与升级语义；排空式已覆盖「多客户端注入后继续跑」的需求，且退出即释放 `flock`，恢复模型简单 |
+| D69 | inbox 采用**文件载体**：`<prefix>inbox/{tmp,pending,init,rejected}`，载荷为完整 `Record` JSON；发布 `tmp → fsync → rename → fsync 目录`；消费 `append_idempotent` 后删除文件，不建 `consumed/` | 无锁多进程发布；完整记录使消费端无需重建字段；崩溃在 append 与删除之间时文件重现，由 id 去重；`init/` 保证「notify → 簿记 → user」顺序 |
+| D70 | `--notify` **只发布**：普通调用写 `pending/`，init 钩子内（`YAA_INBOX_PHASE=init`）写 `init/`；不抢 `runner.lock`、不跟随、不跑 `init`/`llm`、不执行 agent loop，发布带 generation 守卫 | 通知是外部副作用，不应因顺手调用而启动模型或阻塞；由运行中的 runner 在安全点落库，未运行时留给下一次 `run` |
+| D71 | follower 用 `read_after_with_generation` + 20→250 ms 退避 + `DisplayProjector` 增量展示；抢到锁后复检 generation，接管**只尝试一次**；`PendingPolicy` 区分新 `User`（Abandon）与纯 notify（Keep） | 避免每轮全量重投影与重复展示；只接管一次防止失败后无限抢锁；纯 notify 不应替用户作废旧待批 |
+| D72 | 原子水位与 generation 守卫发布：`watermark()` 在同一读快照返回 `(generation, last_seq)`，`publish_with_generation` 在 `clear.lock` 共享锁内校验；`0→1` 视为首次建库、不算归档 | 防止「旧 generation 的行 + 新 generation 值」拼接与归档后写入新库；建库窗口不应让 follower 误报「会话已归档」 |
+| D73 | artifact 路径按**完整数据库文件名**唯一化：非 `session.db` 以安全化文件名作前缀，锁与 inbox 各自独立；`outputs/`、`summaries/` 仍按会话根共享 | 同目录多个显式 `--session` 不能共享 `runner.lock` 或 inbox；用完整文件名而非 `file_stem`，使 `a.db` 与 `a.sqlite` 不碰撞 |
+| D74 | `--clear` 持 `runner.lock` + `clear.lock` 后检查 `pending/`/`init/`，有消息即拒绝归档；库不存在但 inbox 非空同样拒绝 | 归档会清空历史并 bump generation，若连同待处理消息一起归档会静默丢消息；持锁检查与发布互斥 |
+| D75 | `max_steps` 计**模型调用次数**，按含 `User` 的 inbox 批次重置；纯 notify 不重置 | 一轮多用户合并时每个 user 批次都应有完整预算；通知不是新任务，不应无限延长步数 |
 
-> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认。
+> D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认，D68–D75 为阶段 4 单 runner 与多客户端注入确认。
 
 ## 对 design.md 的更正
 
@@ -294,9 +302,9 @@ approval_resolved { type, id, ts, call_id, decision: approve|deny }
 - 阶段 1 默认 allow，无规则（审批在阶段 2；审批只作用于 `origin=ai` 的工具调用，钩子与通知不经过 `shell` 工具）。
 - 输出文件清理策略：**`--clear` 不移动 `outputs/`**，归档记录中的相对路径继续有效；磁盘无界增长作为已知限制记录，阶段 3 再引入保留策略。
 
-## Agent loop 与并发形状（阶段 1）
+## Agent loop 与并发形状（阶段 1 历史示意）
 
-入口形状保持「先发布消息 → 再决定 runner/follow」；当前已用 `runner.lock` 实现逻辑单 runner，inbox 文件协议属阶段 4。
+入口形状保持「先发布消息 → 再决定 runner/follow」；阶段 1 已用 `runner.lock` 实现逻辑单 runner，文件 inbox 已在阶段 4 落地（见 D68–D75 与「阶段 4」节）。以下伪代码保留阶段 1 的形状，具体行为以阶段 4 的实现为准。
 
 ```rust
 async fn main_flow(cfg) -> Result<ExitCode> {
@@ -307,12 +315,12 @@ async fn main_flow(cfg) -> Result<ExitCode> {
     }
 
     let user = build_user_record(prompt);
-    store::append(&session, &[user]);              // 阶段 1：直接追加；阶段 4：改为 inbox 发布
+    store::append(&session, &[user]);              // 阶段 1 直接追加；阶段 4 起先发布 inbox 再抢锁
 
-    let guard = try_acquire_runner(&session);      // 当前：runner.lock 非阻塞选举
+    let guard = try_acquire_runner(&session);      // runner.lock 非阻塞选举
     match guard {
         Some(g) => run_agent_loop(&session, &cfg, g).await,
-        None    => follow(&session).await,         // 阶段 1：不可达
+        None    => follow(&session).await,         // 阶段 1 不可达；阶段 4 已实现
     }
 }
 
@@ -486,9 +494,19 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 12. `--get-prompt`/`--clear`/`--status`/`--notify`/审批行为不因阶段 3 改动而改变。
 13. 原子验证：`cargo check --all-targets`、`cargo clippy`、`cargo test` 全绿；`autocorrect --lint docs crates` 通过。
 
-### 阶段 4：单 runner 与多客户端注入
+### 阶段 4：单 runner 与多客户端注入（已实现）
 
-`runner.lock` 选举（已实现：run/approve/clear 互斥）、`inbox/{tmp,pending,consumed}` 无锁发布（阶段 4 未做）、`consume_inbox`（幂等 append → rename）、跟随与 `read_after` 增量读取、安全点消费。`--clear` 在 runner 运行中拿不到 `runner.lock` 即明确报错（已实现）。
+行为（D68–D75）：
+
+- **排空式单 runner**：一次 `run` 处理到「历史空闲 + inbox 空 + 无未决审批」才退出；`runner.lock` 排他选举，不是常驻 daemon。
+- **文件 inbox**：`<session.root>/<prefix>inbox/{tmp,pending,init,rejected}`；发布 = tmp → fsync → rename → fsync 目录，无锁多进程安全；载荷是完整 `Record` JSON，消费用 `append_idempotent` 后删除文件（不建 `consumed/`）。
+- **先发布后抢锁**：`run` 在 `clear.lock` 共享临界区内做归档预检、原子捕获 `(generation, last_seq)` 并发布 own，释放共享锁后再抢 `runner.lock`。
+- **`--notify` 只发布**：init 钩子内写 `init/`，否则写 `pending/`；不抢锁、不跟随、不跑钩子或 agent；发布带 generation 守卫。
+- **follower/接管**：`read_after_with_generation` + 20→250 ms 退避 + `DisplayProjector` 增量展示 + generation 监控；旧 runner 退出后只尝试接管一次；`PendingPolicy` 区分新 `User`（Abandon）与纯 notify（Keep）。
+- **展示与归属**：水位 `(generation, seq)`；最终回复按 own record id 定位其后第一条轮末 `ai`；`max_steps` 按 user 批次重置（模型调用计数）。
+- **运维**：`--clear` 持锁后拒绝仍有 pending/init 的归档；`--status` 只读显示计数；锁与 inbox 路径按完整数据库文件名唯一化。
+
+验收覆盖（关键测试，概括范围）：inbox 并发发布、幂等消费、非法载荷与超限隔离、路径唯一化；两进程同时 run 仅一个成为 leader；注入后 kill -9 重启不丢不重；注入不打断工具配对；init 顺序与展示恰好一次；follower 不回放历史、增量投影等价全量；接管不重放；`--notify` 不启动 agent；`--clear` 遇 pending 拒绝；generation 变化退出；最终回复归属；建库 `0→1` 不误判归档；`--status` 只读不 reject。
 
 ### 阶段 5：notify 与后台任务
 
@@ -496,7 +514,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 
 ### 阶段 6：断电恢复与不变量
 
-SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pending 已由 core 的恢复逻辑实现；按 `id` 去重；不变量测试。
+SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pending 已由 core 的恢复逻辑实现；文件 inbox 的发布/消费崩溃语义（`rename` 原子、append 后删除前重现靠 id 去重）已在阶段 4 落地；按 `id` 去重；不变量测试。
 
 ## 测试与验证策略
 
@@ -532,6 +550,12 @@ SQLite 事务已消除半行撕裂；补中断 `tool_result` 与作废旧 pendin
 15. **压缩使 KV cache 部分失效**：摘要替换稳定前缀之后的早期消息，provider 从第一个被替换 token 起的复用失效（压缩的本质代价，DSH 同样如此）。
 16. **摘要会再次发送被遮蔽内容**：摘要调用把被遮蔽消息发给模型，隐私面与主调用相同，不新增泄露面，但敏感历史会被多送一次。
 17. **`outputs/` 仍无保留策略**：磁盘可能无界增长（D48 顺延）。
+18. **`--notify` 不立即落库**：它只发布到 inbox，通知要等运行中的 runner 在安全点消费，或下一次 `run` 才进入历史；`--status` 能看到待处理计数，但 `--notify` 返回后立刻读取历史不会包含该通知。
+19. **纯 follower 遇未决审批只等待**：不会自动接管或拒绝，会提示 `--approve` 并继续跟随；需要用户显式放行，或发布新的 `User` 触发 `PendingPolicy::Abandon`。
+20. **inbox 顺序是 ULID 近似序**：按文件名字典序消费，同一毫秒内的 ULID 不保证单调；同毫秒到达的多条消息只保证大致按时间，不保证严格因果。
+21. **follower 每轮全量 `load`**：判断 own 是否落库、历史是否空闲、有无未决审批都需要全量历史，长会话为 O(n)；增量读取本身是 O(增量)，实测空轮询约 0.5 ms，暂不做增量视图。
+22. **显式会话的 `history/<sid>` 仍可能混放**：锁与 inbox 已按完整数据库文件名唯一化，但归档目录仍以父目录名作 sid；同目录多个显式会话会归档到同一 `history/<sid>/`，同名时依赖时间戳与 `-<n>` 后缀避免覆盖，语义上仍混放。`outputs/` 与 `summaries/` 也按会话根共享，同目录显式会话会共用这两个目录。完整唯一化留待阶段 6。
+23. **run 竞态 e2e 是烟雾测试**：真实进程同时启动、慢模型、`kill -9` 等覆盖主路径，不证明所有调度交错；inbox 并发与幂等由 store 单测覆盖，follow 的时序正确性仍依赖不变量测试与代码审查。
 
 ## 已确认项与默认假设
 

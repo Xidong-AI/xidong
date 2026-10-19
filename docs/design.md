@@ -198,7 +198,7 @@ yaa [PROMPT]...              # 多个位置参数以空格连接；空则从 std
 yaa -- "[PROMPT]"            # 同上
 yaa --status                 # 看会话摘要
 yaa --session $path_to/session.db
-yaa --clear                  # 归档当前目录的会话；若已有 runner 在跑，此时再运行 `yaa "内容"` 会把消息排入 inbox 并跟随输出到循环结束（阶段 4）。
+yaa --clear                  # 归档当前目录的会话；若已有 runner 在跑，此时再运行 `yaa "内容"` 会把消息排入 inbox 并跟随输出到循环结束（阶段 4 已实现）。
 yaa --verbose                # 追加思考内容与命令输出
 yaa --quiet                  # 仅打印最终结果输出
 yaa --get-prompt system      # 仅打印内置系统提示词
@@ -280,15 +280,17 @@ some-cmd | yaa --notify="注释" --to "$YAA_PARENT" &
 | 主循环运行中 | 主循环的下一个循环开始时 |
 | 主循环已退出 | 下次该目录 `yaa` 启动时  |
 
-## 单 runner 与多客户端注入（阶段 4）
+## 单 runner 与多客户端注入（阶段 4，已实现）
+
+> 状态：阶段 4 已实现并合入。本节描述实际行为；裁决理由见 `plan.md` 的 D68–D75。
 
 ### 目标
 
-- 同一会话同一时刻只有一个 runner。
-- 已有 runner 运行时，再执行 `yaa "内容"` 不启动第二个 runner。
+- 同一会话同一时刻只有一个 runner（`runner.lock` 排他 `flock`）。
+- 已有 runner 运行时，再执行 `yaa "内容"` 不启动第二个 runner，而是把消息发布到 inbox 并跟随。
 - 新消息先进入 inbox，由 runner 在安全点插入主历史。
 - 插入发生在当前工具调用批次全部结束后，不打断 `tool_call` / `tool_result` 配对。
-- 注入客户端默认跟随主历史输出，直到循环结束。
+- 注入客户端默认跟随主历史输出，直到本轮工作排空。
 - 断电重启后不丢消息、不重复插入、不破坏历史语义。
 
 ### 文件布局
@@ -296,59 +298,73 @@ some-cmd | yaa --notify="注释" --to "$YAA_PARENT" &
 ```plaintext
 $YAA_DATA_HOME/sessions/<sid>/
   session.db             # 主历史事件库，只由 runner 写
-  runner.lock            # runner 长期 flock 锁（已实现）
+  runner.lock            # runner 选举锁（flock 排他）
+  clear.lock             # clear 排他 / inbox 发布共享
+  init.lock              # 首次建库串行化
   outputs/               # 截断工具的完整输出
-  inbox/                 # 文件 inbox（阶段 4 未做）
-    tmp/                 # 临时文件，不参与消费
-    pending/             # 待消费消息，每个消息一个文件
-    consumed/            # 已消费消息
+  summaries/             # 渲染期压缩的侧车摘要
+  inbox/
+    tmp/                 # 发布临时文件，不参与扫描；崩溃残留由 cleanup 清理
+    pending/             # 普通 user 与外部 notify
+    init/                # init 钩子期间的 notify
+    rejected/            # 解析失败、超限或非法载荷
 ```
 
-`runner.lock` 文件永久保留，不删除，不用“文件是否存在”判断 runner。只使用 `flock` 排他锁判断。
+锁文件永久保留，不删除，不用「文件是否存在」判断 runner，只使用 `flock` 判断。inbox 消费后直接删除消息文件，**不建 `consumed/`**。
 
-### 启动流程
+默认会话 `session.db` 使用上述无前缀路径。显式 `--session` 且数据库文件名不是 `session.db` 时，锁与 inbox 按**完整文件名**安全化后加前缀，例如 `a.db.runner.lock`、`a.db.clear.lock`、`a.db.init.lock`、`a.db.inbox/`。安全化保留 `[A-Za-z0-9._-]`，其余字符替换为 `_`，超长名追加短 hash；因此同目录的 `a.db` 与 `a.sqlite` 不会共享锁或 inbox。`outputs/` 与 `summaries/` 仍按会话根共享（见 `plan.md` 的「已知限制」）。
+
+### 启动流程（`run`）
 
 ```rust
-fn start(prompt) {
+fn run(prompt) {
     let session = resolve_session(cwd);
+    create_dir_all(session.root);
+    cleanup_inbox_tmp(session, 1h);
 
-    let user_msg = build_user_msg(prompt); // 含全局唯一 id
-    write_inbox_message(session, user_msg); // tmp -> fsync -> rename 到 pending
+    let own = Record::user(prompt);           // 含全局唯一 id
 
-    let lock = open_runner_lock(session);
+    // 发布与水位在同一个 clear.lock SH 临界区，且不覆盖 notify 命令执行。
+    let wm = {
+        let _clear = clear_lock_shared(session);
+        if is_archived(session) { return 1; }
+        let wm = watermark(session);          // 同一快照的 (generation, last_seq)
+        publish_with_generation(session, Pending, &own, wm.generation);
+        wm
+    };
 
-    match lock.try_lock_exclusive() {
-        Ok(guard) => {
-            recover(session);
-            run_agent_loop(session, guard);
-        }
-        Err(WouldBlock) => {
-            follow(session.db, start_seq, user_msg.id);
-        }
+    // 先发布，再抢锁；释放 clear.lock SH 后才抢 runner.lock，避免与 --clear 死锁。
+    match try_exclusive(runner_lock(session)) {
+        Some(_guard) => run_queued(session, own, PendingPolicy::Abandon),
+        None => follow(session, own, wm.last_seq, wm.generation),
     }
 }
 ```
 
-先写 inbox，再尝试获取 runner 锁。这样无论自己成为 runner，还是已有 runner，消息都不会丢。
+先发布再抢锁，这样无论自己成为 runner，还是已有 runner，消息都不会丢。归档预检与发布处于同一个 `clear.lock` 共享临界区，`--clear` 的排他锁无法在两者之间插入。
+
+`--approve` 不发布 user、不跟随；抢锁失败仍按阶段 2 语义报错退出 1。
 
 ### inbox 发布
 
-注入方只做三件事：
+注入方只做以下步骤，无需锁：
 
-1. 写临时文件到 `inbox/tmp/`。
-2. `fsync` 临时文件。
-3. 原子 `rename` 到 `inbox/pending/<ulid>.json`。
-4. `fsync` `pending/` 目录。
+1. 把**完整 `Record` JSON** 写入 `inbox/tmp/<唯一名>`（不是仅正文；载荷必须是 `user` 或 `system(source=notify)`）。
+2. 对临时文件 `sync_all`。
+3. 原子 `rename` 到 `inbox/pending/<record.id()>.json` 或 `inbox/init/<record.id()>.json`。
+4. `fsync` 目标目录。
 
-多个客户端可同时发布，不需要锁。`rename` 是原子的，`pending/` 中不会出现半条消息。
+`rename` 在同一文件系统内原子，`pending/` 中不会出现半条消息；多个客户端可同时发布。`record.id()` 必须匹配 `[A-Za-z0-9_-]{1,128}`，否则拒绝发布且不拼接路径。扫描时还要求文件名等于 id、载荷类型合法、文件不超过 1 MiB；不满足者尽力移入 `rejected/` 并跳过。`count_inbox` 只读统计 `*.json` 数量，供 `--status` 使用。
 
-消息文件示例：
+消息文件示例（实际载荷就是 `Record`）：
 
 ```json
 {"type":"user","id":"01J...","ts":...,"client_id":"cli_x","turn_id":"turn_x","content":"你好"}
 ```
 
-`--notify` 的 system 消息也走同一 inbox，只是 `type` 为 `system`。
+`--notify` 的 system 消息走同一 inbox：普通调用写 `pending/`，init 钩子内（环境变量 `YAA_INBOX_PHASE=init`）写 `init/`。
+
+`--notify` **只发布**：执行命令前短暂持 `clear.lock` 共享锁做归档预检并捕获 generation，命令执行期间不持锁（避免内嵌 `yaa --clear` 死锁）；发布时再由 `publish_with_generation` 持共享锁校验 generation。它不抢 `runner.lock`、不跟随、不跑 `init`/`llm` 钩子、不执行 agent loop；退出码来自命令本身，发布失败返回 1。真归档（generation 变化且不是 0→1 建库）时拒绝发布，避免把通知写进新 generation。
 
 ### 主循环安全点
 
@@ -358,23 +374,30 @@ fn start(prompt) {
 - 或当前没有未完成工具调用；
 - 下一轮模型调用之前。
 
-主循环：
+`run_queued` 的启动消费顺序：
+
+1. 普通 run / 含新 `User` 的接管先作废旧待批（`PendingPolicy::Abandon`），再补崩溃孤儿 `tool_result`；
+2. 历史中没有 `system(source=init)` 簿记时执行 `init` 钩子，随后消费 `inbox/init/` 并写簿记；`init` 失败仍消费 `init/`、落 own 并按配置错误退出（不消费其他 pending）；
+3. 消费文件名（ULID）小于 `own.id()` 的 `inbox/pending/` 注入；
+4. 消费 own；
+5. 解析 `llm` 钩子后进入主循环。
+
+主循环（示意；实际实现见 `crates/yaa-core/src/agent.rs` 的 `run_loop`）：
 
 ```rust
-fn run_agent_loop(session, runner_guard) {
+fn run_loop(session, runner_guard) {
     loop {
-        // 安全点：消费 inbox，追加到 session.db
-        consume_inbox(session);
-
-        let history = load(session);
-
-        if is_idle(history) && pending_is_empty(session) {
-            // 释放 runner.lock 后退出；若之后有注入，跟随者会接管
-            drop(runner_guard);
-            break;
+        // 安全点：上一轮工具批次已完整落盘，合并消费 init/ 与 pending/（按 ULID 升序）
+        let saw_user = consume_inbox(session); // append_idempotent + 删除文件
+        if saw_user {
+            step = 0;                          // 新 user 批次重置步数预算
+        }
+        if step >= max_steps {
+            break;                             // 退出码 5
         }
 
-        let ctx = render_context(history); // 压缩只发生在这里
+        let history = load(session);
+        let ctx = render_context(history);     // 压缩只发生在这里
         let resp = model.chat(ctx);
 
         // `ai` 与其全部 `tool_call` 以单批原子追加（见 plan.md D12）
@@ -385,9 +408,11 @@ fn run_agent_loop(session, runner_guard) {
                 let result = shell_execute(call);
                 append_history(session, tool_result(result));
             }
-            // 工具批次结束，下一轮开头消费 inbox
+            // 工具批次结束，下一轮开头才是下一个安全点
         } else {
-            // 无 `tool_call` 的 `ai` 记录即为回合结束，不引入独立 `turn_end` 类型
+            // 无 `tool_call` 的 `ai` 记录即为回合结束，不引入独立 `turn_end` 类型。
+            // 但最终模型调用期间可能到达 notify：inbox 非空则继续下一轮消费，
+            // 不重置 step，仍由 max_steps 兜底。
         }
     }
 }
@@ -395,76 +420,88 @@ fn run_agent_loop(session, runner_guard) {
 
 效果：
 
-- runner 执行工具时，第二个 `yaa` 把消息写入 `inbox/pending/`。
+- runner 执行工具时，第二个 `yaa` 把消息发布到 `inbox/pending/`。
 - runner 不在工具中间插入消息。
 - 当前工具批次全部 `tool_result` 写完后，下一轮循环开头消费 inbox。
-- 新 user 消息被追加到 `session.db` 的 `tool_result` 之后。
-- 下一次模型调用自然看到它，继续输出。
+- 新 user 消息被追加到 `session.db` 的 `tool_result` 之后，下一次模型调用自然看到它。
+- `max_steps` 按**模型调用次数**计；消费到含 `User` 的批次时重置，纯 notify 不重置。
 
 ### inbox 消费
 
 ```rust
-fn consume_inbox(session) {
-    let mut files = list_files(session.inbox.pending);
-    files.sort_by_key(|f| f.name); // ULID 时间有序
+fn consume_inbox(session) -> bool {
+    let mut messages = scan(session, Init);
+    messages.extend(scan(session, Pending));
+    messages.sort_by_key(|m| m.id()); // ULID 时间近似有序
 
-    for file in files {
-        let msg = read_json(file);
-
-        if !history_contains_id(session.db, msg.id) {
-            append(session, &[msg.into_history()]);
-        }
-
-        rename(file, session.inbox.consumed.join(file.name));
-        fsync(session.inbox.consumed);
+    let saw_user = messages.iter().any(|m| is_user(m));
+    let records: Vec<Record> = messages.iter().map(record).collect();
+    append_idempotent(session, &records);          // 整批幂等追加
+    for message in messages {
+        remove_file(message.path);                 // 消费后删除，不建 consumed/
     }
+    saw_user
 }
 ```
 
-顺序：
+顺序与崩溃语义：
 
-1. 用幂等事务把消息 append 到 `session.db`（WAL + `synchronous=FULL`，提交即持久）；
-2. rename 到 `consumed/`。
+1. 用 `append_idempotent` 把消息追加到 `session.db`（WAL + `synchronous=FULL`，提交即持久）；
+2. 删除对应 inbox 文件。
 
-若在 1 和 2 之间断电，重启后会重复消费，但 `id` 去重保证不会重复插入。
+若在 1 和 2 之间断电，重启后消息文件会重现并被再次扫描，但 `append_idempotent` 按记录 `id` 去重，不会重复插入。若发布方在 `rename` 前崩溃，只会留下 `tmp/` 残留（下次尽力清理），不会出现半条已发布消息。
 
 ### 跟随与接管
 
-已有 runner 时，第二个 `yaa` 进入跟随模式：
+已有 runner 时，第二个 `yaa` 进入跟随模式，只读、不写历史、不跑钩子、不执行工具：
 
-- 从启动时记录的 `seq` 水位开始 `read_after`；
-- 增量读取并渲染新消息；
-- 周期性尝试非阻塞获取 `runner.lock`；
-- 若获取成功，说明旧 runner 已退出，自己成为新 runner，调用 `run_agent_loop` 接管；
-- 接管时会消费 `inbox/pending/`，包括自己刚注入的消息；
-- 直到空闲且 pending 为空，再释放锁退出。
+- 启动水位是发布 own 时同一 `clear.lock` 临界区内捕获的 `(baseline_gen, start_seq)`，因此不回放历史；
+- 用 `read_after_with_generation` 增量读取，退避从 20 ms 起翻倍至 250 ms 封顶，有记录时重置为 20 ms，并加 ±20% 抖动；
+- 每批记录交给 `DisplayProjector` 增量投影：它跨批维护 `call_id → command` 命令表与末尾待定 `ai` 正文，行为等价于全量投影；启动时用 `start_seq` 之前的历史回填命令表但不产出旧条目，保证之后到达的 `approval_resolved` 仍能显示命令；
+- 每次读取都校验返回的 `generation`：真归档（变化且不是 `0→1` 建库）提示「会话已归档」并以 0 退出；`0→1` 视为首次建库，重置 `next_seq = 0` 后继续；
+- 非阻塞尝试获取 `runner.lock`；抢到后**复检 generation**，再补读旧 runner 释放前的最后一批，消除「读水位后、抢锁前被 clear」的竞态；
+- 若 own 已落库、inbox 为空、无未决审批且历史空闲 → 释放锁退出 0；最终回复由 CLI 按 own id 定位其后的第一条轮末 `ai` 打印；
+- 若 own 已落库、存在未决审批且 inbox 不含新 `User` → 用 `PendingPolicy::Keep`，提示运行 `yaa --approve` 并留在跟随，**不替用户拒绝**；
+- 其余情形调用 `run_takeover` 接管。接管**只尝试一次**：有新的 `User` 时用 `PendingPolicy::Abandon` 作废旧待批，否则用 `Keep`；接管失败即退出并保留 inbox 消息，不丢消息。
 
-这样即使 runner 在“检查 pending 为空”和“释放锁退出”之间发生注入竞态，跟随者也会接管处理，消息不会卡死。
+接管复用 `run_queued` 的消费顺序。own 可能已被旧 runner 消费，按 id 幂等去重，不会重复插入。
+
+最终回复归属：每个客户端按自己的 user record id 定位「其后第一条轮末 `ai`」，多客户端合并成一轮时各自打印同一条答案。若该答案为空，follower 与 leader 一样发出空回复提示，不静默退出。
 
 ### 退出与竞态
 
-runner 退出条件：
+runner 退出条件（排空式，一次启动处理到满足为止）：
 
-- 主历史处于空闲；
-- `inbox/pending/` 为空；
-- 持有 `runner.lock` 时做出该判断；
-- 释放 `runner.lock` 后退出。
+- 主历史处于空闲（空、末条为轮末 `ai`、或仅含 init 簿记/空 `system`）；
+- `inbox/pending/` 与 `inbox/init/` 均无可消费消息；
+- 没有未决 `approval_pending`；
+- 持有 `runner.lock` 时做出该判断，释放锁后不再写历史。
+
+存在未决 `approval_pending` 时 runner 以退出码 6 退出（保留阶段 2 语义）；follower 不自动接管。末条是 `user` 或 `tool_result` 表示轮次未完成，接管者继续跑而不是退出。
 
 若释放锁后、退出前有新注入：
 
-- 注入方写完 pending 后尝试 `runner.lock`；
+- 注入方发布消息后尝试 `runner.lock`；
 - 若成功，它成为新 runner，处理自己的消息；
-- 若失败，它进入跟随，旧 runner 释放锁后它会尝试接管。
+- 若失败，它进入跟随，旧 runner 释放锁后它尝试接管。
 
-只要默认注入客户端都会“跟随并尝试接管”，消息最终会被处理。
+只要默认注入客户端都会「跟随并尝试接管」，消息最终会被处理。这是排空式单进程模型，不是常驻 daemon。
+
+### `--clear` 与 `--status`
+
+- `--clear` 先取 `runner.lock` 排他锁，再取 `clear.lock` 排他锁；持锁后检查 `inbox/pending/` 与 `inbox/init/`，只要还有消息就拒绝归档并返回 1，inbox 原样保留。数据库文件不存在但 inbox 非空时同样拒绝，避免静默丢消息。检查期间 notify 发布持 `clear.lock` 共享锁，因此不会有新消息插入。
+- `--status` 用只读的 `count_inbox` 显示 pending/init 计数（不解析、不 reject、不创建目录）；数据库不存在但 inbox 非空时仍显示计数。
+- `inbox/tmp/` 中超 1 小时的临时文件由下次 `run`/`--notify` 尽力清理。
 
 ### 断电恢复（阶段 6）
 
 SQLite 事务消除了「撕裂尾行」问题：一批记录要么全部提交、要么全部不可见，断电只可能丢掉尚未提交的批次。缺失的配对仍由渲染器在内存中合成中断 `tool` 消息兜底（见 plan.md 更正 11）；持久化补写由 `yaa-core` 的恢复逻辑完成（store 保持哑，不猜测业务语义）。
 
+文件 inbox 协议已在阶段 4 实现：发布先写 `tmp/`、`fsync` 后原子 `rename`，已发布消息不会因断电变成半条；消费是「`append_idempotent` 后删除文件」，若在两者之间断电，消息文件会重现并由 id 去重。普通 `run` 先发布 own 再抢锁，因此断电时已发布但未消费的消息仍在 inbox，下次启动继续处理。
+
 断电后所有进程死亡，内核自动释放 `flock`。`runner.lock` 文件残留无害。新 `yaa` 启动后：
 
-1. 尝试获取 `runner.lock`，成功则成为 runner（inbox 文件协议属阶段 4，尚未实现）。
+1. 尝试获取 `runner.lock`，成功则成为 runner；随后按阶段 4 的顺序执行崩溃恢复、`init` 与 inbox 消费（先 `init/`，再 own 之前的 `pending/`，再 own）。
 2. 在 `init` 钩子与写入 `user` 之前执行恢复：
    - 为每个无对应 `tool_result` 的 `tool_call` 补一条中断结果（`stderr="runner interrupted"`，`code=-1`），幂等；
    - 普通 run 先把未决 `approval_pending` 补成 `approval_resolved: deny` 与失败结果；`--approve` 只补孤儿 `tool_call`，把最旧 pending 留给本次放行。
@@ -481,11 +518,12 @@ SQLite 事务消除了「撕裂尾行」问题：一批记录要么全部提交�
 ### 不变量
 
 - `session.db` 是唯一历史事实源，只由 runner 写。
-- 历史消息不可变，上下文只是渲染视图。
-- 压缩只发生在渲染阶段，原始事件库不变。
-- `inbox/` 多写无锁，每消息一文件，`rename` 原子发布。
-- 消息 `id` 全局唯一，消费幂等。
-- `runner.lock` 只用于 runner 选举，不用于数据保护。
-- 任何时刻同一会话最多一个 runner。
+- 历史消息不可变，上下文只是渲染视图；压缩只发生在渲染阶段。
+- `inbox/` 多写无锁，每消息一文件，`rename` 原子发布；载荷是完整 `Record`。
+- 消息 `id` 全局唯一；消费用 `append_idempotent` 按 id 去重，消费后删除文件。
+- `runner.lock` 只用于 runner 选举，不用于数据保护；任何时刻同一会话最多一个 runner。
+- 发布先于抢锁；发布与归档预检在同一 `clear.lock` 共享临界区。
 - 注入不打断工具批次，只在安全点插入。
+- 展示水位是 `(generation, seq)` 且只前进；generation 真变化即停止跟随（`0→1` 首次建库除外）。
+- `--clear` 不归档仍有待处理 inbox 的会话；锁与 inbox 路径按完整数据库文件名唯一化。
 - 断电重启后，消息不丢、不重复、不破坏工具调用配对。

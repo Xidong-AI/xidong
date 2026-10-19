@@ -79,6 +79,7 @@ Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook 
 4. **Main loop**: re-read history → render to model messages → call the model → run the shell tool → record the result, until the model stops calling tools or `max_steps` is reached.
 5. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded. Both `--notify` forms (command and stdin) reuse the same truncation and dump path. Limit precedence: `--notify-timeout` → `YAA_NOTIFY_*` env vars → `[shell]` → defaults.
 6. **Command visibility**: a notification's replayable command enters the model context with an `[执行命令]` prefix, telling the model which command produced it.
+7. **Concurrency and injection**: each session has at most one runner at a time; a second `yaa "..."` publishes its message to the session inbox and follows the running runner's output. `--notify` also only writes to the inbox and never starts the model; a running `yaa` consumes it at a safe point, or the next `yaa` run does. `--clear` refuses to archive while messages are pending.
 
 ## Layout
 
@@ -86,7 +87,7 @@ Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook 
 | ----------- | --------------------------------------------------------------- |
 | `yaa-cli`   | `yaa` binary: argument parsing, entry point, stdout/stderr policy |
 | `yaa-core`  | Config and paths, tool definition, model calls, rendering and display projection, agent loop |
-| `yaa-store` | Session SQLite event database read/write, reads by sequence, archiving, file locks |
+| `yaa-store` | Session SQLite event database read/write, reads by sequence, archiving, file locks, file inbox publish/scan |
 | `yaa-exec`  | Shell execution mechanism: process group, timeout, streaming truncation, full-output files |
 | `yaa-msg`   | Record types and serialization                                   |
 
