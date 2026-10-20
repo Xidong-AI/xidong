@@ -3344,6 +3344,136 @@ max_steps = 10
     assert_eq!(stdout_of(&output).trim(), "最终答复");
 }
 
+/// 2 个回合的纯 CJK 历史：每回合 user 304 码点、ai 302 码点。
+///
+/// 按二分类估算（ASCII 按 4 字符/token、非 ASCII 每码点 1 token）：
+/// - user：303 个非 ASCII + 1 个 ASCII 数字 → `ceil(1/4) + 303 = 304`；
+/// - ai：302 个非 ASCII → `302`；
+/// - 两回合合计 `(304 + 302) × 2 = 1212`。
+fn cjk_compaction_history() -> Vec<yaa_msg::Record> {
+    let mut records = Vec::new();
+    for index in 0..2 {
+        records.push(yaa_msg::Record::user(format!(
+            "问题{index}：{}",
+            "中".repeat(300)
+        )));
+        records.push(yaa_msg::Record::ai(
+            "fake-model",
+            "h",
+            "回答".to_string() + &"文".repeat(300),
+            None,
+        ));
+    }
+    records
+}
+
+/// 刀 3 核心证据：大量 CJK 历史在旧固定密度下被严重低估、不会触发压缩，而二分类
+/// 估算会在窗口溢出前触发。
+///
+/// 精确数值（`chars_per_token = 4`，逐字段独立取上整）：
+/// - 二分类：历史 1212 token，加本次新问题「新问题」3 token = **1215**；
+/// - 旧固定密度：每回合 `ceil(304/4) + ceil(302/4) = 76 + 76`，两回合 304，
+///   加新问题 1 token = **305**。
+///
+/// 窗口 1000、`threshold_ratio = 0.8` → 阈值 800：旧算法 305 < 800 不会触发，
+/// 二分类 1215 ≥ 800 触发。这是本用例存在的唯一理由，勿把历史改小。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cjk_history_triggers_compaction_under_binary_estimate() {
+    let (addr, state) = start_server(vec![
+        text_response("## Primary Request and Intent\n- 回顾 CJK 历史"),
+        text_response("最终答复"),
+    ])
+    .await;
+    let env = TestEnv::new(addr.port());
+    env.write_llm(&format!(
+        "{}context_window = 1000\n",
+        llm_toml_with(addr.port(), "openai")
+    ));
+    env.write_config(
+        r#"
+[hooks]
+init = "true"
+
+[compaction]
+threshold_ratio = 0.8
+retain_ratio = 0.1
+chars_per_token = 4
+prune_threshold_chars = 1000000
+prune_head_chars = 1000
+prune_tail_chars = 500
+
+[agent]
+max_steps = 10
+"#,
+    );
+    seed(&env.session_db(), &cjk_compaction_history());
+
+    let output = env.run(&["新问题"]);
+    assert!(
+        output.status.success(),
+        "CJK 压缩运行失败：{}",
+        stderr_of(&output)
+    );
+
+    // 恰好一次摘要 + 一次主调用，顺序为「摘要 → 主」。
+    let requests = state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2, "二分类估算应触发压缩：{requests:?}");
+    let instruction = requests[0]["messages"].as_array().unwrap().last().unwrap()["content"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        instruction.contains("compaction engine"),
+        "首个请求末条应为压缩指令：{instruction}"
+    );
+    let main_body = serde_json::to_string(&requests[1]["messages"]).unwrap();
+    assert!(
+        main_body.contains("<compacted-summary>"),
+        "主请求应携带摘要检查点"
+    );
+}
+
+/// 反向对照：同一段 CJK 历史，窗口放大到 10000（阈值 8000）后二分类估算仅 1215
+/// token，不应压缩——证明压缩由阈值触发而非无条件发生。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cjk_history_below_binary_threshold_does_not_compact() {
+    let (addr, state) = start_server(vec![text_response("直接回答")]).await;
+    let env = TestEnv::new(addr.port());
+    env.write_llm(&format!(
+        "{}context_window = 10000\n",
+        llm_toml_with(addr.port(), "openai")
+    ));
+    env.write_config(
+        r#"
+[hooks]
+init = "true"
+
+[compaction]
+threshold_ratio = 0.8
+retain_ratio = 0.1
+chars_per_token = 4
+prune_threshold_chars = 1000000
+prune_head_chars = 1000
+prune_tail_chars = 500
+
+[agent]
+max_steps = 10
+"#,
+    );
+    seed(&env.session_db(), &cjk_compaction_history());
+
+    let output = env.run(&["新问题"]);
+    assert!(
+        output.status.success(),
+        "未压缩运行失败：{}",
+        stderr_of(&output)
+    );
+
+    let requests = state.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "未超阈值时只应有主调用：{requests:?}");
+    let body = serde_json::to_string(&requests[0]["messages"]).unwrap();
+    assert!(!body.contains("<compacted-summary>"), "不应发生压缩");
+}
+
 /// 阶段 3 验收 10：`--json` 把展示事件输出为带 `type` 的 JSONL，最终回复也在其中。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn json_outputs_jsonl_event_stream() {

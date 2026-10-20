@@ -4,7 +4,9 @@
 # 钩子是一段 shell 命令，以 `sh -c` 执行：
 #   - init：空会话初始化，仅执行一次；stdout 不进入上下文，内容由命令内的
 #     `yaa --notify` 写入；
-#   - llm：每次运行执行一次，输出模型供应配置的 TOML（格式见 llm.example.toml）。
+#   - llm：每次运行执行一次，输出模型供应配置的 TOML（格式见 llm.example.toml）；
+#   - estimate（可选）：压缩判定的 token 估算，stdin 收 JSON 字符串数组、stdout 回等长
+#     JSON 整数数组；未配置或失败时回退内置二分类启发式。
 
 [hooks]
 # `$YAA_BIN` 是当前 yaa 可执行文件的绝对路径，避免 PATH 中没有 yaa 时钩子失败。
@@ -18,6 +20,11 @@ if [ -f "$GLB_CFG/AGENTS.md" ]; then "$YAA_BIN" --notify="用户总提示词" --
 "$YAA_BIN" --notify="当前环境" -- echo "工作目录：$(pwd)"
 '''
 llm = "cat $YAA_CONFIG_HOME/llm.toml"
+# 可选：外部 token 估算钩子（默认不启用）。压缩判定前，把本次投影的全部文本字段
+# 去重后以 JSON 字符串数组写入 stdin；钩子须在 stdout 返回等长的 JSON 整数数组
+# （每个字段的 token 数）。超时、非零退出或输出不合法时回退内置启发式，并只告警
+# 一次。适合外接精确 tokenizer，例如 `python3 /path/to/estimate.py`。
+# estimate = "python3 /path/to/estimate.py"
 # 单次钩子执行硬超时（秒），覆盖启动与读尽输出；超时整组击杀，绝不挂起。
 timeout_secs = 30
 
@@ -47,7 +54,7 @@ enabled = true
 threshold_ratio = 0.8
 # 逐字保留的近期尾部占窗口比例；须小于 threshold_ratio。
 retain_ratio = 0.16
-# token 估算密度（已知低估 CJK）。
+# ASCII token 估算密度；非 ASCII（CJK、emoji 等）每码点按 1 token 计。
 chars_per_token = 4
 # 摘要调用的输出上限。
 max_tokens = 8192

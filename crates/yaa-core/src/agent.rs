@@ -32,6 +32,22 @@ use crate::render;
 use crate::session;
 use crate::tools;
 
+mod estimate_hook;
+
+/// `plan_messages` 跨步复用的状态。
+///
+/// 放在 `run_loop` 的局部变量里而非 [`Runner`] 字段：一次运行内的缓存与禁用标记
+/// 不应泄漏到下一次运行。
+#[derive(Default)]
+struct PlanState {
+    /// 本次运行的摘要链尾：生成一次后后续步骤复用，避免重复调用摘要模型。
+    compaction: Option<compaction::cache::SummaryEntry>,
+    /// token 估算钩子的跨步缓存：`(指纹，文本 → token 数)`。
+    estimate_cache: Option<(String, compaction::PrecomputedMap)>,
+    /// 钩子一旦失败（超时/非零/解析失败/长度不匹配）即永久禁用本会话剩余步骤。
+    estimate_hook_disabled: bool,
+}
+
 /// 进程退出码。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExitCode {
@@ -668,8 +684,8 @@ impl Runner<'_> {
         let schema_hash = tools::shell::schema_hash();
         let limits = self.config.shell.to_limits();
         let outputs_dir = session::outputs_dir(&self.session);
-        // 本次运行的摘要链尾：生成一次后后续步骤复用，避免重复调用摘要模型。
-        let mut compaction_state: Option<compaction::cache::SummaryEntry> = None;
+        // 本次运行的计划状态：摘要链尾与 token 估算钩子缓存。
+        let mut plan_state = PlanState::default();
 
         let max_steps = self.config.agent.max_steps;
         let mut step = 0u32;
@@ -689,7 +705,7 @@ impl Runner<'_> {
 
             let history = History::load(&self.session)?;
             let plan = self
-                .plan_messages(history.records(), model, &mut compaction_state)
+                .plan_messages(history.records(), model, &mut plan_state)
                 .await;
 
             // 先展示自上次以来新增的记录（注入、用户、工具批次），再推进水位。
@@ -792,13 +808,14 @@ impl Runner<'_> {
 
     /// 计算本步要发给模型的消息：必要时修剪工具正文与压缩早期历史。
     ///
-    /// `state` 是本次运行的摘要链尾：一旦生成摘要，后续步骤复用而不重复调用模型。
-    /// 首次进入时从侧车缓存读取，实现同区间跨运行复用（D50）；生成的新条目在此落盘。
+    /// `state` 在本次运行内跨步复用：摘要链尾避免重复调用模型，token 估算钩子的
+    /// 结果与禁用标记也随之保留。首次进入时从侧车缓存读取摘要，实现同区间跨运行
+    /// 复用（D50）；生成的新条目在此落盘。
     async fn plan_messages<M: Model>(
         &self,
         records: &[Record],
         model: &M,
-        state: &mut Option<compaction::cache::SummaryEntry>,
+        state: &mut PlanState,
     ) -> compaction::Plan {
         let cfg = &self.config.compaction;
         let Some(budgets) = compaction::Budgets::from_config(cfg, model.context_window()) else {
@@ -811,14 +828,25 @@ impl Runner<'_> {
         };
         let estimator = compaction::Estimator::new(cfg.chars_per_token);
         let cache = SummaryCache::new(&self.session.root, &self.session.artifact_name());
-        let previous = match state.clone() {
+        let previous = match state.compaction.clone() {
             Some(entry) => Some(entry),
             None => cache.load_latest().unwrap_or(None),
+        };
+        // 两阶段触发：先用纯启发式判断是否值得调用外部估算钩子；只有已超阈值才调。
+        // 阶段一不直接返回渲染结果——仍需交给 `compact` 处理前驱摘要替换与修剪。
+        let needs_hook =
+            estimator.estimate_messages(&render::render(records), None) >= budgets.threshold_tokens;
+        let precomputed = if needs_hook {
+            self.precomputed_estimate(records, previous.as_ref(), state)
+                .await
+        } else {
+            None
         };
         let plan = compaction::compact(
             records,
             model.name(),
             &estimator,
+            precomputed.as_ref(),
             &budgets,
             cfg,
             previous.as_ref(),
@@ -831,9 +859,91 @@ impl Runner<'_> {
                     "压缩摘要落盘失败，本次仍使用内存摘要：{err:#}"
                 )));
             }
-            *state = Some(entry.clone());
+            state.compaction = Some(entry.clone());
         }
         plan
+    }
+
+    /// token 估算钩子的指纹：记录数量 + 末条 id + 前驱摘要 id。
+    fn estimate_fingerprint(
+        records: &[Record],
+        previous: Option<&compaction::cache::SummaryEntry>,
+    ) -> String {
+        let last_id = records.last().map_or("", |record| record.id());
+        let previous_id = previous.map_or("", |entry| entry.id.as_str());
+        format!("{}:{last_id}:{previous_id}", records.len())
+    }
+
+    /// 调用外部 token 估算钩子；未配置、已禁用、无文本或命中缓存时返回 `None`。
+    ///
+    /// 任何失败（编码/执行/超时/非零/解析/长度不匹配）都回退内置启发式，发出一次性
+    /// 警告，并永久禁用本次运行的剩余步骤——避免每步重复付出失败开销。
+    async fn precomputed_estimate(
+        &self,
+        records: &[Record],
+        previous: Option<&compaction::cache::SummaryEntry>,
+        state: &mut PlanState,
+    ) -> Option<compaction::PrecomputedMap> {
+        if self.config.hooks.estimate.is_empty() || state.estimate_hook_disabled {
+            return None;
+        }
+        let texts =
+            estimate_hook::collect_texts(records, previous.map(|entry| entry.summary.as_str()));
+        if texts.is_empty() {
+            return None;
+        }
+        let fingerprint = Self::estimate_fingerprint(records, previous);
+        if let Some((cached, map)) = &state.estimate_cache
+            && cached == &fingerprint
+        {
+            return Some(map.clone());
+        }
+        let payload = match estimate_hook::encode(&texts) {
+            Ok(payload) => payload,
+            Err(err) => {
+                self.disable_estimate_hook(state, &format!("编码请求失败：{err:#}"));
+                return None;
+            }
+        };
+        let outcome = match crate::hook::run(
+            &self.config.hooks.estimate,
+            self.cwd,
+            &self.hook_env(),
+            Some(payload.as_bytes()),
+            self.config.hooks.timeout_secs,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.disable_estimate_hook(state, &format!("执行失败：{err}"));
+                return None;
+            }
+        };
+        if outcome.code != 0 {
+            self.disable_estimate_hook(state, &format!("退出码 {}", outcome.code));
+            return None;
+        }
+        let map = match estimate_hook::decode(&outcome.stdout, &texts) {
+            Ok(map) => map,
+            Err(err) => {
+                self.disable_estimate_hook(state, &format!("解析输出失败：{err:#}"));
+                return None;
+            }
+        };
+        state.estimate_cache = Some((fingerprint, map.clone()));
+        Some(map)
+    }
+
+    /// 禁用 token 估算钩子并发出一次性告警；重复调用无副作用。
+    fn disable_estimate_hook(&self, state: &mut PlanState, reason: &str) {
+        if state.estimate_hook_disabled {
+            return;
+        }
+        state.estimate_hook_disabled = true;
+        self.sink.emit(DisplayItem::Notice(format!(
+            "token 估算钩子不可用（{reason}），已回退到内置启发式；压缩估算可能不准。"
+        )));
     }
 
     /// 对一次 `origin=ai` 的工具调用求审批裁决并按落地表处理。
@@ -1067,7 +1177,15 @@ impl Runner<'_> {
         }
         env.insert("YAA_INBOX_PHASE".to_string(), "init".to_string());
         let command = self.config.hooks.init.as_str();
-        match crate::hook::run(command, self.cwd, &env, self.config.hooks.timeout_secs).await {
+        match crate::hook::run(
+            command,
+            self.cwd,
+            &env,
+            None,
+            self.config.hooks.timeout_secs,
+        )
+        .await
+        {
             Ok(outcome) => {
                 // 钩子内的 `yaa --notify` 的 stderr 透传给用户（D27）；stdout 忽略，
                 // 内容只经 `yaa --notify` 写入上下文。
@@ -1103,15 +1221,22 @@ impl Runner<'_> {
     async fn resolve_llm_hook(&self) -> Result<LlmConfig, ExitCode> {
         let env = self.hook_env();
         let command = self.config.hooks.llm.as_str();
-        let outcome =
-            match crate::hook::run(command, self.cwd, &env, self.config.hooks.timeout_secs).await {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    self.sink
-                        .emit(DisplayItem::Error(format!("执行 llm 钩子失败：{err}")));
-                    return Err(ExitCode::Config);
-                }
-            };
+        let outcome = match crate::hook::run(
+            command,
+            self.cwd,
+            &env,
+            None,
+            self.config.hooks.timeout_secs,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.sink
+                    .emit(DisplayItem::Error(format!("执行 llm 钩子失败：{err}")));
+                return Err(ExitCode::Config);
+            }
+        };
         if outcome.code != 0 {
             self.emit_hook_stderr(&outcome.stderr);
             self.sink.emit(DisplayItem::Error(format!(
@@ -1569,6 +1694,112 @@ mod tests {
         assert_eq!(ExitCode::Model.code(), 4);
         assert_eq!(ExitCode::MaxSteps.code(), 5);
         assert_eq!(ExitCode::Pending.code(), 6);
+    }
+
+    #[test]
+    fn estimate_fingerprint_tracks_length_last_id_and_previous() {
+        let records = vec![Record::user("a"), Record::user("b")];
+        let last_id = records.last().unwrap().id().to_string();
+        assert_eq!(
+            Runner::estimate_fingerprint(&records, None),
+            format!("2:{last_id}:")
+        );
+        let previous = compaction::cache::SummaryEntry {
+            id: "prev".to_string(),
+            model: "m".to_string(),
+            previous: None,
+            covers: Vec::new(),
+            summary: "s".to_string(),
+            created_ts: 0,
+            tokens: None,
+        };
+        assert_eq!(
+            Runner::estimate_fingerprint(&records, Some(&previous)),
+            format!("2:{last_id}:prev")
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_hook_unset_returns_none_without_touching_state() {
+        let harness = Harness::new(test_config("true"));
+        let sink = NullSink;
+        let runner = harness.runner(&sink);
+        let records = vec![Record::user("你好")];
+        let mut state = PlanState::default();
+        assert!(
+            runner
+                .precomputed_estimate(&records, None, &mut state)
+                .await
+                .is_none()
+        );
+        assert!(!state.estimate_hook_disabled);
+        assert!(state.estimate_cache.is_none());
+    }
+
+    #[tokio::test]
+    async fn estimate_hook_result_is_cached_across_calls() {
+        let mut config = test_config("true");
+        config.hooks.estimate =
+            "n=$(cat calls 2>/dev/null || echo 0); n=$((n+1)); echo $n > calls; printf '[7]'"
+                .to_string();
+        let harness = Harness::new(config);
+        let sink = RecordingSink::default();
+        let runner = harness.runner(&sink);
+        let records = vec![Record::user("你好")];
+        let mut state = PlanState::default();
+
+        let first = runner
+            .precomputed_estimate(&records, None, &mut state)
+            .await
+            .expect("首次应调用钩子并返回结果");
+        assert_eq!(first.get("你好"), Some(&7));
+        let second = runner
+            .precomputed_estimate(&records, None, &mut state)
+            .await
+            .expect("第二次应命中缓存");
+        assert_eq!(second.get("你好"), Some(&7));
+        // 钩子只被真正执行一次。
+        assert_eq!(
+            std::fs::read_to_string(harness.cwd.join("calls"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_hook_failure_disables_and_warns_once() {
+        let mut config = test_config("true");
+        config.hooks.estimate = "printf 'not-json'".to_string();
+        let harness = Harness::new(config);
+        let sink = RecordingSink::default();
+        let runner = harness.runner(&sink);
+        let records = vec![Record::user("你好")];
+        let mut state = PlanState::default();
+
+        assert!(
+            runner
+                .precomputed_estimate(&records, None, &mut state)
+                .await
+                .is_none()
+        );
+        assert!(state.estimate_hook_disabled);
+        let notices = || {
+            sink.items()
+                .into_iter()
+                .filter(|item| matches!(item, DisplayItem::Notice(_)))
+                .count()
+        };
+        assert_eq!(notices(), 1, "失败应给一次性告警");
+
+        // 已禁用：后续调用直接回退，不再执行钩子也不再告警。
+        assert!(
+            runner
+                .precomputed_estimate(&records, None, &mut state)
+                .await
+                .is_none()
+        );
+        assert_eq!(notices(), 1);
     }
 
     /// 刀 2：展示水位按 `seq` 定界；归档重置 `seq` 后旧水位不得误展示旧内容或重复。

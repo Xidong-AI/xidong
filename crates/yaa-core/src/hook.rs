@@ -42,6 +42,7 @@ type Result<T> = std::result::Result<T, HookError>;
 
 /// 执行钩子命令。
 ///
+/// `stdin` 为 `Some` 时经管道并发写入并在写完后关闭；`None` 时接 `/dev/null`。
 /// 硬性约束：从 `spawn` 到读尽两个流的**整个**过程都受 `timeout_secs` 约束。
 /// `sh` 以独立进程组启动，超时时对**整组**发 SIGKILL，因此即使钩子留下的后台子进程
 /// 仍攥着管道，`run` 也会在截止期内返回 `HookError::Timeout`，绝不永久挂起。
@@ -49,8 +50,16 @@ pub async fn run(
     command: &str,
     cwd: &Path,
     env: &BTreeMap<String, String>,
+    stdin: Option<&[u8]>,
     timeout_secs: u64,
 ) -> Result<HookOutcome> {
+    // 超限在 spawn 前判定：不为注定失败的调用启动进程。
+    if let Some(bytes) = stdin
+        && bytes.len() > MAX_STREAM_BYTES
+    {
+        return Err(HookError::TooLarge { stream: "stdin" });
+    }
+
     let start = Instant::now();
     let deadline = Duration::from_secs(timeout_secs);
 
@@ -59,7 +68,11 @@ pub async fn run(
         .arg(command)
         .current_dir(cwd)
         .envs(env)
-        .stdin(Stdio::null())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -70,6 +83,21 @@ pub async fn run(
     let mut child = cmd.spawn()?;
     // `process_group(0)` 下子进程组 id == 子进程 pid。
     let pid = child.id();
+
+    // 写入任务与读流并发，共享同一 deadline；错误/超时路径统一 abort。
+    let mut writer = match stdin {
+        Some(bytes) => {
+            let mut pipe = child.stdin.take().ok_or(HookError::MissingPipe("stdin"))?;
+            let bytes = bytes.to_vec();
+            Some(tokio::spawn(async move {
+                use tokio::io::AsyncWriteExt;
+                // 写入失败（如子进程提前退出）无需上抛：结果由退出码与输出体现。
+                let _ = pipe.write_all(&bytes).await;
+                // `pipe` 在此 drop，向子进程发送 EOF。
+            }))
+        }
+        None => None,
+    };
 
     let stdout = child
         .stdout
@@ -85,17 +113,33 @@ pub async fn run(
         Ok(Ok(pair)) => pair,
         Ok(Err(err)) => {
             // 超限时 `drain_both` 已停止读取；必须杀死进程组，避免其阻塞在写管道上。
+            abort_writer(&mut writer);
             kill_group(pid, &mut child);
             reap(&mut child).await;
             return Err(err);
         }
         Err(_) => {
             // 进程组里可能有攥住管道、永不 EOF 的后台子进程：整组击杀后立即返回。
+            abort_writer(&mut writer);
             kill_group(pid, &mut child);
             reap(&mut child).await;
             return Err(HookError::Timeout { secs: timeout_secs });
         }
     };
+
+    // 输出已 EOF，但写任务可能仍在向仍等待 stdin 的子进程喂数据：以剩余预算等它写完
+    // 并关闭管道，否则 `child.wait()` 可能因 stdin 未 EOF 而挂起。
+    if let Some(handle) = writer.as_mut() {
+        let write_budget = deadline
+            .saturating_sub(start.elapsed())
+            .max(Duration::from_millis(50));
+        if tokio::time::timeout(write_budget, handle).await.is_err() {
+            abort_writer(&mut writer);
+            kill_group(pid, &mut child);
+            reap(&mut child).await;
+            return Err(HookError::Timeout { secs: timeout_secs });
+        }
+    }
 
     // 管道已 EOF，但子进程可能尚未退出；再以剩余预算回收，整体仍不越过截止期。
     let wait_budget = deadline
@@ -108,10 +152,18 @@ pub async fn run(
             code: status?.code().unwrap_or(-1),
         }),
         Err(_) => {
+            abort_writer(&mut writer);
             kill_group(pid, &mut child);
             reap(&mut child).await;
             Err(HookError::Timeout { secs: timeout_secs })
         }
+    }
+}
+
+/// 中止尚未完成的写入任务；已完成或不存在时无操作。
+fn abort_writer(writer: &mut Option<tokio::task::JoinHandle<()>>) {
+    if let Some(handle) = writer.take() {
+        handle.abort();
     }
 }
 
@@ -191,7 +243,7 @@ mod tests {
     #[tokio::test]
     async fn captures_stdout_and_code() {
         let dir = tempfile::tempdir().unwrap();
-        let outcome = run("echo hello", dir.path(), &empty_env(), TEST_TIMEOUT)
+        let outcome = run("echo hello", dir.path(), &empty_env(), None, TEST_TIMEOUT)
             .await
             .unwrap();
         assert_eq!(outcome.stdout, "hello\n");
@@ -205,6 +257,7 @@ mod tests {
             "echo oops >&2; exit 3",
             dir.path(),
             &empty_env(),
+            None,
             TEST_TIMEOUT,
         )
         .await
@@ -218,9 +271,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut env = empty_env();
         env.insert("GLB_CFG".to_string(), "/cfg".to_string());
-        let outcome = run("printf '%s' \"$GLB_CFG\"", dir.path(), &env, TEST_TIMEOUT)
-            .await
-            .unwrap();
+        let outcome = run(
+            "printf '%s' \"$GLB_CFG\"",
+            dir.path(),
+            &env,
+            None,
+            TEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
         assert_eq!(outcome.stdout, "/cfg");
     }
 
@@ -232,6 +291,7 @@ mod tests {
             "head -c 2097152 /dev/zero",
             dir.path(),
             &empty_env(),
+            None,
             TEST_TIMEOUT,
         )
         .await;
@@ -239,10 +299,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdin_is_written_and_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = run(
+            "cat",
+            dir.path(),
+            &empty_env(),
+            Some(b"hello stdin"),
+            TEST_TIMEOUT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.stdout, "hello stdin");
+        assert_eq!(outcome.code, 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_stdin_is_an_error_before_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![b'x'; MAX_STREAM_BYTES + 1];
+        let outcome = run(
+            "cat",
+            dir.path(),
+            &empty_env(),
+            Some(&payload),
+            TEST_TIMEOUT,
+        )
+        .await;
+        assert!(
+            matches!(outcome, Err(HookError::TooLarge { stream: "stdin" })),
+            "应报 stdin 超限：{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn hanging_hook_times_out_promptly() {
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
-        let outcome = run("sleep 30", dir.path(), &empty_env(), 1).await;
+        let outcome = run("sleep 30", dir.path(), &empty_env(), None, 1).await;
         let elapsed = started.elapsed();
         assert!(
             matches!(outcome, Err(HookError::Timeout { secs: 1 })),
@@ -260,7 +354,7 @@ mod tests {
         // 直接子进程的 kill 不够，必须整组击杀才不会永久挂起。
         let dir = tempfile::tempdir().unwrap();
         let started = Instant::now();
-        let outcome = run("sleep 30 &", dir.path(), &empty_env(), 1).await;
+        let outcome = run("sleep 30 &", dir.path(), &empty_env(), None, 1).await;
         let elapsed = started.elapsed();
         assert!(
             matches!(outcome, Err(HookError::Timeout { secs: 1 })),

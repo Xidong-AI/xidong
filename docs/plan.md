@@ -57,7 +57,7 @@
 | D49 | 压缩策略（比率、pruner 预算、`retries`）归 `[compaction]`；模型上下文窗口 `context_window` 随 `llm` 钩子输出（供应侧，与 `model` 同源，换模型只改一处），缺失即整支禁用（静默，不报错） | 窗口是模型属性而非策略；DSH 同样从路由适配器解析 capacity。策略与预算在 `[compaction]` 与 `[shell]`/`[agent]` 并列 |
 | D50 | 压缩只发生在渲染期、**不改 `session.db`**；摘要产物写 `sessions/<sid>/summaries/<hash>.json` 侧车（`hash` = 被遮蔽记录 id 序列 + 模型） | 忠于 `design.md`「压缩只发生在渲染阶段，原始事件库不变」；key 含记录 id 使缓存精确，同内容不同划分不误命中 |
 | D51 | 摘要**链式递进**：新摘要输入 = 旧摘要文本 + 新遮蔽区，`previous` 记录前驱；渲染时只应用链尾摘要 | 无状态重算会让长会话第二次压缩把已蔽原文整段重喂、可能直接超窗口；链式使每次摘要输入有界 |
-| D52 | token 估算按 `chars_per_token`（默认 4）对**投影消息文本**（`content` + `tool_calls` 参数 + `reasoning`）计，不含工具 schema | 对齐 DSH 的固定密度启发式；工具 schema 固定且小，省略可接受，且避免把 schema 传进渲染层 |
+| D52 | token 估算按**字段级二分类**：ASCII 码点按 `chars_per_token`（默认 4）取上整，非 ASCII 码点每码点计 1 token；各字段独立取整后求和，不含工具 schema | 修正旧固定密度对 CJK 约 4 倍的系统性低估（中文会话实际已近窗口仍不触发压缩）；字段级取整与钩子预计算粒度一致 |
 | D53 | pruner 用独立 `[compaction]` 预算（默认 8192/4096/1024），只修剪 `tool` 消息正文、跳过 `system`；标记 `\n\n[... tool result middle pruned ...]\n\n`；按 Unicode 码点 | 与 `[shell]` 的执行期截断语义不同（历史再修剪 vs 执行即截断），复用会把两种阈值混为一谈；跳过 `system` 避免裁掉稳定前缀 |
 | D54 | 摘要指令照搬 DSH `COMPACTION_INSTRUCTION`（英文 Markdown 结构）+ `CHECKPOINT_PREAMBLE` + `<compacted-summary>` 标签；摘要调用**不带 tools**、以被遮蔽消息 + 指令为输入 | 该指令是经 DSH 验证的工程化 prompt；不带 tools 避免模型返回 `tool_calls`、简化调用形状 |
 | D55 | 摘要失败（网络/超时/空输出/不比原文小/重试耗尽）→ stderr 警告 + 用完整历史继续；不中止回合 | 对齐 DSH「警告并携带完整历史继续」；压缩是优化而非正确性前提 |
@@ -96,6 +96,7 @@
 | D88 | artifact 路径唯一化：非默认会话以安全化的完整数据库文件名作 `artifact_name`，`outputs/`、`summaries/` 与归档目录 `history/<sid>/` 均在其下再嵌一层；默认会话 `artifact_name` 为空串 | 同目录多个显式 `--session` 会共用 `outputs`/`summaries` 并混放归档；统一 artifact 前缀让默认会话零变化、兼容既有路径 |
 | D89 | env 入口绝对化：`YAA_SESSION` 输出前绝对化；`--to` 与继承的 `YAA_NOTIFY`/`YAA_PARENT` 的相对值在解析目标时按 cwd 绝对化 | 相对值会随后续子进程 cwd 漂移，指向错误会话；在入口处一次性绝对化，规则单一且不改变已绝对值的语义 |
 | D90 | 断电保障分级：承诺「进程崩溃级 + fsync 约束下的断电级」，不承诺未 fsync 窗口与未落盘发布，真机器断电需 dm-log-writes；限定项（edges 表、daemon、向量检索、真断电、保留策略）明确为升级判据 | 避免把「SQLite 事务 + 原子 rename」误读为任意断电无损；把不可验证的承诺写成限制与升级条件，既诚实又给出何时引入重武器的判据 |
+| D91 | 可选 `[hooks] estimate`：仅有纯启发式估算已超阈值时调用；把本次投影的全部文本字段去重后以 JSON 字符串数组写入钩子 stdin，钩子须在 stdout 返回等长 JSON 整数数组；结果按「记录数 + 末条 id + 前驱摘要 id」跨步缓存；超时/非零/解析失败回退内置并只告警一次 | 允许外接精确 tokenizer 而不引入重依赖；批处理避免逐字段启动进程；失败不阻断回合，且永久禁用避免每步重复付出失败开销 |
 
 > D6–D8、D11 中「提示词钩子」的描述已被 D19 取代：现仅存 `init` 与 `llm` 两个钩子；D5 的 `yaa-shell` 已按 D14 改名 `yaa-exec`。D31–D35 为阶段 1 修复轮落地的行为修正，其中 D31、D32 涉及投影与记录 schema，D33–D35 为执行/存储语义。D48–D58 为阶段 3 设计讨论确认，D59–D67 为 SQLite 存储迁移确认，D68–D75 为阶段 4 单 runner 与多客户端注入确认，D76–D82 为阶段 5 notify 与后台任务确认，D83–D85 为阶段 5 终审修复确认，D86–D90 为阶段 6 断电恢复与不变量收口确认。
 
@@ -195,7 +196,7 @@ request_timeout_secs = 300
 enabled = true
 threshold_ratio = 0.8        # 投影超过窗口 × 该比例即触发压缩
 retain_ratio = 0.16          # 逐字保留的近期尾部（窗口比例）；须 < threshold_ratio
-chars_per_token = 4          # token 估算密度（已知低估 CJK）
+chars_per_token = 4          # ASCII token 估算密度；非 ASCII（CJK/emoji 等）每码点 1 token
 max_tokens = 8192            # 摘要调用输出上限
 prune_threshold_chars = 8192 # 工具消息正文超过此码点数才修剪
 prune_head_chars = 4096      # 修剪保留的头部码点数
@@ -498,7 +499,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 验收：
 
 1. 配置：`[compaction]` 全字段解析与校验（比例 ∈ (0,1]、`retain_ratio < threshold_ratio`、`chars_per_token ≥ 1`、`prune_head + prune_tail + 标记 ≤ prune_threshold`、`enabled` 布尔）；`llm` 配置的 `context_window` 解析与校验，缺失时压缩静默禁用。
-2. token 估算：`chars_per_token` 生效；`content`、`tool_calls` 参数与 `reasoning` 计入。
+2. token 估算：ASCII 按 `chars_per_token`、非 ASCII 每码点 1 token，各字段独立取整后求和；`content`、`tool_calls` 参数与 `reasoning` 计入；含大量 CJK 的历史可在超出窗口前触发压缩；配置 `[hooks] estimate` 时预计算值优先、失败回退内置。
 3. pruner：仅 `tool` 消息被修剪、`system` 不受影响；未超 `prune_threshold_chars` 不动；修剪后码点数 ≤ 阈值且严格小于原文；按 Unicode 码点（不拆代理项对）。
 4. 选区间：稳定 `system` 头永不入区间；尾部按 `retain_tokens` 保留；切点回退到工具配对平衡；无可用区间返回 `None`（不产生空摘要）。
 5. 触发：投影低于阈值不压缩、不产生侧车文件；跨过阈值先 pruner，修剪后已低于阈值则跳过摘要。
@@ -596,7 +597,7 @@ yaa --no-store               # 本次运行使用临时会话，退出即淘
 5. 仅 POSIX（`sh -c`、`killpg`）；Windows 不在阶段 1 范围。
 6. **（永久限制）`outputs/` 无保留策略**：截断落盘的完整输出只增不减，磁盘可能无界增长；阶段 6 明确不做自动保留策略，用户报告磁盘问题时先用 `du`/`find` 手动查看占用再 prune（见「升级判据」）。
 7. 会话不承诺跨机迁移。
-8. token 估算按固定密度（`chars_per_token`，默认 4），仍低估 CJK（D52）。
+8. token 估算默认按字段级二分类（ASCII 按 `chars_per_token`，非 ASCII 每码点 1 token，D52）；未配置 `[hooks] estimate` 时，对高频中文词可能略高估、对多码点 emoji 可能高估，二者方向均偏保守；需要精确值时接入外部估算钩子（D91）。
 9. `reasoning` 落盘：思考内容进入会话文件，增大存储与隐私面（D23）。
 10. 思考回传仅覆盖 `reasoning_content` 系端点（DeepSeek/Kimi/Qwen/GLM）；Anthropic/Responses/Gemini 的签名类结构化 metadata 不支持（D24）。
 11. **（F12，阶段 5 已修复）展示与渲染对 `system` 的谓词已统一**：display、render 与 inbox 载荷校验都调用 `is_injectable_system`（当前仅 `source == "notify"`），不再各自判断 `source` 与 `content`/`output_files`。

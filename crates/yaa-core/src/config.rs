@@ -24,6 +24,8 @@ if [ -f "$GLB_CFG/AGENTS.md" ]; then "$YAA_BIN" --notify="用户总提示词" --
 "$YAA_BIN" --notify="当前环境" -- echo "工作目录：$(pwd)""#;
 /// 默认模型配置钩子。
 pub const DEFAULT_LLM: &str = "cat $YAA_CONFIG_HOME/llm.toml";
+/// 默认 token 估算钩子：空串表示禁用，回退内置启发式。
+const DEFAULT_ESTIMATE: &str = "";
 
 const DEFAULT_HOOK_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -66,6 +68,9 @@ pub struct ApprovalConfig {
 pub struct Hooks {
     pub init: String,
     pub llm: String,
+    /// 可选 token 估算钩子：stdin 收 JSON 字符串数组、stdout 回等长整数数组；
+    /// 空串表示禁用。
+    pub estimate: String,
     /// 单次钩子执行的硬超时（秒），覆盖启动与读尽输出的全过程。
     pub timeout_secs: u64,
 }
@@ -92,6 +97,7 @@ impl Default for Hooks {
         Self {
             init: DEFAULT_INIT.to_string(),
             llm: DEFAULT_LLM.to_string(),
+            estimate: DEFAULT_ESTIMATE.to_string(),
             timeout_secs: DEFAULT_HOOK_TIMEOUT_SECS,
         }
     }
@@ -184,6 +190,7 @@ struct RawConfig {
 struct RawHooks {
     init: Option<String>,
     llm: Option<String>,
+    estimate: Option<String>,
     timeout_secs: Option<u64>,
 }
 
@@ -268,6 +275,9 @@ fn merge(raw: RawConfig) -> anyhow::Result<Config> {
         }
         if let Some(value) = hooks.llm {
             config.hooks.llm = value;
+        }
+        if let Some(value) = hooks.estimate {
+            config.hooks.estimate = value;
         }
         if let Some(value) = hooks.timeout_secs {
             config.hooks.timeout_secs = value;
@@ -461,6 +471,26 @@ mod tests {
         // 旧的两条提示词钩子已删除：默认值里不再出现它们的名字。
         assert!(!DEFAULT_INIT.contains("system_prompt"));
         assert!(!DEFAULT_INIT.contains("user_prompt"));
+    }
+
+    #[test]
+    fn default_estimate_hook_is_disabled() {
+        assert_eq!(Hooks::default().estimate, DEFAULT_ESTIMATE);
+        assert!(Hooks::default().estimate.is_empty());
+    }
+
+    #[test]
+    fn hooks_estimate_can_be_overridden() {
+        let file = write_config("[hooks]\nestimate = \"estimate-tokens\"\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.hooks.estimate, "estimate-tokens");
+    }
+
+    #[test]
+    fn missing_hooks_section_keeps_estimate_empty() {
+        let file = write_config("[agent]\nmax_steps = 3\n");
+        let config = Config::load(file.path()).unwrap();
+        assert_eq!(config.hooks.estimate, DEFAULT_ESTIMATE);
     }
 
     #[test]

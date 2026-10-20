@@ -16,7 +16,7 @@ pub mod region;
 pub mod summary;
 pub mod token;
 
-pub use token::Estimator;
+pub use token::{Estimator, PrecomputedMap};
 
 use std::future::Future;
 use std::pin::Pin;
@@ -94,10 +94,13 @@ pub struct Plan {
 ///
 /// 摘要回调 `summarizer` 只在确需新摘要时被调用一次。返回的 [`Plan::messages`]
 /// 即最终请求体，[`Plan::entry`] 由调用方落盘（本函数不写文件，便于纯逻辑单测）。
+// 参数数量由编排者规定的固定签名决定；后续若再扩张再考虑收拢为参数结构体。
+#[allow(clippy::too_many_arguments)]
 pub async fn compact<S: Summarizer>(
     records: &[Record],
     model: &str,
     estimator: &Estimator,
+    precomputed: Option<&token::PrecomputedMap>,
     budgets: &Budgets,
     cfg: &CompactionConfig,
     previous: Option<&cache::SummaryEntry>,
@@ -130,7 +133,7 @@ pub async fn compact<S: Summarizer>(
         message: summary::checkpoint_message(&entry.summary),
     });
 
-    if estimator.estimate_messages(&messages) < budgets.threshold_tokens {
+    if estimator.estimate_messages(&messages, precomputed) < budgets.threshold_tokens {
         return Plan {
             messages,
             applied: applied_previous,
@@ -143,7 +146,7 @@ pub async fn compact<S: Summarizer>(
     let prune_budgets = prune::PruneBudgets::from_config(cfg);
     let mut pruned = messages;
     prune::prune_messages(&mut pruned, &prune_budgets);
-    if estimator.estimate_messages(&pruned) < budgets.threshold_tokens {
+    if estimator.estimate_messages(&pruned, precomputed) < budgets.threshold_tokens {
         return Plan {
             messages: pruned,
             applied: applied_previous,
@@ -157,11 +160,11 @@ pub async fn compact<S: Summarizer>(
     let mut view_tokens: Vec<usize> = Vec::with_capacity(body_records.len() + 1);
     let mut view_boundaries: Vec<bool> = Vec::with_capacity(body_records.len() + 1);
     if let Some(entry) = previous {
-        view_tokens.push(estimator.estimate_text(&entry.summary));
+        view_tokens.push(estimator.estimate_text_with(&entry.summary, precomputed));
         view_boundaries.push(true);
     }
     for record in body_records {
-        view_tokens.push(estimator.estimate_record(record));
+        view_tokens.push(estimator.estimate_record(record, precomputed));
         view_boundaries.push(region::is_step_boundary(record));
     }
 
@@ -217,7 +220,9 @@ pub async fn compact<S: Summarizer>(
         }
     };
     let checkpoint = summary::checkpoint_message(&summary_text);
-    if estimator.estimate_message(&checkpoint) >= estimator.estimate_messages(&shadow_msgs) {
+    if estimator.estimate_message(&checkpoint, precomputed)
+        >= estimator.estimate_messages(&shadow_msgs, precomputed)
+    {
         return Plan {
             messages: pruned,
             applied: applied_previous,
@@ -239,7 +244,7 @@ pub async fn compact<S: Summarizer>(
         covers: covers.clone(),
         summary: summary_text,
         created_ts: yaa_msg::now_ms(),
-        tokens: Some(estimator.estimate_message(&checkpoint)),
+        tokens: Some(estimator.estimate_message(&checkpoint, precomputed)),
     };
     Plan {
         messages: final_messages,
@@ -349,6 +354,7 @@ mod tests {
             &records,
             "m",
             &estimator(),
+            None,
             &budgets(10_000, 5),
             &cfg(),
             None,
@@ -370,6 +376,7 @@ mod tests {
             &records,
             "m",
             &estimator(),
+            None,
             &budgets(400, 40),
             &cfg(),
             None,
@@ -382,8 +389,11 @@ mod tests {
         assert_eq!(entry.covers, applied.covered);
         assert!(entry.summary.contains("Primary Request"));
         // 摘要替换了被遮蔽区间：投影体积应显著小于原文。
-        let before: usize = records.iter().map(|r| estimator().estimate_record(r)).sum();
-        let after = estimator().estimate_messages(&plan.messages);
+        let before: usize = records
+            .iter()
+            .map(|r| estimator().estimate_record(r, None))
+            .sum();
+        let after = estimator().estimate_messages(&plan.messages, None);
         assert!(after < before, "压缩后投影应更小：{after} vs {before}");
         assert_eq!(summarizer.calls().len(), 1);
     }
@@ -409,6 +419,7 @@ mod tests {
             &records,
             "m",
             &estimator(),
+            None,
             &budgets(100, 5),
             &compact_cfg,
             None,
@@ -438,6 +449,7 @@ mod tests {
             &records,
             "m",
             &estimator(),
+            None,
             &budgets(400, 40),
             &cfg(),
             None,
@@ -462,6 +474,7 @@ mod tests {
             &records,
             "m",
             &estimator(),
+            None,
             &budgets(400, 40),
             &cfg(),
             None,
@@ -481,6 +494,7 @@ mod tests {
             &grown,
             "m",
             &estimator(),
+            None,
             &budgets(400, 40),
             &cfg(),
             Some(&entry),
@@ -529,6 +543,7 @@ mod tests {
             &records,
             "m",
             &estimator(),
+            None,
             &budgets(400, 40),
             &cfg(),
             Some(&stale),
@@ -576,6 +591,7 @@ mod tests {
             &records,
             "m",
             &estimator(),
+            None,
             &budgets(300, 30),
             &cfg(),
             None,
