@@ -1,4 +1,4 @@
-# YAA 智能体设计
+# XIDONG 智能体设计
 
 设想一个基于 Rust 的极致轻量的智能体（AI Agent）。
 每个模块都分 crate 开发，先用 Cargo workspace 管理，边界稳定后考虑拆分仓库。
@@ -6,7 +6,7 @@
 > 本文是构想稿。实现现状，以及本文与实现的已知不一致处，以 [`docs/plan.md`](plan.md) 为准。
 > 其在“对 design.md 的更正”部分逐条列出。
 
-用 `yaa` 运行的非交互式命令。
+用 `xidong` 运行的非交互式命令。
 
 ## 模块设计
 
@@ -15,24 +15,24 @@
 
 可能先做三到四个 crate 吧：
 
-- `yaa-cli`：参数解析、入口、展示渲染、stdout/stderr 策略；`yaa --notify` 的写入路径也在此短路。
-- `yaa-core`：智能体循环（Agent loop）、工具定义（`tools`）、模型调用、消息模型、渲染与展示投影、上下文分层装配（见 [`dsh-context.md`](dsh-context.md)）。
-- `yaa-store`：会话 SQLite 事件库、归档、加载、文件锁，以及文件 inbox/spool 的原子发布与扫描。
-- `yaa-exec`：Shell 执行机制，负责进程组、超时、流式截断、完整输出落盘；不含工具定义。
-- `yaa-msg`：消息类型。
+- `xidong::cli`：参数解析、入口、展示渲染、stdout/stderr 策略；`xidong --notify` 的写入路径也在此短路。
+- `xidong::core`：智能体循环（Agent loop）、工具定义（`tools`）、模型调用、消息模型、渲染与展示投影、上下文分层装配（见 [`dsh-context.md`](dsh-context.md)）。
+- `xidong::store`：会话 SQLite 事件库、归档、加载、文件锁，以及文件 inbox/spool 的原子发布与扫描。
+- `xidong::exec`：Shell 执行机制，负责进程组、超时、流式截断、完整输出落盘；不含工具定义。
+- `xidong::msg`：消息类型。
 
-唯一工具的全部知识——function schema、提示词片段、参数解析、错误文案、调用编排与结果转换——集中在 `yaa-core::tools`，不跨 crate 维护；`yaa-exec` 只是被它调用的执行机制。单工具场景不引入 trait/registry 与模板引擎。
+唯一工具的全部知识——function schema、提示词片段、参数解析、错误文案、调用编排与结果转换——集中在 `xidong::core::tools`，不跨 crate 维护；`xidong::exec` 只是被它调用的执行机制。单工具场景不引入 trait/registry 与模板引擎。
 
-向上下文注入内容只有一条外部接口：`yaa --notify` 把外部产出（初始化脚本、后台任务、用户管道）写成 `system` 事件。系统提示词不再走专用的钩子记录，而是空会话初始化脚本调用 `yaa --notify` 写入的普通事件；`llm` 配置加载不进入上下文，也不留记录。
+向上下文注入内容只有一条外部接口：`xidong --notify` 把外部产出（初始化脚本、后台任务、用户管道）写成 `system` 事件。系统提示词不再走专用的钩子记录，而是空会话初始化脚本调用 `xidong --notify` 写入的普通事件；`llm` 配置加载不进入上下文，也不留记录。
 
 ## 历史消息
 
 历史消息管理框架模块把历史消息作为事件序列存储：每会话一个 SQLite 库，`events` 表 append-only，每行 `payload` 保存一条完整记录的 JSON，`type`/`ts` 由 SQLite 生成列从 `payload` 派生。
 
 ```json
-{"type":"system","ts":...,"id":"01J...","source":"notify","origin":"/abs/path/to/sessions/<sid>/session.db","command":"\"$YAA_BIN\" --get-prompt system","content":"<系统提示词>\n当前智能体环境是 YAA，一个以 Shell 为唯一工具的智能体。……\n</系统提示词>"}
+{"type":"system","ts":...,"id":"01J...","source":"notify","origin":"/abs/path/to/sessions/<sid>/session.db","command":"\"$XIDONG_BIN\" --get-prompt system","content":"<系统提示词>\n当前智能体环境是 XIDONG，一个以 Shell 为唯一工具的智能体。……\n</系统提示词>"}
 {"type":"system","ts":...,"id":"01J...","source":"notify","command":"cat \"$GLB_CFG/AGENTS.md\"","content":"<用户总提示词>\n……AGENTS.md 内容……\n</用户总提示词>"}
-{"type":"system","ts":...,"id":"01J...","source":"notify","command":"echo \"工作目录：$(pwd)\"","content":"<当前环境>\n工作目录：/home/pj568/项目/yaa\n</当前环境>"}
+{"type":"system","ts":...,"id":"01J...","source":"notify","command":"echo \"工作目录：$(pwd)\"","content":"<当前环境>\n工作目录：/home/pj568/项目/xidong\n</当前环境>"}
 {"type":"system","ts":...,"id":"01J...","source":"init","content":""}
 {"type":"user","ts":...,"id":"01J...","content":"你好"}
 {"type":"ai","ts":...,"id":"01J...","model":"...","tool_schema_hash":"...","content":"...","reasoning":"..."}
@@ -47,7 +47,7 @@
 >
 > `ts` 为 Unix 毫秒；`id` 为 ULID，全记录唯一；`tool_result` 用 `call_id` 与 `tool_call` 配对。
 >
-> `system` 事件是内容进入上下文的唯一通道：`source=notify` 承载 `yaa --notify` 写入的通知，正文内联 `<注释>` 信封（呈献给模型时即此文本）；`source=init` 是空会话初始化的簿记，`content` 为空、不渲染。可选 `command` 保存产生该通知的命令，展示时以 `% 命令` 呈现，投影时以 `[执行命令]` 前缀进入上下文（D31）；stdin 形态与簿记没有此项。阶段 5 另加归因字段：`origin` 为发布者会话库绝对路径（`--notify` 总是写），`call_id` 为产生本次通知的工具调用 id（仅继承值合法时写），二者均可缺省。注入内容的渲染角色由事件在日志中的**物理位置**决定，不依赖额外字段；哪些 `system` 可注入统一由 `is_injectable_system` 判定（见「环境链与多智能体通知」）。
+> `system` 事件是内容进入上下文的唯一通道：`source=notify` 承载 `xidong --notify` 写入的通知，正文内联 `<注释>` 信封（呈献给模型时即此文本）；`source=init` 是空会话初始化的簿记，`content` 为空、不渲染。可选 `command` 保存产生该通知的命令，展示时以 `% 命令` 呈现，投影时以 `[执行命令]` 前缀进入上下文（D31）；stdin 形态与簿记没有此项。阶段 5 另加归因字段：`origin` 为发布者会话库绝对路径（`--notify` 总是写），`call_id` 为产生本次通知的工具调用 id（仅继承值合法时写），二者均可缺省。注入内容的渲染角色由事件在日志中的**物理位置**决定，不依赖额外字段；哪些 `system` 可注入统一由 `is_injectable_system` 判定（见「环境链与多智能体通知」）。
 
 过往历史消息不可变，上下文只是基于历史消息构造的渲染视图。
 渲染时语义转换为对应接口格式的消息，所以模型始终看到的是结构和内容合规的上下文。
@@ -66,21 +66,21 @@
 压缩只发生在渲染阶段，原始事件库不变。
 压缩保留未完成工具调用。
 
-每一次执行 `yaa "……"` 都默认接着当前目录下已存在的会话历史消息继续，除非 `yaa --clear`。
+每一次执行 `xidong "……"` 都默认接着当前目录下已存在的会话历史消息继续，除非 `xidong --clear`。
 
 工具调用输出过长时，中间部分被截去，并产生包含完整输出的外部文件。
 
 目录结构：
 
 ```plaintext
-$YAA_CONFIG_HOME/config.toml                                      # 配置根
-$YAA_DATA_HOME/sessions/<sid>/session.db                          # 主历史事件库（WAL 副产物 -wal/-shm 同目录）
-$YAA_DATA_HOME/sessions/<sid>/{runner,clear,init}.lock            # runner 选举 / clear 互斥 / 建库串行化
-$YAA_DATA_HOME/sessions/<sid>/outputs/<ulid>.{stdout,stderr}.out  # 截断后的完整输出
-$YAA_DATA_HOME/history/<sid>/sessions-<ts>.db                     # 主历史归档快照（VACUUM INTO）
+$XIDONG_CONFIG_HOME/config.toml                                      # 配置根
+$XIDONG_DATA_HOME/sessions/<sid>/session.db                          # 主历史事件库（WAL 副产物 -wal/-shm 同目录）
+$XIDONG_DATA_HOME/sessions/<sid>/{runner,clear,init}.lock            # runner 选举 / clear 互斥 / 建库串行化
+$XIDONG_DATA_HOME/sessions/<sid>/outputs/<ulid>.{stdout,stderr}.out  # 截断后的完整输出
+$XIDONG_DATA_HOME/history/<sid>/sessions-<ts>.db                     # 主历史归档快照（VACUUM INTO）
 ```
 
-> 状态根按 XDG 拆分：配置根 `$YAA_CONFIG_HOME`，数据根 `$YAA_DATA_HOME`（见 plan.md D10）。
+> 状态根按 XDG 拆分：配置根 `$XIDONG_CONFIG_HOME`，数据根 `$XIDONG_DATA_HOME`（见 plan.md D10）。
 >
 > 主循环每一步重读会话库；写入以一个 `BEGIN IMMEDIATE` 事务批量提交（WAL + `synchronous=FULL`），不逐条写。事务保证一批记录要么全部可见、要么全部不可见，因此不存在半行撕裂。
 >
@@ -88,12 +88,12 @@ $YAA_DATA_HOME/history/<sid>/sessions-<ts>.db                     # 主历史归
 
 ## 使用示例
 
-`yaa "……"` 一次运行内部可以循环多步，使用效果伪示例：
+`xidong "……"` 一次运行内部可以循环多步，使用效果伪示例：
 
 ```zsh
-$ yaa 你好吗？
+$ xidong 你好吗？
 # 系统提示词
-% "$YAA_BIN" --get-prompt system
+% "$XIDONG_BIN" --get-prompt system
 
 ---
 # 用户总提示词
@@ -106,17 +106,17 @@ $ yaa 你好吗？
 ---
 我很好，谢谢，您还有什么需要帮助的吗？
 
-$ yaa 不用了，只是确认是否能正常回复。
+$ xidong 不用了，只是确认是否能正常回复。
 好的，需要帮助时随时叫我。
 
-$ yaa --clear
+$ xidong --clear
 # 归档历史消息（内部完成，不调用工具或钩子）
-$YAA_DATA_HOME/history/<sid>/sessions-<ts>.db
+$XIDONG_DATA_HOME/history/<sid>/sessions-<ts>.db
 
 $ cd /home/pj568/桌面
-$ yaa 不用子智能体，帮我查未来五天的天气并写入到文件 \`/home/pj568/桌面/temp.txt\`。
+$ xidong 不用子智能体，帮我查未来五天的天气并写入到文件 \`/home/pj568/桌面/temp.txt\`。
 # 系统提示词
-% "$YAA_BIN" --get-prompt system
+% "$XIDONG_BIN" --get-prompt system
 
 ---
 # 用户总提示词
@@ -136,13 +136,13 @@ $ yaa 不用子智能体，帮我查未来五天的天气并写入到文件 \`/h
 2. 你告诉我要查询的具体地点；
 3. 其它，你来说。
 
-$ yaa 按网络定位。
+$ xidong 按网络定位。
 # 获取 IP 所在位置
-% yaa-webfetch https://ipinfo.io/json
+% xidong-webfetch https://ipinfo.io/json
 
 ---
 # 获取所在位置未来天气预报
-% yaa-webfetch https://api.open-meteo.com/v1/forecast?latitude=22.4821&longitude=113.8850&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max&timezone=Asia%2FShanghai&forecast_days=6
+% xidong-webfetch https://api.open-meteo.com/v1/forecast?latitude=22.4821&longitude=113.8850&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max&timezone=Asia%2FShanghai&forecast_days=6
 
 ---
 # 检查文件存在情况
@@ -166,12 +166,12 @@ EOF
 
 `/home/pj568/桌面/temp.txt`
 
-$ yaa 我已查看，删掉它。
+$ xidong 我已查看，删掉它。
 # 删除 temp.txt（阶段 2：命中规则后拦截）
 % rm /home/pj568/桌面/temp.txt
 匹配到 `rm`，是否批准执行 `rm /home/pj568/桌面/temp.txt`？
 
-$ yaa --approve
+$ xidong --approve
 # 删除 temp.txt
 % rm /home/pj568/桌面/temp.txt
 
@@ -187,43 +187,43 @@ $ yaa --approve
 
 初始化注入与外部通知都用与工具调用一致的块样式展示：默认 `# 注释` + `% 命令`（摘要），`--verbose` 追加内容全文；初始化只在空会话触发一次，`llm` 配置加载不展示。
 
-本节是使用效果示意，非逐字规范：具体参数以下文“参数（待定）”为准，实现状态见 `docs/plan.md`。示例里的 `yaa-webfetch` 是外部辅助命令，不属于 `yaa` 自带工具；提示词打印已定为 `yaa --get-prompt` 子命令。
+本节是使用效果示意，非逐字规范：具体参数以下文“参数（待定）”为准，实现状态见 `docs/plan.md`。示例里的 `xidong-webfetch` 是外部辅助命令，不属于 `xidong` 自带工具；提示词打印已定为 `xidong --get-prompt` 子命令。
 
 ## 参数（待定）
 
-阶段 1 已实现 `--status`/`--session`/`--clear`/`--verbose`/`--quiet`/`--get-prompt`/`--cwd`/`--config`，以及 `--notify` 的写入形态；`--json`/`--no-store`/`--approve` 属阶段 2；`--notify` 的跨会话目标解析（`--to`/`YAA_NOTIFY`/`YAA_PARENT`）已于阶段 5 实现。
+阶段 1 已实现 `--status`/`--session`/`--clear`/`--verbose`/`--quiet`/`--get-prompt`/`--cwd`/`--config`，以及 `--notify` 的写入形态；`--json`/`--no-store`/`--approve` 属阶段 2；`--notify` 的跨会话目标解析（`--to`/`XIDONG_NOTIFY`/`XIDONG_PARENT`）已于阶段 5 实现。
 
 ```plaintext
-yaa [PROMPT]...              # 多个位置参数以空格连接；空则从 stdin 读
-yaa -- "[PROMPT]"            # 同上
-yaa --status                 # 看会话摘要
-yaa --session $path_to/session.db
-yaa --clear                  # 归档当前目录的会话；若已有 runner 在跑，此时再运行 `yaa "内容"` 会把消息排入 inbox 并跟随输出到循环结束（阶段 4 已实现）。
-yaa --verbose                # 追加思考内容与命令输出
-yaa --quiet                  # 仅打印最终结果输出
-yaa --get-prompt system      # 仅打印内置系统提示词
-yaa --notify="注释" -- cmd   # 执行 cmd，把输出作为通知写入当前会话
-cmd | yaa --notify="注释"    # 从 stdin 读，写入当前会话
-yaa --notify="注释" --to $path_to/session.db -- cmd  # 写入显式目标会话（必须已存在）
-cmd | yaa --notify="注释" --to "$YAA_PARENT"         # 回注父会话
-yaa --json                   # 结构化事件
-yaa --approve                # 同意一次
-yaa --cwd="……"               # 设置会话目录
-yaa --no-store
-yaa --config $path_to/config.toml
+xidong [PROMPT]...              # 多个位置参数以空格连接；空则从 stdin 读
+xidong -- "[PROMPT]"            # 同上
+xidong --status                 # 看会话摘要
+xidong --session $path_to/session.db
+xidong --clear                  # 归档当前目录的会话；若已有 runner 在跑，此时再运行 `xidong "内容"` 会把消息排入 inbox 并跟随输出到循环结束（阶段 4 已实现）。
+xidong --verbose                # 追加思考内容与命令输出
+xidong --quiet                  # 仅打印最终结果输出
+xidong --get-prompt system      # 仅打印内置系统提示词
+xidong --notify="注释" -- cmd   # 执行 cmd，把输出作为通知写入当前会话
+cmd | xidong --notify="注释"    # 从 stdin 读，写入当前会话
+xidong --notify="注释" --to $path_to/session.db -- cmd  # 写入显式目标会话（必须已存在）
+cmd | xidong --notify="注释" --to "$XIDONG_PARENT"         # 回注父会话
+xidong --json                   # 结构化事件
+xidong --approve                # 同意一次
+xidong --cwd="……"               # 设置会话目录
+xidong --no-store
+xidong --config $path_to/config.toml
 ……
 ```
 
 ## 审批（阶段 2）
 
-`yaa --approve` 同意最旧的未决（尚未批准或拒绝）`pending` 命令执行并继续智能体循环，一次性调用多个命令都被拦截时需连续执行多次此命令。
+`xidong --approve` 同意最旧的未决（尚未批准或拒绝）`pending` 命令执行并继续智能体循环，一次性调用多个命令都被拦截时需连续执行多次此命令。
 
 用户直接发新提示词时，pending 自动 deny。
 
 ## 配置文件
 
-配置文件 `$YAA_CONFIG_HOME/config.toml` 内配置钩子命令、命令和目录拦截放行规则、压缩触发条件、timeout 和 max-steps 什么的。
-钩子只有两个：`init`（空会话初始化，内容经 `yaa --notify` 写入上下文）与 `llm`（模型供应配置，不进入上下文）。默认命令均可替换。`llm` 输出的配置含 `endpoint_format`，用于决定思考内容是否回传（见 [`plan.md`](plan.md) D24）。
+配置文件 `$XIDONG_CONFIG_HOME/config.toml` 内配置钩子命令、命令和目录拦截放行规则、压缩触发条件、timeout 和 max-steps 什么的。
+钩子只有两个：`init`（空会话初始化，内容经 `xidong --notify` 写入上下文）与 `llm`（模型供应配置，不进入上下文）。默认命令均可替换。`llm` 输出的配置含 `endpoint_format`，用于决定思考内容是否回传（见 [`plan.md`](plan.md) D24）。
 
 阶段 1 已实现钩子命令、timeout 与 max-steps；拦截放行规则属阶段 2，压缩触发条件属阶段 3。
 
@@ -233,31 +233,31 @@ yaa --config $path_to/config.toml
 
 ## 通知与后台任务
 
-`yaa --notify` 是内容进入会话的外部接口（写入形态属阶段 1，后台与跨会话语义已于阶段 5 实现）：
+`xidong --notify` 是内容进入会话的外部接口（写入形态属阶段 1，后台与跨会话语义已于阶段 5 实现）：
 
-- `yaa --notify="注释" -- cmd`：执行命令，把 stdout 作为通知写入会话。
-- `cmd | yaa --notify="注释"`：从 stdin 读内容写入。
+- `xidong --notify="注释" -- cmd`：执行命令，把 stdout 作为通知写入会话。
+- `cmd | xidong --notify="注释"`：从 stdin 读内容写入。
 - 注释可省略，缺省为「由用户执行」；通知正文内联 `<注释>` 信封。
 
 `system(source=notify)` 事件不被夹在模型的 `assistant.tool_calls` 与配对 `tool` 消息之间，因此是「离群」的；渲染时自动转换为呈现层信封，见上文渲染规则。
 
-模型可以让 shell 工具执行后台作业，但**必须把整条作业的 stdout/stderr 关闭或重定向**：`yaa-exec` 给工具自建进程组，直接子进程 `sh` 退出后仍会读取输出管道；后台进程若继续持有管道，读取宽限期（2 秒）到期后工具会对整组发 `SIGKILL`，内层 `yaa --notify` 永远来不及发布。因此推荐：
+模型可以让 shell 工具执行后台作业，但**必须把整条作业的 stdout/stderr 关闭或重定向**：`xidong::exec` 给工具自建进程组，直接子进程 `sh` 退出后仍会读取输出管道；后台进程若继续持有管道，读取宽限期（2 秒）到期后工具会对整组发 `SIGKILL`，内层 `xidong --notify` 永远来不及发布。因此推荐：
 
 ```shellscript
-{ some-cmd | yaa --notify="注释"; } >/dev/null 2>&1 &
+{ some-cmd | xidong --notify="注释"; } >/dev/null 2>&1 &
 # 或让后台作业脱离工具进程组
-setsid sh -c 'some-cmd | yaa --notify="注释"' >/dev/null 2>&1 &
+setsid sh -c 'some-cmd | xidong --notify="注释"' >/dev/null 2>&1 &
 ```
 
-两种形态都让 `shell` 工具立即拿到空输出；后台任务结束后，`yaa --notify` 进程把结果发布到会话的 inbox，由运行中的 runner 在安全点落库，模型在下一轮才看到它。通知结果的压缩复用工具调用的过长截断与外部完整输出文件。
+两种形态都让 `shell` 工具立即拿到空输出；后台任务结束后，`xidong --notify` 进程把结果发布到会话的 inbox，由运行中的 runner 在安全点落库，模型在下一轮才看到它。通知结果的压缩复用工具调用的过长截断与外部完整输出文件。
 
 后台子智能体复用同一方法，如：
 
 ```shellscript
-{ yaa --quiet --cwd .workspace/temp -- "你作为子智能体做某些任务。" \
-  | yaa --notify="子智能体" --to "$YAA_SESSION"; } >/dev/null 2>&1 &
+{ xidong --quiet --cwd .workspace/temp -- "你作为子智能体做某些任务。" \
+  | xidong --notify="子智能体" --to "$XIDONG_SESSION"; } >/dev/null 2>&1 &
 # 或让后台作业脱离工具进程组
-setsid sh -c 'yaa --quiet --cwd .workspace/temp -- "你作为子智能体做某些任务。" | yaa --notify="子智能体" --to "$YAA_SESSION"' >/dev/null 2>&1 &
+setsid sh -c 'xidong --quiet --cwd .workspace/temp -- "你作为子智能体做某些任务。" | xidong --notify="子智能体" --to "$XIDONG_SESSION"' >/dev/null 2>&1 &
 ```
 
 ### 环境链与多智能体通知（阶段 5）
@@ -266,32 +266,32 @@ setsid sh -c 'yaa --quiet --cwd .workspace/temp -- "你作为子智能体做某�
 
 身份拆分为三者：`self`（本会话）、`target`（本次通知目标）、`parent`（父会话）。通知只写目标会话的 inbox（发布失败且可重试时写 spool），不启动目标会话的模型。
 
-#### 环境变量与 `yaa_env`
+#### 环境变量与 `xidong_env`
 
-会话变量收敛到纯函数 `yaa-core::session::yaa_env(self_db, incoming_env, call_id)`：钩子（`hook_env`）、shell 工具 `extra_env` 与 `--approve` 执行路径共用它，消除「会话变量一处拼、限额变量另一处拼」的漂移；`YAA_NOTIFY_*` 限额仍由 shell 工具追加，不在本函数内。
+会话变量收敛到纯函数 `xidong::core::session::xidong_env(self_db, incoming_env, call_id)`：钩子（`hook_env`）、shell 工具 `extra_env` 与 `--approve` 执行路径共用它，消除「会话变量一处拼、限额变量另一处拼」的漂移；`XIDONG_NOTIFY_*` 限额仍由 shell 工具追加，不在本函数内。
 
 | 变量                  | 含义                       | 设置规则                                                                 |
 | --------------------- | -------------------------- | ------------------------------------------------------------------------ |
-| `YAA_SESSION`         | 本会话库绝对路径           | 每次 yaa 无条件重设为自己                                                |
-| `YAA_NOTIFY`          | 默认通知目标               | 默认本会话；继承值非空且 ≠ 自身 `YAA_SESSION` 时保留                     |
-| `YAA_PARENT`          | 父会话库绝对路径           | 优先保留继承的 `YAA_PARENT`（非空且 ≠ 自身，中间层）；否则取继承的 `YAA_SESSION`（非空且 ≠ 自身，孵化者）；都没有则不输出 |
-| `YAA_NOTIFY_CALL_ID`  | 产生当前工具调用的 id      | 仅 shell 工具执行时注入本次 `call.id`；钩子不注入                         |
+| `XIDONG_SESSION`         | 本会话库绝对路径           | 每次 xidong 无条件重设为自己                                                |
+| `XIDONG_NOTIFY`          | 默认通知目标               | 默认本会话；继承值非空且 ≠ 自身 `XIDONG_SESSION` 时保留                     |
+| `XIDONG_PARENT`          | 父会话库绝对路径           | 优先保留继承的 `XIDONG_PARENT`（非空且 ≠ 自身，中间层）；否则取继承的 `XIDONG_SESSION`（非空且 ≠ 自身，孵化者）；都没有则不输出 |
+| `XIDONG_NOTIFY_CALL_ID`  | 产生当前工具调用的 id      | 仅 shell 工具执行时注入本次 `call.id`；钩子不注入                         |
 
-- `run` 自身仍只按 `--session`/cwd 决定会话，不因继承的 `YAA_SESSION` 改变自己；对子进程，`YAA_SESSION` 无条件重设为本会话。
-- 继承的 `YAA_NOTIFY`（非空且 ≠ 自身）会保留：父的 shell 工具默认注入 `YAA_NOTIFY=父`，因此子智能体默认通知父；只继承 `YAA_SESSION` 而没有 `YAA_NOTIFY` 时默认通知自己。回自己用 `--to "$YAA_SESSION"`，回父用 `--to "$YAA_PARENT"`。
-- `YAA_PARENT` 为空时执行 `--to "$YAA_PARENT"` 得到空串，是用法错误（退出码 2），不会静默写入错误目标。
-- 子内部再次 spawn 时，`YAA_NOTIFY_CALL_ID` 覆盖为最近调用点；`origin` 始终是发布者自己的会话库。
+- `run` 自身仍只按 `--session`/cwd 决定会话，不因继承的 `XIDONG_SESSION` 改变自己；对子进程，`XIDONG_SESSION` 无条件重设为本会话。
+- 继承的 `XIDONG_NOTIFY`（非空且 ≠ 自身）会保留：父的 shell 工具默认注入 `XIDONG_NOTIFY=父`，因此子智能体默认通知父；只继承 `XIDONG_SESSION` 而没有 `XIDONG_NOTIFY` 时默认通知自己。回自己用 `--to "$XIDONG_SESSION"`，回父用 `--to "$XIDONG_PARENT"`。
+- `XIDONG_PARENT` 为空时执行 `--to "$XIDONG_PARENT"` 得到空串，是用法错误（退出码 2），不会静默写入错误目标。
+- 子内部再次 spawn 时，`XIDONG_NOTIFY_CALL_ID` 覆盖为最近调用点；`origin` 始终是发布者自己的会话库。
 
 #### `--to` 优先级与严格校验
 
-目标优先级从高到低：显式 `--to` → `--session` → `YAA_NOTIFY`（非空且 ≠ 自身）→ `YAA_SESSION`（非空）→ 当前 cwd 默认会话。
+目标优先级从高到低：显式 `--to` → `--session` → `XIDONG_NOTIFY`（非空且 ≠ 自身）→ `XIDONG_SESSION`（非空）→ 当前 cwd 默认会话。
 
 显式 `--to` 走固定阶梯，只报第一个失败（退出码 1，**绝不创建**目标目录或文件）：
 
 1. 绝对化后存在（文件或目录）；
 2. 目录 → 其中必须已有 `session.db`；
 3. 旧 `.jsonl` 报旧格式错误并提示 `--clear`；
-4. 文件必须是 yaa 会话库（SQLite 文件头与 store 的 `application_id`/`user_version`）；
+4. 文件必须是 xidong 会话库（SQLite 文件头与 store 的 `application_id`/`user_version`）；
 5. 会话未归档；
 6. 其余 IO 错误原样返回。
 
@@ -302,14 +302,14 @@ setsid sh -c 'yaa --quiet --cwd .workspace/temp -- "你作为子智能体做某�
 - `--to` 与 `--no-store` 同用；
 - `--to` 未与 `--notify` 同用（clap 校验）。
 
-显式 `--to` 或 `YAA_NOTIFY` 选中的目标一律按跨会话处理，写目标 `pending/`，即使它指向自身也不写 `init/`。`--approve` 不认 `--to`：其解析链是 `--session` → `YAA_SESSION` → cwd，`--to` 与 `--approve` 组合因 `--to` 要求 `--notify` 而被 clap 拒绝。
+显式 `--to` 或 `XIDONG_NOTIFY` 选中的目标一律按跨会话处理，写目标 `pending/`，即使它指向自身也不写 `init/`。`--approve` 不认 `--to`：其解析链是 `--session` → `XIDONG_SESSION` → cwd，`--to` 与 `--approve` 组合因 `--to` 要求 `--notify` 而被 clap 拒绝。
 
 #### 父子血缘与归因
 
 通知记录新增两个可选字段：
 
-- `System.origin`：发布者会话库的绝对路径。`--notify` **总是**写；有继承的 `YAA_SESSION` 时用其值，否则用解析出的自发会话。
-- `System.call_id`：产生本次通知的工具调用 id。仅当继承的 `YAA_NOTIFY_CALL_ID` 匹配 `[A-Za-z0-9_-]{1,128}` 时写，非法值静默忽略、不报错。
+- `System.origin`：发布者会话库的绝对路径。`--notify` **总是**写；有继承的 `XIDONG_SESSION` 时用其值，否则用解析出的自发会话。
+- `System.call_id`：产生本次通知的工具调用 id。仅当继承的 `XIDONG_NOTIFY_CALL_ID` 匹配 `[A-Za-z0-9_-]{1,128}` 时写，非法值静默忽略、不报错。
 
 两者都是 `Option` 且 `skip_serializing_if = "Option::is_none"`：旧 JSON 记录缺字段解析为 `None`，不需要 SQLite schema 迁移。归因字段只说明「谁发的」，不改变渲染分组。
 
@@ -329,26 +329,26 @@ setsid sh -c 'yaa --quiet --cwd .workspace/temp -- "你作为子智能体做某�
 
 ```shellscript
 # 父的 shell 工具内：整条后台作业重定向输出，子智能体完成后把结果回注到父会话
-{ yaa --quiet --cwd .workspace/dir -- "作为子智能体完成 <任务>" \
-  | yaa --notify="子智能体完成" --to "$YAA_SESSION"; } >/dev/null 2>&1 &
+{ xidong --quiet --cwd .workspace/dir -- "作为子智能体完成 <任务>" \
+  | xidong --notify="子智能体完成" --to "$XIDONG_SESSION"; } >/dev/null 2>&1 &
 
 # 或让后台作业脱离工具进程组
-setsid sh -c 'yaa --quiet --cwd .workspace/dir -- "作为子智能体完成 <任务>" | yaa --notify="子智能体完成" --to "$YAA_SESSION"' >/dev/null 2>&1 &
+setsid sh -c 'xidong --quiet --cwd .workspace/dir -- "作为子智能体完成 <任务>" | xidong --notify="子智能体完成" --to "$XIDONG_SESSION"' >/dev/null 2>&1 &
 
 # 或子自己回父
-yaa --notify="..." --to "$YAA_PARENT"
+xidong --notify="..." --to "$XIDONG_PARENT"
 ```
 
-后台作业必须关闭或重定向 stdout/stderr：`yaa-exec` 在直接子进程退出后读取输出管道，后台进程若继续持有管道，读取宽限期（2 秒）后会被整组 `SIGKILL`，内层通知永远不到达；`setsid` 形态则让作业脱离工具进程组。`&` 让任务立即转入后台，shell 工具马上返回；任务结束后通知进入 inbox，运行中的会话在下一个安全点消费，没有 runner 时留待下次 `yaa` 处理。`call_id` 沿环境链继承父的工具调用 id，子内部再 spawn 时覆盖为最近调用点。跨数据根允许：`output_files` 的相对路径基准按发布者的数据根解析（已知限制）。
+后台作业必须关闭或重定向 stdout/stderr：`xidong::exec` 在直接子进程退出后读取输出管道，后台进程若继续持有管道，读取宽限期（2 秒）后会被整组 `SIGKILL`，内层通知永远不到达；`setsid` 形态则让作业脱离工具进程组。`&` 让任务立即转入后台，shell 工具马上返回；任务结束后通知进入 inbox，运行中的会话在下一个安全点消费，没有 runner 时留待下次 `xidong` 处理。`call_id` 沿环境链继承父的工具调用 id，子内部再 spawn 时覆盖为最近调用点。跨数据根允许：`output_files` 的相对路径基准按发布者的数据根解析（已知限制）。
 
 ### 主循环召回
 
-`yaa --notify` 发布时持 `clear.lock` 共享锁做 generation 守卫并写文件 inbox；运行中的 runner 在安全点消费落库，未运行时留待下次启动。发布失败且可重试时降级 spool，由下次非跟随运行补投。`--clear` 持该锁的排他锁，因此归档与通知发布不会交错。
+`xidong --notify` 发布时持 `clear.lock` 共享锁做 generation 守卫并写文件 inbox；运行中的 runner 在安全点消费落库，未运行时留待下次启动。发布失败且可重试时降级 spool，由下次非跟随运行补投。`--clear` 持该锁的排他锁，因此归档与通知发布不会交错。
 
 | 状态         | 收到 `system` 消息的时机 |
 | ------------ | ------------------------ |
 | 主循环运行中 | 主循环的下一个循环开始时 |
-| 主循环已退出 | 下次该目录 `yaa` 启动时  |
+| 主循环已退出 | 下次该目录 `xidong` 启动时  |
 
 ## 单 runner 与多客户端注入（阶段 4，已实现）
 
@@ -357,7 +357,7 @@ yaa --notify="..." --to "$YAA_PARENT"
 ### 目标
 
 - 同一会话同一时刻只有一个 runner（`runner.lock` 排他 `flock`）。
-- 已有 runner 运行时，再执行 `yaa "内容"` 不启动第二个 runner，而是把消息发布到 inbox 并跟随。
+- 已有 runner 运行时，再执行 `xidong "内容"` 不启动第二个 runner，而是把消息发布到 inbox 并跟随。
 - 新消息先进入 inbox，由 runner 在安全点插入主历史。
 - 插入发生在当前工具调用批次全部结束后，不打断 `tool_call` / `tool_result` 配对。
 - 注入客户端默认跟随主历史输出，直到本轮工作排空。
@@ -366,7 +366,7 @@ yaa --notify="..." --to "$YAA_PARENT"
 ### 文件布局
 
 ```plaintext
-$YAA_DATA_HOME/sessions/<sid>/
+$XIDONG_DATA_HOME/sessions/<sid>/
   session.db             # 主历史事件库，只由 runner 写
   runner.lock            # runner 选举锁（flock 排他）
   clear.lock             # clear 排他 / inbox 发布共享
@@ -435,9 +435,9 @@ fn run(prompt) {
 {"type":"user","id":"01J...","ts":...,"client_id":"cli_x","turn_id":"turn_x","content":"你好"}
 ```
 
-`--notify` 的 system 消息走同一 inbox：普通调用写 `pending/`，init 钩子内（环境变量 `YAA_INBOX_PHASE=init`）写 `init/`。
+`--notify` 的 system 消息走同一 inbox：普通调用写 `pending/`，init 钩子内（环境变量 `XIDONG_INBOX_PHASE=init`）写 `init/`。
 
-`--notify` **只发布**：执行命令前短暂持 `clear.lock` 共享锁做归档预检并捕获 generation，命令执行期间不持锁（避免内嵌 `yaa --clear` 死锁）；发布时再由 `publish_with_generation` 持共享锁校验 generation。预检或发布遇 BUSY/IO 时降级写 spool，命令退出码保持不变；真归档（generation 变化且不是 0→1 建库）等终态拒绝写入并返回 1。它不抢 `runner.lock`、不跟随、不跑 `init`/`llm` 钩子、不执行 agent loop；退出码来自命令本身。
+`--notify` **只发布**：执行命令前短暂持 `clear.lock` 共享锁做归档预检并捕获 generation，命令执行期间不持锁（避免内嵌 `xidong --clear` 死锁）；发布时再由 `publish_with_generation` 持共享锁校验 generation。预检或发布遇 BUSY/IO 时降级写 spool，命令退出码保持不变；真归档（generation 变化且不是 0→1 建库）等终态拒绝写入并返回 1。它不抢 `runner.lock`、不跟随、不跑 `init`/`llm` 钩子、不执行 agent loop；退出码来自命令本身。
 
 ### 主循环安全点
 
@@ -456,7 +456,7 @@ fn run(prompt) {
 5. 消费 own；
 6. 解析 `llm` 钩子后进入主循环。
 
-主循环（示意；实际实现见 `crates/yaa-core/src/agent.rs` 的 `run_loop`）：
+主循环（示意；实际实现见 `src/core.rs/src/agent.rs` 的 `run_loop`）：
 
 ```rust
 fn run_loop(session, runner_guard) {
@@ -494,7 +494,7 @@ fn run_loop(session, runner_guard) {
 
 效果：
 
-- runner 执行工具时，第二个 `yaa` 把消息发布到 `inbox/pending/`。
+- runner 执行工具时，第二个 `xidong` 把消息发布到 `inbox/pending/`。
 - runner 不在工具中间插入消息。
 - 当前工具批次全部 `tool_result` 写完后，下一轮循环开头消费 inbox。
 - 新 user 消息被追加到 `session.db` 的 `tool_result` 之后，下一次模型调用自然看到它。
@@ -527,7 +527,7 @@ fn consume_inbox(session) -> bool {
 
 ### 跟随与接管
 
-已有 runner 时，第二个 `yaa` 进入跟随模式，只读、不写历史、不跑钩子、不执行工具：
+已有 runner 时，第二个 `xidong` 进入跟随模式，只读、不写历史、不跑钩子、不执行工具：
 
 - 启动水位是发布 own 时同一 `clear.lock` 临界区内捕获的 `(baseline_gen, start_seq)`，因此不回放历史；
 - 用 `read_after_with_generation` 增量读取，退避从 20 ms 起翻倍至 250 ms 封顶，有记录时重置为 20 ms，并加 ±20% 抖动；
@@ -535,7 +535,7 @@ fn consume_inbox(session) -> bool {
 - 每次读取都校验返回的 `generation`：真归档（变化且不是 `0→1` 建库）提示「会话已归档」并以 0 退出；`0→1` 视为首次建库，重置 `next_seq = 0` 后继续；
 - 非阻塞尝试获取 `runner.lock`；抢到后**复检 generation**，再补读旧 runner 释放前的最后一批，消除「读水位后、抢锁前被 clear」的竞态；
 - 若 own 已落库、inbox 为空、无未决审批且历史空闲 → 释放锁退出 0；最终回复由 CLI 按 own id 定位其后的第一条轮末 `ai` 打印；
-- 若 own 已落库、存在未决审批且 inbox 不含新 `User` → 用 `PendingPolicy::Keep`，提示运行 `yaa --approve` 并留在跟随，**不替用户拒绝**；
+- 若 own 已落库、存在未决审批且 inbox 不含新 `User` → 用 `PendingPolicy::Keep`，提示运行 `xidong --approve` 并留在跟随，**不替用户拒绝**；
 - 其余情形调用 `run_takeover` 接管。接管**只尝试一次**：有新的 `User` 时用 `PendingPolicy::Abandon` 作废旧待批，否则用 `Keep`；接管失败即退出并保留 inbox 消息，不丢消息。
 
 接管复用 `run_queued` 的消费顺序。own 可能已被旧 runner 消费，按 id 幂等去重，不会重复插入。
@@ -585,12 +585,12 @@ runner 退出条件（排空式，一次启动处理到满足为止）：
 
 #### 不变量检查器与崩溃矩阵
 
-`yaa-core::test_support` 提供两个纯查询入口，供 e2e/harness 与单测共用：
+`xidong::core::test_support` 提供两个纯查询入口，供 e2e/harness 与单测共用：
 
 - `check_consistency(&Session)`：任意时刻应成立的结构不变量——无重复记录 `id`、`seq` 严格递增、同一 `call_id` 至多一条成功（`code == 0`）`tool_result`、`approval_resolved` 必有同 `call_id` 的 `approval_pending`、`tool_call` 的 `call_id` 唯一。
 - `check_converged(&Session)`：在一致性之上追加收敛态要求——无孤儿 `tool_call`、无未决 `approval_pending`、`inbox/{pending,init}` 与 `spool` 无待消费 `.json`、`runner.lock` 可被独占获取（获取后立即释放）。
 
-两者复用 `crates/yaa-core/src/agent.rs` 的 `orphan_tool_calls`/`unresolved_pending` 谓词，避免配对语义漂移。`crates/yaa-cli/tests/crash.rs` 以手工构造崩溃后磁盘状态（B 状态注入）为主、随机 `kill -9` 烟雾（A）为辅，用真实二进制重试；每个场景结束时调用检查器——未收敛态用 `check_consistency`，成功重试后用 `check_converged`。
+两者复用 `src/core.rs/src/agent.rs` 的 `orphan_tool_calls`/`unresolved_pending` 谓词，避免配对语义漂移。`./tests/crash.rs` 以手工构造崩溃后磁盘状态（B 状态注入）为主、随机 `kill -9` 烟雾（A）为辅，用真实二进制重试；每个场景结束时调用检查器——未收敛态用 `check_consistency`，成功重试后用 `check_converged`。
 
 注入点 → 测试名映射（与 `crash.rs` 文件头一致）：
 
@@ -617,17 +617,17 @@ runner 退出条件（排空式，一次启动处理到满足为止）：
 
 - **展示水位改为 `seq`**：`History` 平行保存记录与其 `seq`，`last_seq()` 取末条 `seq`，`emit_new` 用 `partition_point` 定位第一条 `seq >` 水位的记录。归档清空后主库 `seq` 从 1 重新起算（`generation` 递增），因此水位比较基于 `seq` 值而非记录下标，旧水位超前于当前最大 `seq` 时从 0 起按全量新历史展示。
 - **artifact 路径唯一化**：非默认会话（数据库文件名不是 `session.db`）把安全化后的完整文件名作为 `artifact_name`，`outputs/`、`summaries/` 与归档目录 `history/<sid>/` 都在其下再嵌一层，使同一目录下的多个显式会话互不混放；默认会话 `artifact_name` 为空串，路径与旧行为完全一致。
-- **env 入口绝对化**：`YAA_SESSION` 在输出前绝对化；`--to` 与继承的 `YAA_NOTIFY`/`YAA_PARENT` 若是相对路径，在解析通知目标时按当前 cwd 绝对化，不再随后续子进程的 cwd 漂移。
+- **env 入口绝对化**：`XIDONG_SESSION` 在输出前绝对化；`--to` 与继承的 `XIDONG_NOTIFY`/`XIDONG_PARENT` 若是相对路径，在解析通知目标时按当前 cwd 绝对化，不再随后续子进程的 cwd 漂移。
 
 #### 崩溃语义与恢复流程
 
-SQLite 事务消除了「撕裂尾行」问题：一批记录要么全部提交、要么全部不可见，断电只可能丢掉尚未提交的批次。缺失的配对仍由渲染器在内存中合成中断 `tool` 消息兜底（见 plan.md 更正 11）；持久化补写由 `yaa-core` 的恢复逻辑完成（store 保持哑，不猜测业务语义）。
+SQLite 事务消除了「撕裂尾行」问题：一批记录要么全部提交、要么全部不可见，断电只可能丢掉尚未提交的批次。缺失的配对仍由渲染器在内存中合成中断 `tool` 消息兜底（见 plan.md 更正 11）；持久化补写由 `xidong::core` 的恢复逻辑完成（store 保持哑，不猜测业务语义）。
 
 文件 inbox 协议已在阶段 4 实现：发布先写 `tmp/`、`fsync` 后原子 `rename`，已发布消息不会因断电变成半条；消费是「`append_idempotent` 后删除文件」，若在两者之间断电，消息文件会重现并由 id 去重。普通 `run` 先发布 own 再抢锁，因此断电时已发布但未消费的消息仍在 inbox，下次启动继续处理。
 
 阶段 5 的 spool 复用同一原子发布原语，因此断电语义相同：发布失败的通知要么完整落在 spool、要么完全不出现；补投是「`append_idempotent` 后删除」，在两者之间断电只会让文件重现并被 id 去重。spool 只兜「发布失败」，发布者进程在写 spool 之前被 SIGKILL 的丢失不在保障范围内（见 `plan.md` 的「已知限制」）。
 
-断电后所有进程死亡，内核自动释放 `flock`。`runner.lock` 文件残留无害。新 `yaa` 启动后：
+断电后所有进程死亡，内核自动释放 `flock`。`runner.lock` 文件残留无害。新 `xidong` 启动后：
 
 1. 尝试获取 `runner.lock`，成功则成为 runner；随后按阶段 4 的顺序执行崩溃恢复、spool 补投、`init` 与 inbox 消费（先只补投 spool 自身，再 `init/`，再 own 之前的 `pending/`，再 own）。
 2. 在 `init` 钩子与写入 `user` 之前执行恢复：
@@ -654,7 +654,7 @@ SQLite 事务消除了「撕裂尾行」问题：一批记录要么全部提交�
 - 注入不打断工具批次，只在安全点插入。
 - 展示水位是 `(generation, seq)` 且只前进；generation 真变化即停止跟随（`0→1` 首次建库除外）。
 - `--clear` 不归档仍有待处理 inbox 或非空 spool 的会话；锁、inbox 与 spool 路径按完整数据库文件名唯一化，`outputs/`、`summaries/` 与归档目录同法按 `artifact_name` 唯一化。
-- 环境链由 `yaa_env` 单一构造：`YAA_SESSION` 总是自己，`YAA_NOTIFY` 只继承指向别处的值，`YAA_PARENT` 只保留中间层或孵化者，`YAA_NOTIFY_CALL_ID` 仅 shell 工具注入。
+- 环境链由 `xidong_env` 单一构造：`XIDONG_SESSION` 总是自己，`XIDONG_NOTIFY` 只继承指向别处的值，`XIDONG_PARENT` 只保留中间层或孵化者，`XIDONG_NOTIFY_CALL_ID` 仅 shell 工具注入。
 - 显式 `--to` 只读校验、绝不创建；普通 `--notify` 才警告并创建。
 - 通知归因 `origin` 总写、`call_id` 合法才写；两者缺省不影响旧记录解析，也不改变渲染分组。
 - `is_injectable_system` 是 display/render/inbox 的唯一 `system` 白名单谓词。

@@ -7,7 +7,7 @@ on:
       - '.github/workflows/build.yaml'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'crates/**'
+      - 'src/**'
 
 concurrency:
   group: "build"
@@ -86,19 +86,19 @@ jobs:
 
       - name: 编译
         run: |
-          cargo build --release --bin yaa
+          cargo build --release --bin xidong
 
       - name: 收集包
         run: |
-          mkdir -p yaa_${{ matrix.build }}
-          cp target/release/yaa yaa_${{ matrix.build }}/
+          mkdir -p xidong_${{ matrix.build }}
+          cp target/release/xidong xidong_${{ matrix.build }}/
         shell: bash
 
       - name: 上传包
         uses: actions/upload-artifact@v4
         with:
-          name: yaa_${{ matrix.build }}
-          path: yaa_${{ matrix.build }}/**/*
+          name: xidong_${{ matrix.build }}
+          path: xidong_${{ matrix.build }}/**/*
           retention-days: 3
 
       - name: 保存 Rust 缓存

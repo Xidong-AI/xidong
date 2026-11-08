@@ -1,34 +1,34 @@
 <h1 align="center">
-  <a href="https://github.com/Byte-tea/yaa/">
-    <img src="assets/yaa.svg" width="150" height="150" alt="banner" /><br>
+  <a href="https://github.com/Xidong-AI/xidong/">
+    <img src="assets/xidong.svg" width="150" height="150" alt="banner" /><br>
   </a>
 </h1>
 
 <p align="center"><a href="README.md">中文</a> | English</p>
 
-## yaa
+## xidong
 
-`yaa` means Yet Another Agent. A minimal command-line agent: **its only tool is the shell**, history lives in a per-session SQLite event database (insert-only; the context is just a rendered projection of it).
+`xidong` means Yet Another Agent. A minimal command-line agent: **its only tool is the shell**, history lives in a per-session SQLite event database (insert-only; the context is just a rendered projection of it).
 
 ## Highlights
 
 - **The shell is the only tool**: no built-in file, search, or web tools. Write whatever commands you need; external commands (such as your own `webfetch`) are callable as long as they are on `PATH`.
-- **Minimal hooks**: only an `init` hook for empty-session initialization and an `llm` hook for the model provider configuration; initialization injections enter the context through `yaa --notify`, and can be wired to `cat`, `pass`, `op`, and friends.
+- **Minimal hooks**: only an `init` hook for empty-session initialization and an `llm` hook for the model provider configuration; initialization injections enter the context through `xidong --notify`, and can be wired to `cat`, `pass`, `op`, and friends.
 - **Auditable history**: each session is an append-only SQLite event database (`sessions/<sid>/session.db`); at render time records are mapped to model-interface messages.
-- **Per-directory sessions**: the session id is a hash of the canonical working directory, so running `yaa` again in the same directory resumes the session.
-- **Non-interactive**: one `yaa "..."` runs multiple steps internally until the model stops calling tools.
+- **Per-directory sessions**: the session id is a hash of the canonical working directory, so running `xidong` again in the same directory resumes the session.
+- **Non-interactive**: one `xidong "..."` runs multiple steps internally until the model stops calling tools.
 
 ## Install
 
 ```bash
 cargo build --release
-# binary: target/release/yaa
+# binary: target/release/xidong
 ```
 
 Or install it onto `PATH`:
 
 ```bash
-cargo install --path crates/yaa-cli
+cargo install --path .
 ```
 
 ## Configuration
@@ -36,63 +36,63 @@ cargo install --path crates/yaa-cli
 The only prerequisite is the model provider configuration; everything else has defaults.
 
 ```bash
-mkdir -p ~/.config/yaa
-cp configs/llm.example.toml ~/.config/yaa/llm.toml     # fill in api_key
-cp configs/config.example.toml ~/.config/yaa/config.toml
+mkdir -p ~/.config/xidong
+cp configs/llm.example.toml ~/.config/xidong/llm.toml     # fill in api_key
+cp configs/config.example.toml ~/.config/xidong/config.toml
 ```
 
-- Config root `$YAA_CONFIG_HOME`, default `~/.config/yaa`, holds `config.toml`, `llm.toml`, and `AGENTS.md`.
-- Data root `$YAA_DATA_HOME`, default `~/.local/share/yaa`, holds sessions, archives, and tool output files.
+- Config root `$XIDONG_CONFIG_HOME`, default `~/.config/xidong`, holds `config.toml`, `llm.toml`, and `AGENTS.md`.
+- Data root `$XIDONG_DATA_HOME`, default `~/.local/share/xidong`, holds sessions, archives, and tool output files.
 
 `config.toml` contains hook commands and limits; see `configs/config.example.toml` for every field.
 
 ## Usage
 
 ```bash
-yaa 你好                          # a single run, multiple steps internally
-yaa read the file here            # multiple positional args join with spaces
-yaa                               # read the prompt from stdin
-echo "summarize this repo" | yaa
-yaa --clear                       # archive the current directory's session
-yaa --status                      # print a session summary
-yaa --get-prompt system           # print the built-in system prompt template
-yaa --notify="comment" -- cmd      # run cmd and write its stdout as a notification
-cmd | yaa --notify="comment"       # read stdin and write it as a notification
-yaa --notify="comment" --to "$YAA_PARENT" -- cmd  # write to an explicit target (must exist)
-yaa --notify-timeout 30 --notify="comment" -- cmd  # override the notification command timeout (seconds)
-yaa --cwd /path/to/project 你好    # set the working directory
-yaa --session /path/to/session.db 你好
-yaa --config /path/to/config.toml 你好
-yaa --verbose                     # also show reasoning and command output
-yaa --quiet                       # print only the final reply
+xidong 你好                          # a single run, multiple steps internally
+xidong read the file here            # multiple positional args join with spaces
+xidong                               # read the prompt from stdin
+echo "summarize this repo" | xidong
+xidong --clear                       # archive the current directory's session
+xidong --status                      # print a session summary
+xidong --get-prompt system           # print the built-in system prompt template
+xidong --notify="comment" -- cmd      # run cmd and write its stdout as a notification
+cmd | xidong --notify="comment"       # read stdin and write it as a notification
+xidong --notify="comment" --to "$XIDONG_PARENT" -- cmd  # write to an explicit target (must exist)
+xidong --notify-timeout 30 --notify="comment" -- cmd  # override the notification command timeout (seconds)
+xidong --cwd /path/to/project 你好    # set the working directory
+xidong --session /path/to/session.db 你好
+xidong --config /path/to/config.toml 你好
+xidong --verbose                     # also show reasoning and command output
+xidong --quiet                       # print only the final reply
 ```
 
-By default the process log goes to stderr: initialization injections, external notifications, and tool commands are printed as `# comment`/`# description` and `% command` blocks separated by `---`, together with the assistant text of non-final steps; the final reply goes to stdout only, so `yaa 你好 > reply.txt` stays clean.
+By default the process log goes to stderr: initialization injections, external notifications, and tool commands are printed as `# comment`/`# description` and `% command` blocks separated by `---`, together with the assistant text of non-final steps; the final reply goes to stdout only, so `xidong 你好 > reply.txt` stays clean.
 `--verbose` adds the model's reasoning and tool command output; the `llm` hook is never persisted and never displayed. `--quiet` suppresses the whole process log.
 
 Exit codes: `0` success, `1` generic error, `2` usage error, `3` config or hook error, `4` model error, `5` reached `max_steps`.
 
 ## How it works
 
-1. **Initialization injection**: on an empty session the `init` hook runs once; the `yaa --notify` calls inside it write `system(source=notify)` events (system prompt, user-wide prompt, current environment).
+1. **Initialization injection**: on an empty session the `init` hook runs once; the `xidong --notify` calls inside it write `system(source=notify)` events (system prompt, user-wide prompt, current environment).
 2. The **`llm` hook** runs once per invocation; its stdout is parsed into the model provider configuration. It is never persisted and never enters the context.
 3. **Layered rendering**: injections before the first `user` merge into one `system` message as a stable prefix; later out-of-band notifications merge into the adjacent `user`, keeping the prefix untouched.
 4. **Main loop**: re-read history → render to model messages → call the model → run the shell tool → record the result, until the model stops calling tools or `max_steps` is reached.
-5. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded. Both `--notify` forms (command and stdin) reuse the same truncation and dump path. Limit precedence: `--notify-timeout` → `YAA_NOTIFY_*` env vars → `[shell]` → defaults.
+5. **Truncation**: when one stream of tool output exceeds the limit its middle is cut; the full output is written to `sessions/<sid>/outputs/` and the path is recorded. Both `--notify` forms (command and stdin) reuse the same truncation and dump path. Limit precedence: `--notify-timeout` → `XIDONG_NOTIFY_*` env vars → `[shell]` → defaults.
 6. **Command visibility**: a notification's replayable command enters the model context with an `[执行命令]` prefix, telling the model which command produced it.
-7. **Concurrency and injection**: each session has at most one runner at a time; a second `yaa "..."` publishes its message to the session inbox and follows the running runner's output. `--notify` also only writes to the inbox and never starts the model; a running `yaa` consumes it at a safe point, or the next `yaa` run does. `--clear` refuses to archive while messages are pending.
-8. **Multi-agent and background tasks**: the environment chain carries `YAA_SESSION` (this session), `YAA_NOTIFY` (default notification target), and `YAA_PARENT` (parent session). Use `... | yaa --notify="comment" --to "$YAA_SESSION" &` to run a long task in the background and inject its result back into this session; a child agent reports to its parent with `--to "$YAA_PARENT"`. An explicit `--to` only writes to an existing session and never creates one; if publishing fails, the notification is kept in the spool and replayed on the next run.
+7. **Concurrency and injection**: each session has at most one runner at a time; a second `xidong "..."` publishes its message to the session inbox and follows the running runner's output. `--notify` also only writes to the inbox and never starts the model; a running `xidong` consumes it at a safe point, or the next `xidong` run does. `--clear` refuses to archive while messages are pending.
+8. **Multi-agent and background tasks**: the environment chain carries `XIDONG_SESSION` (this session), `XIDONG_NOTIFY` (default notification target), and `XIDONG_PARENT` (parent session). Use `... | xidong --notify="comment" --to "$XIDONG_SESSION" &` to run a long task in the background and inject its result back into this session; a child agent reports to its parent with `--to "$XIDONG_PARENT"`. An explicit `--to` only writes to an existing session and never creates one; if publishing fails, the notification is kept in the spool and replayed on the next run.
 9. **Reliability**: records are committed in SQLite transactions and inbox/spool files are published by atomic `rename`, so a `kill -9` never loses a committed batch, duplicates an insertion, or breaks tool-call pairing; power loss is bounded by `fsync` — already flushed batches survive, while records or publishes inside an un-fsynced window are lost (see the upgrade criteria in `docs/plan.md` for real power-loss guarantees).
 
 ## Layout
 
-| crate       | Responsibility                                                  |
+| Module      | Responsibility                                                  |
 | ----------- | --------------------------------------------------------------- |
-| `yaa-cli`   | `yaa` binary: argument parsing, entry point, stdout/stderr policy |
-| `yaa-core`  | Config and paths, tool definition, model calls, rendering and display projection, agent loop |
-| `yaa-store` | Session SQLite event database read/write, reads by sequence, archiving, file locks, file inbox/spool publish/scan |
-| `yaa-exec`  | Shell execution mechanism: process group, timeout, streaming truncation, full-output files |
-| `yaa-msg`   | Record types and serialization                                   |
+| `xidong::cli`   | `xidong` binary: argument parsing, entry point, stdout/stderr policy |
+| `xidong::core`  | Config and paths, tool definition, model calls, rendering and display projection, agent loop |
+| `xidong::store` | Session SQLite event database read/write, reads by sequence, archiving, file locks, file inbox/spool publish/scan |
+| `xidong::exec`  | Shell execution mechanism: process group, timeout, streaming truncation, full-output files |
+| `xidong::msg`   | Record types and serialization                                   |
 
 Background: [docs/design.md](docs/design.md); implementation plan: [docs/plan.md](docs/plan.md).
 

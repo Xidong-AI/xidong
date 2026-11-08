@@ -1,7 +1,7 @@
-# yaa 模型供应配置示例。
+# xidong 模型供应配置示例。
 #
-# 复制到 $YAA_CONFIG_HOME/llm.toml（默认 ~/.config/yaa/llm.toml），由 `llm` 钩子
-# 读取并输出给 yaa。文件含密钥，请勿提交到版本库。
+# 复制到 $XIDONG_CONFIG_HOME/llm.toml（默认 ~/.config/xidong/llm.toml），由 `llm` 钩子
+# 读取并输出给 xidong。文件含密钥，请勿提交到版本库。
 
 base_url = "https://api.deepseek.com"
 api_key = "sk-……"

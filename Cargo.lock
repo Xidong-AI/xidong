@@ -1992,30 +1992,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
-name = "yaa-cli"
+name = "xidong"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "clap",
- "rusqlite",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "yaa-core",
- "yaa-exec",
- "yaa-msg",
- "yaa-store",
-]
-
-[[package]]
-name = "yaa-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
  "libc",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
@@ -2024,42 +2009,6 @@ dependencies = [
  "tokio",
  "toml",
  "ulid",
- "yaa-exec",
- "yaa-msg",
- "yaa-store",
-]
-
-[[package]]
-name = "yaa-exec"
-version = "0.1.0"
-dependencies = [
- "libc",
- "tempfile",
- "thiserror",
- "tokio",
- "ulid",
-]
-
-[[package]]
-name = "yaa-msg"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "ulid",
-]
-
-[[package]]
-name = "yaa-store"
-version = "0.1.0"
-dependencies = [
- "libc",
- "rusqlite",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror",
- "yaa-msg",
 ]
 
 [[package]]
